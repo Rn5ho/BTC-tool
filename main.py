@@ -189,11 +189,19 @@ class Orchestrator:
             await self._settle_previous_window()
         if self._current_slug != market.slug:
             self._current_slug = market.slug
-            self._window_btc_start = self.binance.get_latest_price()
+            # Use Chainlink for window start price (matches settlement source)
+            chainlink_price = await self.polymarket.get_chainlink_btc_price()
+            if chainlink_price is not None:
+                self._window_btc_start = chainlink_price
+                price_source = "Chainlink"
+            else:
+                self._window_btc_start = self.binance.get_latest_price()
+                price_source = "Binance (fallback)"
             logger.info(
-                "New window: %s | BTC start: %s",
+                "New window: %s | BTC start: %s [%s]",
                 market.slug,
                 self._window_btc_start,
+                price_source,
             )
 
         # 2. Refresh live Polymarket prices
@@ -287,22 +295,33 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def _settle_previous_window(self) -> None:
-        """Settle paper trades from the previous 5-minute window."""
+        """Settle paper trades from the previous 5-minute window.
+
+        Uses Chainlink BTC/USD price (Polymarket's resolution source) for
+        settlement. Falls back to Binance spot price if Chainlink is
+        unavailable.
+        """
         if self._window_btc_start is None:
             return
 
-        btc_end = self.binance.get_latest_price()
+        # Prefer Chainlink (the actual resolution source) over Binance
+        btc_end = await self.polymarket.get_chainlink_btc_price()
+        price_source = "Chainlink"
+        if btc_end is None:
+            btc_end = self.binance.get_latest_price()
+            price_source = "Binance (fallback)"
         if btc_end is None:
             logger.warning("Cannot settle — no BTC end price available")
             return
 
         btc_went_up = btc_end >= self._window_btc_start
         logger.info(
-            "Settling window %s: start=%.2f end=%.2f went_%s",
+            "Settling window %s: start=%.2f end=%.2f went_%s [%s]",
             self._current_slug,
             self._window_btc_start,
             btc_end,
             "UP" if btc_went_up else "DOWN",
+            price_source,
         )
 
         if self.paper_trader:

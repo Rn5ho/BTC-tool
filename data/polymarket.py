@@ -3,6 +3,9 @@
 Uses the Gamma API for market discovery and the CLOB API for live price feeds.
 Markets follow a deterministic slug pattern: btc-updown-5m-{window_ts} where
 window_ts is the current unix timestamp rounded down to the nearest 5-minute boundary.
+
+Settlement prices are fetched from Chainlink's on-chain BTC/USD price feed,
+which is the resolution source used by Polymarket for these markets.
 """
 
 import asyncio
@@ -25,6 +28,20 @@ POLL_INTERVAL_SECONDS = 3.0
 
 # 5-minute window in seconds
 WINDOW_SECONDS = 300
+
+# Chainlink BTC/USD Price Feed on Ethereum Mainnet
+# This is the resolution source for Polymarket BTC Up/Down markets.
+# Contract: Aggregator Proxy — returns price with 8 decimals.
+CHAINLINK_BTC_USD_ADDR = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
+CHAINLINK_LATEST_ROUND_DATA = "0xfeaf968c"  # latestRoundData() selector
+CHAINLINK_DECIMALS = 8
+
+# Public Ethereum RPC endpoints (fallback order)
+ETH_RPC_URLS = [
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth",
+    "https://ethereum-rpc.publicnode.com",
+]
 
 
 class PolymarketClient:
@@ -356,6 +373,59 @@ class PolymarketClient:
         if data is None:
             logger.warning("Failed to fetch orderbook for token %s", token_id)
         return data
+
+    # ------------------------------------------------------------------
+    # Chainlink price feed (settlement source)
+    # ------------------------------------------------------------------
+
+    async def get_chainlink_btc_price(self) -> Optional[float]:
+        """Fetch the current BTC/USD price from Chainlink's on-chain oracle.
+
+        Polymarket resolves BTC Up/Down markets using the Chainlink BTC/USD
+        data stream. This method reads ``latestRoundData()`` from the
+        Chainlink Aggregator Proxy on Ethereum mainnet via a public RPC.
+
+        Returns:
+            BTC price in USD, or None if the price cannot be fetched.
+        """
+        if self._session is None or self._session.closed:
+            logger.error("Session not started. Call start() before fetching Chainlink price.")
+            return None
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {"to": CHAINLINK_BTC_USD_ADDR, "data": CHAINLINK_LATEST_ROUND_DATA},
+                "latest",
+            ],
+            "id": 1,
+        }
+
+        for rpc_url in ETH_RPC_URLS:
+            try:
+                async with self._session.post(
+                    rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    result = await resp.json()
+                    hex_data = result.get("result", "")
+                    if not hex_data or hex_data == "0x" or len(hex_data) < 130:
+                        continue
+                    # latestRoundData() returns (roundId, answer, startedAt, updatedAt, answeredInRound)
+                    # answer is the second 32-byte word (chars 66..130 of the hex string)
+                    answer_hex = hex_data[66:130]
+                    price_raw = int(answer_hex, 16)
+                    price = price_raw / (10 ** CHAINLINK_DECIMALS)
+                    logger.debug("Chainlink BTC/USD: $%.2f (via %s)", price, rpc_url)
+                    return price
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                logger.debug("Chainlink RPC %s failed: %s", rpc_url, exc)
+                continue
+
+        logger.warning("Failed to fetch Chainlink BTC/USD price from all RPC endpoints")
+        return None
 
     # ------------------------------------------------------------------
     # Continuous monitoring
