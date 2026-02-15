@@ -90,15 +90,17 @@ class EdgeDetector:
             down_edge,
         )
 
-        # Choose the side with the larger absolute edge.
-        if abs(up_edge) >= abs(down_edge):
+        # Choose the side with the larger *positive* edge.
+        # A negative edge means the market price already exceeds our model's
+        # probability — buying that side would be trading against ourselves.
+        if up_edge > down_edge:
             best_side = "UP"
             best_edge = up_edge
         else:
             best_side = "DOWN"
             best_edge = down_edge
 
-        if abs(best_edge) < self.min_edge:
+        if best_edge < self.min_edge:
             logger.debug(
                 "No actionable edge (best=%.4f, threshold=%.4f)",
                 best_edge,
