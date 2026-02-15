@@ -276,6 +276,18 @@ class Database:
     # Queries
     # ------------------------------------------------------------------
 
+    async def clear_paper_trades(self) -> int:
+        """Delete all paper trades and return the number of rows removed."""
+        try:
+            cursor = await self._db.execute("DELETE FROM paper_trades")
+            await self._db.commit()
+            count = cursor.rowcount
+            logger.info("Cleared %d paper trade(s) from database", count)
+            return count
+        except Exception:
+            logger.exception("Failed to clear paper trades")
+            return 0
+
     async def get_btc_price_at(self, timestamp_ms: int, tolerance_ms: int = 120000) -> Optional[float]:
         """Get BTC close price from the candle nearest to the given timestamp.
 

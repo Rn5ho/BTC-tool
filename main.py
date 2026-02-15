@@ -187,8 +187,10 @@ class Orchestrator:
         self.alerter.register_command("status", self._cmd_status)
         self.alerter.register_command("stats", self._cmd_stats)
         self.alerter.register_command("trades", self._cmd_trades)
+        self.alerter.register_command("reset", self._cmd_reset)
+        self.alerter.register_command("budget", self._cmd_budget)
 
-    async def _cmd_status(self) -> str:
+    async def _cmd_status(self, args: str = "") -> str:
         """Handle /status — current BTC price, model output, market odds."""
         btc = self.binance.get_latest_price()
         chainlink = self.polymarket.get_chainlink_stream_price()
@@ -229,7 +231,7 @@ class Orchestrator:
             f"Candles: {candles} | Trades: {trades} | OB: {ob}"
         )
 
-    async def _cmd_stats(self) -> str:
+    async def _cmd_stats(self, args: str = "") -> str:
         """Handle /stats — trading performance summary."""
         if not self.paper_trader:
             return "Paper trader not initialized."
@@ -245,7 +247,7 @@ class Orchestrator:
             f"ROI: {stats.get('roi', 0):+.1%}"
         )
 
-    async def _cmd_trades(self) -> str:
+    async def _cmd_trades(self, args: str = "") -> str:
         """Handle /trades — list recent/pending paper trades."""
         if not self.paper_trader:
             return "Paper trader not initialized."
@@ -268,6 +270,54 @@ class Orchestrator:
                 f"Size: ${trade['size_usdc']:.2f}"
             )
         return "\n".join(lines)
+
+    async def _cmd_reset(self, args: str = "") -> str:
+        """Handle /reset — clear all paper trades and reset bankroll."""
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+
+        count = await self.db.clear_paper_trades()
+        self.paper_trader._pending_trades.clear()
+        self.paper_trader.bankroll = self.paper_trader.initial_bankroll
+
+        return (
+            f"\U0001f504 <b>RESET COMPLETE</b>\n\n"
+            f"Cleared {count} trade(s).\n"
+            f"Bankroll: ${self.paper_trader.bankroll:.2f}"
+        )
+
+    async def _cmd_budget(self, args: str = "") -> str:
+        """Handle /budget [amount] — show or set the bankroll.
+
+        /budget        — show current bankroll and bet size
+        /budget 200    — set bankroll to $200
+        """
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+
+        if not args.strip():
+            return (
+                f"\U0001f4b0 <b>BUDGET</b>\n\n"
+                f"Bankroll: <b>${self.paper_trader.bankroll:.2f}</b>\n"
+                f"Initial: ${self.paper_trader.initial_bankroll:.2f}\n"
+                f"Bet size: ${self.paper_trader.bet_size:.2f}\n"
+                f"Kelly: {'on' if self.paper_trader.use_kelly else 'off'}"
+            )
+
+        try:
+            amount = float(args.strip())
+            if amount <= 0:
+                return "Amount must be positive."
+        except ValueError:
+            return f"Invalid amount: {args.strip()}\nUsage: /budget 200"
+
+        self.paper_trader.bankroll = amount
+        self.paper_trader.initial_bankroll = amount
+
+        return (
+            f"\U0001f4b0 <b>BUDGET UPDATED</b>\n\n"
+            f"Bankroll set to <b>${amount:.2f}</b>"
+        )
 
     # ------------------------------------------------------------------
     # Main analysis loop
