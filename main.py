@@ -263,9 +263,9 @@ class Orchestrator:
         lines = [f"\U0001f4dd <b>PENDING TRADES</b>\n"]
         for slug, trade in pending.items():
             lines.append(
-                f"  {trade.side} {slug}\n"
-                f"  Entry: {trade.entry_price:.3f} | "
-                f"Size: ${trade.size:.2f}"
+                f"  {trade['side']} {slug}\n"
+                f"  Entry: {trade['entry_price']:.3f} | "
+                f"Size: ${trade['size_usdc']:.2f}"
             )
         return "\n".join(lines)
 
