@@ -4,11 +4,13 @@ Uses the Gamma API for market discovery and the CLOB API for live price feeds.
 Markets follow a deterministic slug pattern: btc-updown-5m-{window_ts} where
 window_ts is the current unix timestamp rounded down to the nearest 5-minute boundary.
 
-Settlement prices are fetched from Chainlink's on-chain BTC/USD price feed,
-which is the resolution source used by Polymarket for these markets.
+Settlement prices come from the Chainlink BTC/USD data stream via Polymarket's
+RTDS (Real-Time Data Streaming) WebSocket — the same source Polymarket uses to
+resolve these markets.
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Callable, Optional
@@ -43,6 +45,12 @@ ETH_RPC_URLS = [
     "https://ethereum-rpc.publicnode.com",
 ]
 
+# Polymarket RTDS WebSocket — streams Chainlink BTC/USD in real-time.
+# This is the actual resolution source for Polymarket BTC Up/Down markets.
+RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+RTDS_PING_INTERVAL = 5.0  # seconds
+CHAINLINK_STREAM_STALE_SECONDS = 60.0  # consider price stale after this
+
 
 class PolymarketClient:
     """Async client for Polymarket BTC 5-minute prediction markets.
@@ -64,6 +72,9 @@ class PolymarketClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._current_market: Optional[PolymarketMarket] = None
         self._market_cache: dict[str, PolymarketMarket] = {}
+        # Chainlink RTDS stream state
+        self._chainlink_stream_price: Optional[float] = None
+        self._chainlink_stream_ts: float = 0.0
 
     async def start(self) -> None:
         """Create the aiohttp client session.
@@ -253,20 +264,14 @@ class PolymarketClient:
             # JSON-encoded string representation of a list.
             token_ids = market_data["clobTokenIds"]
             if isinstance(token_ids, str):
-                import json
-
                 token_ids = json.loads(token_ids)
 
             outcomes = market_data["outcomes"]
             if isinstance(outcomes, str):
-                import json
-
                 outcomes = json.loads(outcomes)
 
             prices = market_data["outcomePrices"]
             if isinstance(prices, str):
-                import json
-
                 prices = json.loads(prices)
 
             # Determine which index is Up and which is Down
@@ -375,15 +380,98 @@ class PolymarketClient:
         return data
 
     # ------------------------------------------------------------------
-    # Chainlink price feed (settlement source)
+    # Chainlink RTDS stream (primary settlement source)
+    # ------------------------------------------------------------------
+
+    def get_chainlink_stream_price(self) -> Optional[float]:
+        """Return the latest Chainlink BTC/USD price from the RTDS stream.
+
+        Returns None if no price has been received yet or the price is
+        stale (older than CHAINLINK_STREAM_STALE_SECONDS).
+        """
+        if self._chainlink_stream_price is None:
+            return None
+        age = time.time() - self._chainlink_stream_ts
+        if age > CHAINLINK_STREAM_STALE_SECONDS:
+            logger.warning("Chainlink stream price is stale (%.0fs old)", age)
+            return None
+        return self._chainlink_stream_price
+
+    async def run_chainlink_stream(self) -> None:
+        """Stream Chainlink BTC/USD prices from Polymarket RTDS WebSocket.
+
+        Connects to Polymarket's real-time data service and subscribes to
+        the ``crypto_prices_chainlink`` topic for ``btc/usd``. This is the
+        actual data source Polymarket uses to resolve BTC Up/Down markets.
+
+        Runs indefinitely with automatic reconnection on failure.
+        Should be launched as an ``asyncio.Task``.
+        """
+        if self._session is None or self._session.closed:
+            logger.error("Session not started. Call start() before streaming.")
+            return
+
+        subscribe_msg = {
+            "action": "subscribe",
+            "subscriptions": [{
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": json.dumps({"symbol": "btc/usd"}),
+            }],
+        }
+
+        while True:
+            try:
+                async with self._session.ws_connect(
+                    RTDS_WS_URL, heartbeat=RTDS_PING_INTERVAL,
+                ) as ws:
+                    await ws.send_json(subscribe_msg)
+                    logger.info(
+                        "Connected to Polymarket RTDS — streaming Chainlink BTC/USD"
+                    )
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                                if data.get("topic") == "crypto_prices_chainlink":
+                                    payload = data.get("payload", {})
+                                    price = payload.get("value") or payload.get("price")
+                                    if price is not None:
+                                        self._chainlink_stream_price = float(price)
+                                        self._chainlink_stream_ts = time.time()
+                                        logger.debug(
+                                            "Chainlink stream: BTC/USD $%.2f",
+                                            self._chainlink_stream_price,
+                                        )
+                            except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                                logger.debug("Failed to parse RTDS message: %s", exc)
+                        elif msg.type in (
+                            aiohttp.WSMsgType.ERROR,
+                            aiohttp.WSMsgType.CLOSED,
+                        ):
+                            logger.warning("RTDS WebSocket closed: %s", msg.data)
+                            break
+
+            except asyncio.CancelledError:
+                logger.info("Chainlink RTDS stream cancelled")
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Chainlink RTDS stream error: %s — reconnecting in 5s", exc
+                )
+            await asyncio.sleep(5)
+
+    # ------------------------------------------------------------------
+    # Chainlink on-chain price feed (fallback)
     # ------------------------------------------------------------------
 
     async def get_chainlink_btc_price(self) -> Optional[float]:
-        """Fetch the current BTC/USD price from Chainlink's on-chain oracle.
+        """Fetch BTC/USD from Chainlink's on-chain aggregator (fallback).
 
-        Polymarket resolves BTC Up/Down markets using the Chainlink BTC/USD
-        data stream. This method reads ``latestRoundData()`` from the
-        Chainlink Aggregator Proxy on Ethereum mainnet via a public RPC.
+        NOTE: The on-chain feed has a ~1h heartbeat and is unsuitable as
+        the primary source for 5-minute settlement.  Prefer
+        ``get_chainlink_stream_price()`` which uses Polymarket's RTDS.
 
         Returns:
             BTC price in USD, or None if the price cannot be fetched.

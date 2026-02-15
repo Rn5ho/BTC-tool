@@ -127,6 +127,9 @@ class Orchestrator:
         # Launch concurrent tasks
         tasks = [
             asyncio.create_task(self.binance.start(), name="binance"),
+            asyncio.create_task(
+                self.polymarket.run_chainlink_stream(), name="chainlink_stream"
+            ),
             asyncio.create_task(self._analysis_loop(), name="analysis"),
             asyncio.create_task(self._stats_loop(), name="stats"),
         ]
@@ -209,15 +212,12 @@ class Orchestrator:
             await self._settle_previous_window()
         if self._current_slug != market.slug:
             self._current_slug = market.slug
-            # Use Binance spot for window start price — Chainlink updates too
-            # infrequently (~1h heartbeat) for reliable 5-minute settlement.
-            self._window_btc_start = self.binance.get_latest_price()
-            price_source = "Binance"
+            # Prefer Chainlink RTDS stream (Polymarket's resolution source)
+            self._window_btc_start = self.polymarket.get_chainlink_stream_price()
+            price_source = "Chainlink Stream"
             if self._window_btc_start is None:
-                chainlink_price = await self.polymarket.get_chainlink_btc_price()
-                if chainlink_price is not None:
-                    self._window_btc_start = chainlink_price
-                    price_source = "Chainlink (fallback)"
+                self._window_btc_start = self.binance.get_latest_price()
+                price_source = "Binance (fallback)"
             logger.info(
                 "New window: %s | BTC start: $%.2f [%s]",
                 market.slug,
@@ -357,19 +357,18 @@ class Orchestrator:
     async def _settle_previous_window(self) -> None:
         """Settle paper trades from the previous 5-minute window.
 
-        Uses Binance spot price for settlement (real-time updates).
-        Chainlink's ~1h heartbeat makes it unsuitable for 5-min windows.
+        Uses Chainlink RTDS stream price (Polymarket's resolution source).
+        Falls back to Binance spot if the stream is unavailable.
         """
         if self._window_btc_start is None:
             return
 
-        # Use Binance spot for settlement — Chainlink updates too infrequently
-        # (~1h heartbeat) for reliable 5-minute window settlement.
-        btc_end = self.binance.get_latest_price()
-        price_source = "Binance"
+        # Prefer Chainlink RTDS stream (Polymarket's actual resolution source)
+        btc_end = self.polymarket.get_chainlink_stream_price()
+        price_source = "Chainlink Stream"
         if btc_end is None:
-            btc_end = await self.polymarket.get_chainlink_btc_price()
-            price_source = "Chainlink (fallback)"
+            btc_end = self.binance.get_latest_price()
+            price_source = "Binance (fallback)"
         if btc_end is None:
             logger.warning("Cannot settle — no BTC end price available")
             return
