@@ -160,9 +160,24 @@ class Orchestrator:
         """Run the feature → probability → edge → trade pipeline every cycle."""
 
         # Wait for Binance to accumulate some data first
-        logger.info("Waiting for initial data from Binance ...")
+        logger.info(
+            "Waiting for initial data from Binance (need 5 closed 1-min candles, ~5 min) ..."
+        )
+        last_count = 0
         while self._running and len(self.binance.candles) < 5:
-            await asyncio.sleep(2)
+            count = len(self.binance.candles)
+            price = self.binance.get_latest_price()
+            trades = len(self.binance.recent_trades)
+            if count != last_count or last_count == 0:
+                logger.info(
+                    "Buffering: %d/5 candles | BTC: %s | trades: %d | orderbook: %s",
+                    count,
+                    f"${price:,.2f}" if price else "waiting...",
+                    trades,
+                    "yes" if self.binance.orderbook else "no",
+                )
+                last_count = count
+            await asyncio.sleep(10)
         logger.info(
             "Initial data ready — %d candles buffered", len(self.binance.candles)
         )
@@ -254,11 +269,13 @@ class Orchestrator:
         # 5. Detect edge
         signal = self.edge_detector.evaluate(feature_vec, market)
         if signal is None:
-            logger.debug(
-                "No edge | P(up)=%.3f | Mkt=%.3f/%.3f | slug=%s",
+            btc_now = self.binance.get_latest_price()
+            logger.info(
+                "No edge | P(up)=%.3f | Mkt Up=%.2f Down=%.2f | BTC=$%s | %s",
                 p_up,
                 market.up_price,
                 market.down_price,
+                f"{btc_now:,.2f}" if btc_now else "N/A",
                 market.slug,
             )
             return
