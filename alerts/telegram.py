@@ -5,6 +5,7 @@ Gracefully degrades if the library is not installed or credentials are missing.
 """
 
 import logging
+import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,12 @@ class TelegramAlerter:
         Telegram API errors are caught and logged so they never crash the caller.
         """
         if not self._enabled or self._bot is None:
-            logger.info("[Telegram disabled] %s", text)
+            # Strip HTML tags and non-ASCII chars (emojis) to avoid
+            # UnicodeEncodeError on Windows consoles using cp1252.
+            safe = re.sub(r"<[^>]+>", "", text)
+            safe = safe.encode("ascii", errors="ignore").decode("ascii")
+            safe = re.sub(r"\n{3,}", "\n\n", safe).strip()
+            logger.info("[Telegram disabled] %s", safe)
             return
 
         # Truncate to Telegram's maximum message length
