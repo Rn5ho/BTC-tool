@@ -52,6 +52,31 @@ RTDS_PING_INTERVAL = 5.0  # seconds
 CHAINLINK_STREAM_STALE_SECONDS = 60.0  # consider price stale after this
 
 
+def compute_fee_factor(price: float, fee_rate: float = 0.25, fee_exponent: int = 2) -> float:
+    """Compute the Polymarket taker fee factor for a given share price.
+
+    Uses the fee curve from the Maker Rebates Program documentation:
+        fee_factor = fee_rate * (price * (1 - price)) ^ fee_exponent
+
+    The fee_factor represents the fraction of trade value taken as fee.
+    Multiply by size_usdc to get the actual fee in USDC.
+
+    At price=0.50 with default crypto params: fee_factor ~ 0.015625 (1.56%).
+    Near extremes (price close to 0 or 1): fee_factor approaches 0.
+
+    Args:
+        price: Share price between 0 and 1.
+        fee_rate: Base fee rate parameter (0.25 for crypto markets).
+        fee_exponent: Curve shaping exponent (2 for crypto markets).
+
+    Returns:
+        Fee factor as a float (multiply by USDC amount for fee).
+    """
+    if price <= 0.0 or price >= 1.0:
+        return 0.0
+    return fee_rate * (price * (1.0 - price)) ** fee_exponent
+
+
 class PolymarketClient:
     """Async client for Polymarket BTC 5-minute prediction markets.
 
@@ -72,6 +97,8 @@ class PolymarketClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._current_market: Optional[PolymarketMarket] = None
         self._market_cache: dict[str, PolymarketMarket] = {}
+        # Fee rate cache: token_id -> fee_rate_bps
+        self._fee_rate_cache: dict[str, int] = {}
         # Chainlink RTDS stream state
         self._chainlink_stream_price: Optional[float] = None
         self._chainlink_stream_ts: float = 0.0
@@ -378,6 +405,37 @@ class PolymarketClient:
         if data is None:
             logger.warning("Failed to fetch orderbook for token %s", token_id)
         return data
+
+    # ------------------------------------------------------------------
+    # Fee rate
+    # ------------------------------------------------------------------
+
+    async def get_fee_rate_bps(self, token_id: str) -> int:
+        """Fetch the taker fee rate in basis points for a token.
+
+        Calls ``GET /fee-rate?token_id={token_id}`` on the CLOB API.
+        Results are cached per token_id to avoid redundant requests.
+
+        Args:
+            token_id: The CLOB token ID to query.
+
+        Returns:
+            Fee rate in basis points (e.g. 0 for fee-free, 1000 for
+            fee-enabled crypto markets). Returns 0 on failure.
+        """
+        if token_id in self._fee_rate_cache:
+            return self._fee_rate_cache[token_id]
+
+        url = f"{self._clob_url}/fee-rate?token_id={token_id}"
+        data = await self._get_json(url)
+
+        fee_bps = 0
+        if data is not None:
+            fee_bps = data.get("fee_rate_bps", 0) or 0
+
+        self._fee_rate_cache[token_id] = fee_bps
+        logger.info("Fee rate for token %s...: %d bps", token_id[:16], fee_bps)
+        return fee_bps
 
     # ------------------------------------------------------------------
     # Chainlink RTDS stream (primary settlement source)

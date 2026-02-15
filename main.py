@@ -73,6 +73,8 @@ class Orchestrator:
         self.edge_detector = EdgeDetector(
             model=self.model,
             min_edge=settings.min_edge_threshold,
+            fee_rate=settings.polymarket_fee_rate,
+            fee_exponent=settings.polymarket_fee_exponent,
         )
         self.paper_trader = None  # initialized in start()
         self.alerter = None       # initialized in start()
@@ -120,6 +122,8 @@ class Orchestrator:
             bankroll=settings.virtual_bankroll,
             bet_size=settings.bet_size_usdc,
             use_kelly=settings.use_kelly,
+            fee_rate=settings.polymarket_fee_rate,
+            fee_exponent=settings.polymarket_fee_exponent,
         )
 
         # Telegram alerter
@@ -454,14 +458,16 @@ class Orchestrator:
                 signals_brief.items(), key=lambda x: abs(x[1]), reverse=True
             )[:3]
         )
+        fee_pct = signal.get("fee_factor", 0.0) * 100
         logger.info(
             ">>> EDGE: %s %s | our=%.1f%% mkt=%.1f%% edge=%+.1f%% "
-            "| BTC=$%s | [%s]",
+            "fee=%.2f%% | BTC=$%s | [%s]",
             signal["side"],
             signal["market_slug"],
             signal["our_prob"] * 100,
             signal["market_prob"] * 100,
             signal["edge"] * 100,
+            fee_pct,
             f"{btc_now:,.2f}" if btc_now else "N/A",
             top_signals,
         )

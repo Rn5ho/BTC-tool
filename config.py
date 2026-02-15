@@ -12,6 +12,18 @@ class Settings(BaseSettings):
     virtual_bankroll: float = 10000.0
     use_kelly: bool = False
 
+    # Polymarket Builder Mode (for live trading — leave blank for paper-only)
+    polymarket_api_key: str = ""
+    polymarket_api_secret: str = ""
+    polymarket_passphrase: str = ""
+
+    # Polymarket fee parameters (crypto 5-min / 15-min markets)
+    # These are the curve parameters from the Maker Rebates Program docs.
+    # fee_per_share = price * fee_rate * (price * (1 - price))^fee_exponent
+    # At price=0.50 with defaults: effective fee ~ 1.56% of trade value.
+    polymarket_fee_rate: float = 0.25
+    polymarket_fee_exponent: int = 2
+
     # Data URLs
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
