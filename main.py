@@ -81,7 +81,7 @@ class Orchestrator:
         self._running = False
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
-        self._window_start_time: float = 0.0  # wall-clock time when window started
+        self._window_start_time: float = 0.0  # unix timestamp of window start (from slug)
 
         # Trade entry timing — only enter trades in the first N seconds of a
         # 5-minute window.  After this cutoff the market has already priced in
@@ -96,6 +96,19 @@ class Orchestrator:
 
         # Heartbeat tracking — avoids flooding the console
         self._cycle_count: int = 0
+    @staticmethod
+    def _slug_start_time(slug: str) -> float:
+        """Extract the window start timestamp (seconds) from a market slug.
+
+        Slug format: ``btc-updown-5m-{unix_ts}``.  Returns the unix_ts as a
+        float so the time gate can compute how far into the window we are.
+        Falls back to ``time.time()`` if the slug is malformed.
+        """
+        try:
+            return float(slug.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return time.time()
+
         self._last_heartbeat: float = 0.0
         self._HEARTBEAT_INTERVAL: float = 30.0  # seconds between status lines
 
@@ -351,7 +364,7 @@ class Orchestrator:
 
         # Initialize window tracking now that we have price data
         self._current_slug = self.polymarket.get_current_slug()
-        self._window_start_time = time.time()
+        self._window_start_time = self._slug_start_time(self._current_slug)
         self._window_btc_start = self.polymarket.get_chainlink_stream_price()
         price_source = "Chainlink Stream"
         if self._window_btc_start is None:
@@ -387,7 +400,7 @@ class Orchestrator:
             await self._settle_previous_window()
         if self._current_slug != current_slug:
             self._current_slug = current_slug
-            self._window_start_time = time.time()
+            self._window_start_time = self._slug_start_time(current_slug)
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
             price_source = "Chainlink Stream"
