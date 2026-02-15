@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "btc-polymarket-edge"
@@ -17,6 +17,9 @@ dependencies = [
     "pydantic-settings>=2.0",
     "aiosqlite>=0.20",
 ]
+
+[tool.setuptools.packages.find]
+include = ["data*", "signals*", "strategy*", "alerts*", "storage*"]
 
 [project.scripts]
 btc-edge = "main:main"

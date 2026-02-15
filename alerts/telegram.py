@@ -14,11 +14,11 @@ try:
     from telegram import Bot
 
     TELEGRAM_AVAILABLE = True
-except ImportError:
+except BaseException:
     Bot = None  # type: ignore[assignment,misc]
     TELEGRAM_AVAILABLE = False
     logger.warning(
-        "python-telegram-bot is not installed. "
+        "python-telegram-bot could not be loaded. "
         "Telegram alerts will be disabled. "
         "Install with: pip install python-telegram-bot"
     )
