@@ -311,16 +311,14 @@ class Orchestrator:
     async def _run_one_cycle(self) -> None:
         """Single iteration of the analysis pipeline."""
 
-        # 1. Discover current Polymarket market
-        market = await self.polymarket.discover_market()
-        if market is None:
-            return
-
-        # Detect window transitions for settlement
-        if self._current_slug and self._current_slug != market.slug:
+        # 0. Check for window transitions BEFORE market discovery.
+        #    Settlement must not depend on the Gamma API succeeding —
+        #    otherwise trades remain unsettled if discovery is slow/fails.
+        current_slug = self.polymarket.get_current_slug()
+        if self._current_slug and self._current_slug != current_slug:
             await self._settle_previous_window()
-        if self._current_slug != market.slug:
-            self._current_slug = market.slug
+        if self._current_slug != current_slug:
+            self._current_slug = current_slug
             self._window_start_time = time.time()
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
@@ -330,10 +328,15 @@ class Orchestrator:
                 price_source = "Binance (fallback)"
             logger.info(
                 "New window: %s | BTC start: $%.2f [%s]",
-                market.slug,
+                current_slug,
                 self._window_btc_start or 0,
                 price_source,
             )
+
+        # 1. Discover current Polymarket market
+        market = await self.polymarket.discover_market()
+        if market is None:
+            return
 
         # 2. Refresh live Polymarket prices
         prices = await self.polymarket.get_live_prices(market)
