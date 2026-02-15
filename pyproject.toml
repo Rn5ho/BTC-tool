@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "btc-polymarket-edge"
+version = "0.1.0"
+description = "BTC Polymarket edge-finding tool"
+requires-python = ">=3.11"
+
+dependencies = [
+    "websockets>=12.0",
+    "aiohttp>=3.9",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "python-telegram-bot>=21.0",
+    "pydantic-settings>=2.0",
+    "aiosqlite>=0.20",
+]
+
+[project.scripts]
+btc-edge = "main:main"
