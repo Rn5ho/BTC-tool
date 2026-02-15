@@ -77,12 +77,14 @@ class TelegramAlerter:
         Telegram API errors are caught and logged so they never crash the caller.
         """
         if not self._enabled or self._bot is None:
-            # Strip HTML tags and non-ASCII chars (emojis) to avoid
-            # UnicodeEncodeError on Windows consoles using cp1252.
-            safe = re.sub(r"<[^>]+>", "", text)
-            safe = safe.encode("ascii", errors="ignore").decode("ascii")
-            safe = re.sub(r"\n{3,}", "\n\n", safe).strip()
-            logger.info("[Telegram disabled] %s", safe)
+            # Log at DEBUG only — avoids flooding the console when Telegram
+            # is disabled.  Strip HTML/emojis to prevent UnicodeEncodeError
+            # on Windows cp1252 consoles.
+            if logger.isEnabledFor(logging.DEBUG):
+                safe = re.sub(r"<[^>]+>", "", text)
+                safe = safe.encode("ascii", errors="ignore").decode("ascii")
+                safe = re.sub(r"\n{3,}", "\n\n", safe).strip()
+                logger.debug("[Telegram disabled] %s", safe)
             return
 
         # Truncate to Telegram's maximum message length

@@ -299,7 +299,14 @@ class Orchestrator:
                 )
             return
 
-        # 6. Edge found — compact, readable log
+        # 6. Edge found — but skip if we already have a pending trade on
+        #    this market (avoids flooding the console every 3 seconds).
+        if (
+            self.paper_trader
+            and market.slug in self.paper_trader._pending_trades
+        ):
+            return
+
         btc_now = self.binance.get_latest_price()
         signals_brief = signal.get("signals", {})
         top_signals = ", ".join(
@@ -335,7 +342,7 @@ class Orchestrator:
                     edge=signal["edge"],
                 )
 
-        # Telegram edge alert
+        # Telegram edge alert (only fires once per market — when trade is placed)
         if self.alerter:
             await self.alerter.send_edge_alert(
                 signal=signal,
