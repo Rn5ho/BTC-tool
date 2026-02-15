@@ -276,6 +276,29 @@ class Database:
     # Queries
     # ------------------------------------------------------------------
 
+    async def get_btc_price_at(self, timestamp_ms: int, tolerance_ms: int = 120000) -> Optional[float]:
+        """Get BTC close price from the candle nearest to the given timestamp.
+
+        Args:
+            timestamp_ms: Target timestamp in milliseconds.
+            tolerance_ms: Search window around the target (default 2 minutes).
+
+        Returns:
+            The close price of the nearest candle, or None if no candle found.
+        """
+        try:
+            cursor = await self._db.execute(
+                """SELECT close FROM candles
+                   WHERE timestamp BETWEEN ? AND ?
+                   ORDER BY ABS(timestamp - ?) LIMIT 1""",
+                (timestamp_ms - tolerance_ms, timestamp_ms + tolerance_ms, timestamp_ms),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+        except Exception:
+            logger.exception("Failed to query BTC price at %d", timestamp_ms)
+            return None
+
     async def get_unsettled_trades(self) -> list[dict]:
         """Return all paper trades that have not yet been settled."""
         try:

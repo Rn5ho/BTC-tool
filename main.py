@@ -299,6 +299,24 @@ class Orchestrator:
             "Initial data ready — %d candles buffered", len(self.binance.candles)
         )
 
+        # Initialize window tracking now that we have price data
+        self._current_slug = self.polymarket.get_current_slug()
+        self._window_start_time = time.time()
+        self._window_btc_start = self.polymarket.get_chainlink_stream_price()
+        price_source = "Chainlink Stream"
+        if self._window_btc_start is None:
+            self._window_btc_start = self.binance.get_latest_price()
+            price_source = "Binance (fallback)"
+        logger.info(
+            "Initialized window: %s | BTC start: $%.2f [%s]",
+            self._current_slug,
+            self._window_btc_start or 0,
+            price_source,
+        )
+
+        # Settle any stale unsettled trades from previous sessions
+        await self._settle_stale_trades()
+
         while self._running:
             try:
                 await self._run_one_cycle()
@@ -547,6 +565,82 @@ class Orchestrator:
 
             if self.alerter:
                 await self.alerter.send_stats_summary(stats)
+
+    async def _settle_stale_trades(self) -> None:
+        """Settle any unsettled trades from previous sessions whose windows have ended.
+
+        On restart, in-memory state is lost and window transitions that
+        occurred while the service was down (or during the buffering phase)
+        are never detected.  This method pulls unsettled trades from the DB,
+        looks up BTC prices from stored candle data, and settles them.
+        """
+        if not self.paper_trader:
+            return
+
+        unsettled = await self.db.get_unsettled_trades()
+        current_slug = self._current_slug or self.polymarket.get_current_slug()
+
+        stale = [r for r in unsettled if r["market_slug"] != current_slug]
+        if not stale:
+            return
+
+        logger.info(
+            "Found %d stale unsettled trade(s) from previous session — settling",
+            len(stale),
+        )
+
+        for row in stale:
+            slug = row["market_slug"]
+
+            # Extract window timestamp from slug: btc-updown-5m-{ts}
+            try:
+                window_ts = int(slug.rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                logger.warning("Cannot parse window ts from slug %s — voiding trade", slug)
+                await self.db.update_paper_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            window_start_ms = window_ts * 1000
+            window_end_ms = (window_ts + 300) * 1000
+
+            btc_start = await self.db.get_btc_price_at(window_start_ms)
+            btc_end = await self.db.get_btc_price_at(window_end_ms)
+
+            if btc_start is None or btc_end is None:
+                logger.warning(
+                    "No candle data for window %s — voiding trade %d",
+                    slug,
+                    row["id"],
+                )
+                await self.db.update_paper_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            btc_went_up = btc_end >= btc_start
+
+            # Load into paper_trader and use its settlement logic
+            self.paper_trader._pending_trades[slug] = {
+                "trade_id": row["id"],
+                "side": row["side"],
+                "size_usdc": row["size_usdc"],
+                "entry_price": row["entry_price"],
+                "our_prob": row["our_prob"],
+                "market_prob": row["market_prob"],
+                "edge": row["edge"],
+            }
+            await self.paper_trader.settle_trade(slug, btc_went_up)
+
+            logger.info(
+                "Settled stale trade: %s %s | BTC $%.2f -> $%.2f (%s)",
+                row["side"],
+                slug,
+                btc_start,
+                btc_end,
+                "UP" if btc_went_up else "DOWN",
+            )
 
     # ------------------------------------------------------------------
     # Periodic stats reporting

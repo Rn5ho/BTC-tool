@@ -43,15 +43,26 @@ class EdgeDetector:
             down_edge,
         )
 
-        # Choose the side with the larger absolute edge.
-        if abs(up_edge) >= abs(down_edge):
-            best_side = "UP"
-            best_edge = up_edge
-        else:
-            best_side = "DOWN"
-            best_edge = down_edge
+        # Only consider sides where we have a POSITIVE edge
+        # (our probability exceeds the market's implied probability).
+        candidates = []
+        if up_edge > 0:
+            candidates.append(("UP", up_edge))
+        if down_edge > 0:
+            candidates.append(("DOWN", down_edge))
 
-        if abs(best_edge) < self.min_edge:
+        if not candidates:
+            logger.debug(
+                "No positive edge on either side (up=%.4f, down=%.4f)",
+                up_edge,
+                down_edge,
+            )
+            return None
+
+        # Pick the side with the larger positive edge
+        best_side, best_edge = max(candidates, key=lambda x: x[1])
+
+        if best_edge < self.min_edge:
             logger.debug(
                 "No actionable edge (best=%.4f, threshold=%.4f)",
                 best_edge,
