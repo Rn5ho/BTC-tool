@@ -69,7 +69,7 @@ class EdgeDetector:
             "market_slug": market.slug,
         }
 
-        logger.info(
+        logger.debug(
             "Edge detected on %s: our=%.4f  market=%.4f  edge=%.4f  slug=%s",
             result["side"],
             result["our_prob"],
@@ -115,5 +115,5 @@ class EdgeDetector:
         lines.append("=" * 50)
 
         report = "\n".join(lines)
-        logger.info("Signal report:\n%s", report)
+        logger.debug("Signal report:\n%s", report)
         return report

@@ -82,6 +82,11 @@ class Orchestrator:
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
 
+        # Heartbeat tracking — avoids flooding the console
+        self._cycle_count: int = 0
+        self._last_heartbeat: float = 0.0
+        self._HEARTBEAT_INTERVAL: float = 30.0  # seconds between status lines
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -267,22 +272,52 @@ class Orchestrator:
         )
 
         # 5. Detect edge
+        self._cycle_count += 1
         signal = self.edge_detector.evaluate(feature_vec, market)
+
         if signal is None:
-            btc_now = self.binance.get_latest_price()
-            logger.info(
-                "No edge | P(up)=%.3f | Mkt Up=%.2f Down=%.2f | BTC=$%s | %s",
-                p_up,
-                market.up_price,
-                market.down_price,
-                f"{btc_now:,.2f}" if btc_now else "N/A",
-                market.slug,
-            )
+            # Quiet heartbeat — only log once every HEARTBEAT_INTERVAL
+            now = time.time()
+            if now - self._last_heartbeat >= self._HEARTBEAT_INTERVAL:
+                self._last_heartbeat = now
+                btc_now = self.binance.get_latest_price()
+                stats_str = ""
+                if self.paper_trader:
+                    stats = await self.paper_trader.get_stats()
+                    stats_str = (
+                        f" | Trades: {stats.get('settled_trades', 0)} "
+                        f"({stats.get('win_rate', 0):.0%} win) "
+                        f"| P&L: ${stats.get('total_pnl', 0):+.2f}"
+                    )
+                logger.info(
+                    "-- Status: BTC $%s | P(up)=%.1f%% | Mkt=%.0f/%.0f%s",
+                    f"{btc_now:,.2f}" if btc_now else "N/A",
+                    p_up * 100,
+                    market.up_price * 100,
+                    market.down_price * 100,
+                    stats_str,
+                )
             return
 
-        # 6. Edge found — log, trade, alert
-        report = self.edge_detector.format_signal_report(signal, feature_vec)
-        logger.info("\n%s", report)
+        # 6. Edge found — compact, readable log
+        btc_now = self.binance.get_latest_price()
+        signals_brief = signal.get("signals", {})
+        top_signals = ", ".join(
+            f"{k}={v:+.3f}" for k, v in sorted(
+                signals_brief.items(), key=lambda x: abs(x[1]), reverse=True
+            )[:3]
+        )
+        logger.info(
+            ">>> EDGE: %s %s | our=%.1f%% mkt=%.1f%% edge=%+.1f%% "
+            "| BTC=$%s | [%s]",
+            signal["side"],
+            signal["market_slug"],
+            signal["our_prob"] * 100,
+            signal["market_prob"] * 100,
+            signal["edge"] * 100,
+            f"{btc_now:,.2f}" if btc_now else "N/A",
+            top_signals,
+        )
 
         # Paper trade
         if self.paper_trader:
@@ -332,12 +367,15 @@ class Orchestrator:
             return
 
         btc_went_up = btc_end >= self._window_btc_start
+        direction = "UP" if btc_went_up else "DOWN"
+        delta = btc_end - self._window_btc_start
         logger.info(
-            "Settling window %s: start=%.2f end=%.2f went_%s [%s]",
+            "--- WINDOW SETTLED: %s | BTC $%.2f -> $%.2f (%+.2f = %s) [%s]",
             self._current_slug,
             self._window_btc_start,
             btc_end,
-            "UP" if btc_went_up else "DOWN",
+            delta,
+            direction,
             price_source,
         )
 
@@ -347,9 +385,18 @@ class Orchestrator:
                 btc_end_price=btc_end,
             )
 
-            # Send settlement alerts
+            # Log updated stats after settlement
+            stats = await self.paper_trader.get_stats()
+            logger.info(
+                "--- P&L: $%+.2f | Win rate: %.0f%% (%d/%d) | Bankroll: $%.2f",
+                stats.get("total_pnl", 0),
+                stats.get("win_rate", 0) * 100,
+                stats.get("wins", 0),
+                stats.get("settled_trades", 0),
+                stats.get("bankroll", 0),
+            )
+
             if self.alerter:
-                stats = await self.paper_trader.get_stats()
                 await self.alerter.send_stats_summary(stats)
 
     # ------------------------------------------------------------------
