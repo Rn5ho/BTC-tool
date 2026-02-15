@@ -11,7 +11,7 @@ BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance B
 - Python 3.11+, asyncio throughout
 - Binance WebSocket (spot klines + depth + aggTrades, futures funding rate)
 - Polymarket Gamma/CLOB API (market discovery, live prices, no auth needed)
-- Chainlink BTC/USD oracle on Ethereum mainnet (settlement price source, via public RPC)
+- Binance spot price for settlement (real-time); Chainlink BTC/USD oracle as fallback only
 - SQLite via aiosqlite (persistence)
 - python-telegram-bot v21+ (alerts, optional)
 - pydantic-settings (config from .env)
@@ -106,7 +106,7 @@ Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.25, taker=0.25, mome
 - Edge = our_P(side) - market_P(side), evaluated for both UP and DOWN sides
 - Trades when |best_edge| > MIN_EDGE_THRESHOLD (default 5%)
 - One pending trade per market slug (no duplicate bets on same 5-min window)
-- Settlement uses Chainlink BTC/USD price (the actual Polymarket resolution source), with Binance spot as fallback
+- Settlement uses Binance spot price (real-time updates); Chainlink's ~1h heartbeat makes it unsuitable for 5-min windows
 - PnL: WIN = size * (1 - entry_price) / entry_price, LOSS = -size
 - Stats tracked: total trades, win rate, cumulative PnL, bankroll, ROI
 
@@ -123,7 +123,7 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 
 - Polymarket 5-min BTC market slugs are deterministic: `btc-updown-5m-{unix_ts}` where `unix_ts = now - (now % 300)`
 - All Polymarket market data endpoints are free (no auth needed)
-- Chainlink BTC/USD price feed (contract `0xF403...E88c`) for settlement — matches Polymarket's resolution oracle
+- Binance spot price for settlement (Chainlink BTC/USD `0xF403...E88c` retained as fallback — its ~1h heartbeat is too slow for 5-min windows)
 - Probability model is a weighted ensemble of normalized signals (v1, no ML)
 - Paper trading only — no real money integration yet
 - Settlement happens on 5-min window transitions
@@ -135,6 +135,7 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - **Windows cp1252 encoding**: Telegram alert messages contain emojis for HTML formatting. When Telegram is disabled, these were previously logged at INFO level causing `UnicodeEncodeError` on Windows consoles. Fixed by logging at DEBUG level and stripping non-ASCII before debug output (`alerts/telegram.py:79-87`).
 - **Console spam**: Edge signals were logging every 3-second cycle. Fixed with duplicate trade detection — only logs edge once per market slug when a new paper trade is placed.
 - **Heartbeat flooding**: Added 30-second interval between status heartbeats instead of logging every cycle.
+- **Chainlink stale settlement prices**: Chainlink BTC/USD oracle has a ~1h heartbeat, so `latestRoundData()` returns the same price for both window start and end within a 5-min window. This caused every settlement to resolve as UP (start==end → +0.00 → UP), inflating win rates to ~82%. Fixed by switching to Binance spot price (real-time) as the primary settlement source (`main.py:_settle_previous_window`).
 
 ## Conventions
 

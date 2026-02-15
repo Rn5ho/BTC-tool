@@ -209,18 +209,19 @@ class Orchestrator:
             await self._settle_previous_window()
         if self._current_slug != market.slug:
             self._current_slug = market.slug
-            # Use Chainlink for window start price (matches settlement source)
-            chainlink_price = await self.polymarket.get_chainlink_btc_price()
-            if chainlink_price is not None:
-                self._window_btc_start = chainlink_price
-                price_source = "Chainlink"
-            else:
-                self._window_btc_start = self.binance.get_latest_price()
-                price_source = "Binance (fallback)"
+            # Use Binance spot for window start price — Chainlink updates too
+            # infrequently (~1h heartbeat) for reliable 5-minute settlement.
+            self._window_btc_start = self.binance.get_latest_price()
+            price_source = "Binance"
+            if self._window_btc_start is None:
+                chainlink_price = await self.polymarket.get_chainlink_btc_price()
+                if chainlink_price is not None:
+                    self._window_btc_start = chainlink_price
+                    price_source = "Chainlink (fallback)"
             logger.info(
-                "New window: %s | BTC start: %s [%s]",
+                "New window: %s | BTC start: $%.2f [%s]",
                 market.slug,
-                self._window_btc_start,
+                self._window_btc_start or 0,
                 price_source,
             )
 
@@ -356,19 +357,19 @@ class Orchestrator:
     async def _settle_previous_window(self) -> None:
         """Settle paper trades from the previous 5-minute window.
 
-        Uses Chainlink BTC/USD price (Polymarket's resolution source) for
-        settlement. Falls back to Binance spot price if Chainlink is
-        unavailable.
+        Uses Binance spot price for settlement (real-time updates).
+        Chainlink's ~1h heartbeat makes it unsuitable for 5-min windows.
         """
         if self._window_btc_start is None:
             return
 
-        # Prefer Chainlink (the actual resolution source) over Binance
-        btc_end = await self.polymarket.get_chainlink_btc_price()
-        price_source = "Chainlink"
+        # Use Binance spot for settlement — Chainlink updates too infrequently
+        # (~1h heartbeat) for reliable 5-minute window settlement.
+        btc_end = self.binance.get_latest_price()
+        price_source = "Binance"
         if btc_end is None:
-            btc_end = self.binance.get_latest_price()
-            price_source = "Binance (fallback)"
+            btc_end = await self.polymarket.get_chainlink_btc_price()
+            price_source = "Chainlink (fallback)"
         if btc_end is None:
             logger.warning("Cannot settle — no BTC end price available")
             return
