@@ -105,6 +105,8 @@ Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.25, taker=0.25, mome
 
 - Edge = our_P(side) - market_P(side), evaluated for both UP and DOWN sides
 - Trades when |best_edge| > MIN_EDGE_THRESHOLD (default 5%)
+- **Time gate**: Only enters trades in the first 120 seconds (2 min) of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
+- **Trend-conflict filter**: If BTC has already moved >0.15% in one direction within the current window and the model's signal is in the *opposite* direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum that the market has correctly priced.
 - One pending trade per market slug (no duplicate bets on same 5-min window)
 - Settlement uses Chainlink BTC/USD stream via Polymarket RTDS WebSocket (the actual resolution source); Binance spot as fallback
 - PnL: WIN = size * (1 - entry_price) / entry_price, LOSS = -size
@@ -136,6 +138,8 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - **Console spam**: Edge signals were logging every 3-second cycle. Fixed with duplicate trade detection — only logs edge once per market slug when a new paper trade is placed.
 - **Heartbeat flooding**: Added 30-second interval between status heartbeats instead of logging every cycle.
 - **Chainlink stale settlement prices**: The on-chain Chainlink aggregator (`latestRoundData()`) has a ~1h heartbeat, returning identical prices for window start and end within 5-min windows. This caused start==end every time, always resolving as UP, inflating win rates to ~82%. Fixed by streaming Chainlink BTC/USD via Polymarket RTDS WebSocket (`wss://ws-live-data.polymarket.com`, topic `crypto_prices_chainlink`) — the same data source Polymarket uses for market resolution. Binance spot is the fallback if the stream is unavailable.
+- **Late-window entries**: The analysis loop could place trades at any point during a 5-min window (e.g., 3 minutes in). By then the market has priced in the move and the "edge" is stale. Fixed with a time gate: trades only allowed in the first 120 seconds of each window.
+- **Contrarian bets against strong trends**: The model's mean-reverting signals (OBI from dip-buyers, VWAP "oversold") would produce UP signals during BTC crashes, while the market correctly priced DOWN at 70-80%. The model would see a large "edge" and bet UP against the trend. Fixed with a trend-conflict filter: if BTC has moved >0.15% in one direction within the window and the signal is opposite, the trade is skipped.
 
 ## Conventions
 

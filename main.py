@@ -81,6 +81,18 @@ class Orchestrator:
         self._running = False
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
+        self._window_start_time: float = 0.0  # wall-clock time when window started
+
+        # Trade entry timing — only enter trades in the first N seconds of a
+        # 5-minute window.  After this cutoff the market has already priced in
+        # the move and any "edge" our model sees is likely stale.
+        self._MAX_ENTRY_SECONDS: float = 120.0  # first 2 minutes of the 5-min window
+
+        # Trend-conflict filter — if BTC has already moved more than this
+        # percentage within the current window and our signal is the opposite
+        # direction, skip the trade.  Prevents betting against strong
+        # intra-window momentum that the market has already priced in.
+        self._TREND_CONFLICT_PCT: float = 0.15  # 0.15%
 
         # Heartbeat tracking — avoids flooding the console
         self._cycle_count: int = 0
@@ -309,6 +321,7 @@ class Orchestrator:
             await self._settle_previous_window()
         if self._current_slug != market.slug:
             self._current_slug = market.slug
+            self._window_start_time = time.time()
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
             price_source = "Chainlink Stream"
@@ -397,8 +410,9 @@ class Orchestrator:
                 )
             return
 
-        # 6. Edge found — but skip if we already have a pending trade on
-        #    this market (avoids flooding the console every 3 seconds).
+        # 6. Edge found — apply safety filters before trading.
+
+        # 6a. Skip if we already have a pending trade on this market.
         if (
             self.paper_trader
             and market.slug in self.paper_trader._pending_trades
@@ -406,6 +420,34 @@ class Orchestrator:
             return
 
         btc_now = self.binance.get_latest_price()
+
+        # 6b. Time gate — only enter trades in the first portion of the window.
+        #     After the cutoff the market has already priced in the move.
+        seconds_in_window = time.time() - self._window_start_time
+        if seconds_in_window > self._MAX_ENTRY_SECONDS:
+            logger.debug(
+                "Skipping edge — too late in window (%.0fs > %.0fs cutoff)",
+                seconds_in_window,
+                self._MAX_ENTRY_SECONDS,
+            )
+            return
+
+        # 6c. Trend-conflict filter — don't bet against a strong intra-window
+        #     price move.  If BTC has already moved more than TREND_CONFLICT_PCT
+        #     in one direction this window and our signal is the opposite, the
+        #     market odds already reflect reality and our "edge" is an artefact.
+        if self._window_btc_start and btc_now:
+            window_move_pct = (btc_now - self._window_btc_start) / self._window_btc_start * 100
+            btc_trending_up = window_move_pct > self._TREND_CONFLICT_PCT
+            btc_trending_down = window_move_pct < -self._TREND_CONFLICT_PCT
+            if (signal["side"] == "UP" and btc_trending_down) or \
+               (signal["side"] == "DOWN" and btc_trending_up):
+                logger.info(
+                    "Skipping edge — trend conflict: signal=%s but BTC moved %+.2f%% this window",
+                    signal["side"],
+                    window_move_pct,
+                )
+                return
         signals_brief = signal.get("signals", {})
         top_signals = ", ".join(
             f"{k}={v:+.3f}" for k, v in sorted(
