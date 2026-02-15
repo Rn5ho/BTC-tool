@@ -117,6 +117,7 @@ class Orchestrator:
             chat_id=settings.telegram_chat_id,
         )
         await self.alerter.start()
+        self._register_bot_commands()
 
         # Polymarket session
         await self.polymarket.start()
@@ -132,6 +133,9 @@ class Orchestrator:
             ),
             asyncio.create_task(self._analysis_loop(), name="analysis"),
             asyncio.create_task(self._stats_loop(), name="stats"),
+            asyncio.create_task(
+                self.alerter.run_command_listener(), name="telegram_cmds"
+            ),
         ]
 
         logger.info("All tasks launched — entering main loop")
@@ -159,6 +163,99 @@ class Orchestrator:
     def _on_candle_closed(self, candle) -> None:
         """Persist closed candles to the database (fire-and-forget)."""
         asyncio.create_task(self.db.save_candle(candle))
+
+    # ------------------------------------------------------------------
+    # Telegram bot commands
+    # ------------------------------------------------------------------
+
+    def _register_bot_commands(self) -> None:
+        """Register interactive Telegram commands."""
+        if not self.alerter:
+            return
+        self.alerter.register_command("status", self._cmd_status)
+        self.alerter.register_command("stats", self._cmd_stats)
+        self.alerter.register_command("trades", self._cmd_trades)
+
+    async def _cmd_status(self) -> str:
+        """Handle /status — current BTC price, model output, market odds."""
+        btc = self.binance.get_latest_price()
+        chainlink = self.polymarket.get_chainlink_stream_price()
+        candles = len(self.binance.candles)
+        trades = len(self.binance.recent_trades)
+        ob = "yes" if self.binance.orderbook else "no"
+
+        # Current model P(up)
+        p_up_str = "N/A"
+        if candles >= 5:
+            try:
+                feature_vec = self.features.compute_features(
+                    candles=self.binance.get_candles(n=50),
+                    orderbook=self.binance.orderbook,
+                    trades=list(self.binance.recent_trades),
+                    funding=self.binance.funding,
+                )
+                p_up = self.model.predict(feature_vec)
+                p_up_str = f"{p_up:.1%}"
+            except Exception:
+                pass
+
+        # Market odds
+        mkt_str = "N/A"
+        market = self.polymarket._current_market
+        if market:
+            mkt_str = f"Up {market.up_price:.0%} / Down {market.down_price:.0%}"
+
+        slug = self._current_slug or "none"
+
+        return (
+            f"\U0001f4ca <b>STATUS</b>\n\n"
+            f"BTC (Binance): <b>${btc:,.2f}</b>\n"
+            f"BTC (Chainlink): {f'<b>${chainlink:,.2f}</b>' if chainlink else 'N/A'}\n"
+            f"Window: {slug}\n"
+            f"P(up): <b>{p_up_str}</b>\n"
+            f"Market: {mkt_str}\n\n"
+            f"Candles: {candles} | Trades: {trades} | OB: {ob}"
+        )
+
+    async def _cmd_stats(self) -> str:
+        """Handle /stats — trading performance summary."""
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+        stats = await self.paper_trader.get_stats()
+        return (
+            f"\U0001f4c8 <b>TRADING STATS</b>\n\n"
+            f"Total trades: {stats.get('total_trades', 0)}\n"
+            f"Settled: {stats.get('settled_trades', 0)}\n"
+            f"Wins: {stats.get('wins', 0)} | Losses: {stats.get('losses', 0)}\n"
+            f"Win rate: <b>{stats.get('win_rate', 0):.1%}</b>\n"
+            f"Total P&amp;L: <b>${stats.get('total_pnl', 0):+.2f}</b>\n"
+            f"Bankroll: ${stats.get('bankroll', 0):,.2f}\n"
+            f"ROI: {stats.get('roi', 0):+.1%}"
+        )
+
+    async def _cmd_trades(self) -> str:
+        """Handle /trades — list recent/pending paper trades."""
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+
+        pending = self.paper_trader._pending_trades
+        if not pending:
+            stats = await self.paper_trader.get_stats()
+            settled = stats.get('settled_trades', 0)
+            return (
+                f"\U0001f4dd <b>TRADES</b>\n\n"
+                f"No pending trades.\n"
+                f"Total settled: {settled}"
+            )
+
+        lines = [f"\U0001f4dd <b>PENDING TRADES</b>\n"]
+        for slug, trade in pending.items():
+            lines.append(
+                f"  {trade.side} {slug}\n"
+                f"  Entry: {trade.entry_price:.3f} | "
+                f"Size: ${trade.size:.2f}"
+            )
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Main analysis loop
