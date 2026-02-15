@@ -1,0 +1,22 @@
+[Unit]
+Description=BTC Polymarket Edge Finder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=btcedge
+WorkingDirectory=/home/btcedge/BTC-tool
+ExecStart=/home/btcedge/BTC-tool/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/btcedge/BTC-tool/btc_edge.log
+StandardError=append:/home/btcedge/BTC-tool/btc_edge.log
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/btcedge/BTC-tool
+
+[Install]
+WantedBy=multi-user.target

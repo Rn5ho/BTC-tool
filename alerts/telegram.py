@@ -1,12 +1,16 @@
 """Telegram bot for sending edge alerts, trade notifications, and periodic stats.
 
+Also listens for interactive commands (/status, /stats, /help) so the user
+can query the bot on demand from Telegram.
+
 Uses python-telegram-bot library (v21+, async).
 Gracefully degrades if the library is not installed or credentials are missing.
 """
 
+import asyncio
 import logging
 import re
-from typing import Optional
+from typing import Any, Callable, Coroutine, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,9 @@ class TelegramAlerter:
         self.chat_id: str = chat_id
         self._bot: Optional[object] = None
         self._enabled: bool = bool(bot_token and chat_id)
+        self._update_offset: int = 0
+        # Command handlers: command_name -> async fn returning response string
+        self._commands: dict[str, Callable[[], Coroutine[Any, Any, str]]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -177,3 +184,87 @@ class TelegramAlerter:
         """Send an error notification."""
         text = f"\u26a0\ufe0f <b>ERROR:</b> {error}"
         await self._send(text)
+
+    # ------------------------------------------------------------------
+    # Interactive command handling
+    # ------------------------------------------------------------------
+
+    def register_command(
+        self, name: str, handler: Callable[[], Coroutine[Any, Any, str]]
+    ) -> None:
+        """Register an async handler for a bot command.
+
+        Args:
+            name: Command name without the leading slash (e.g. ``"status"``).
+            handler: Async callable that returns the response text (HTML).
+        """
+        self._commands[name.lower()] = handler
+
+    async def run_command_listener(self) -> None:
+        """Poll for incoming Telegram messages and dispatch commands.
+
+        Runs indefinitely. Should be launched as an ``asyncio.Task``.
+        Only processes messages from the configured chat_id.
+        """
+        if not self._enabled or self._bot is None:
+            return
+
+        # Skip any messages that arrived before we started
+        try:
+            updates = await self._bot.get_updates(timeout=0)  # type: ignore[union-attr]
+            if updates:
+                self._update_offset = updates[-1].update_id + 1
+        except Exception:
+            pass
+
+        logger.info("Telegram command listener started")
+
+        while True:
+            try:
+                updates = await self._bot.get_updates(  # type: ignore[union-attr]
+                    offset=self._update_offset, timeout=10,
+                )
+                for update in updates:
+                    self._update_offset = update.update_id + 1
+                    msg = update.message
+                    if msg is None:
+                        continue
+                    # Only respond to our configured chat
+                    if str(msg.chat_id) != str(self.chat_id):
+                        continue
+                    text = (msg.text or "").strip()
+                    if not text.startswith("/"):
+                        continue
+
+                    cmd = text.split()[0].lstrip("/").lower()
+                    # Strip @botname suffix (e.g. /status@Matic5m_bot)
+                    if "@" in cmd:
+                        cmd = cmd.split("@")[0]
+
+                    handler = self._commands.get(cmd)
+                    if handler is not None:
+                        try:
+                            response = await handler()
+                            await self._send(response)
+                        except Exception:
+                            logger.exception("Error handling /%s command", cmd)
+                            await self._send(
+                                f"\u26a0\ufe0f Error processing /{cmd}"
+                            )
+                    elif cmd == "help":
+                        cmds = ", ".join(f"/{c}" for c in sorted(self._commands))
+                        await self._send(
+                            f"\U0001f916 <b>Available commands:</b>\n"
+                            f"{cmds}\n/help"
+                        )
+                    else:
+                        await self._send(
+                            f"Unknown command: /{cmd}\nTry /help"
+                        )
+
+            except asyncio.CancelledError:
+                logger.info("Telegram command listener cancelled")
+                raise
+            except Exception:
+                logger.debug("Command listener poll error", exc_info=True)
+                await asyncio.sleep(5)
