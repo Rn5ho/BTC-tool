@@ -1,10 +1,19 @@
-"""Paper trading engine for simulating bets on Polymarket 5-min BTC markets."""
+"""Paper trading engine for simulating bets on Polymarket 5-min BTC markets.
+
+Accounts for Polymarket taker fees when computing PnL.  Buying shares at
+price *p* with fee factor *f* means you receive fewer shares:
+    shares = (size_usdc / p) * (1 - f)
+On a win the payout is shares * $1, so:
+    win_pnl  = shares - size_usdc
+    loss_pnl = -size_usdc
+"""
 
 import logging
 import time
 from typing import Optional
 
 from data.models import PaperTrade, PolymarketMarket
+from data.polymarket import compute_fee_factor
 from storage.db import Database
 
 logger = logging.getLogger(__name__)
@@ -19,13 +28,37 @@ class PaperTrader:
         bankroll: float = 10000.0,
         bet_size: float = 50.0,
         use_kelly: bool = False,
+        fee_rate: float = 0.0,
+        fee_exponent: int = 2,
     ) -> None:
         self.db = db
         self.bankroll = bankroll
         self.initial_bankroll = bankroll
         self.bet_size = bet_size
         self.use_kelly = use_kelly
+        self.fee_rate = fee_rate
+        self.fee_exponent = fee_exponent
         self._pending_trades: dict[str, dict] = {}
+        self._total_fees: float = 0.0  # cumulative fees paid
+
+    async def restore_bankroll(self) -> None:
+        """Restore bankroll from historical trades in the database.
+
+        On restart the in-memory bankroll resets to initial_bankroll,
+        but the DB still holds P&L from all previous sessions.  This
+        method adds the cumulative historical P&L so the bankroll and
+        the displayed total_pnl stay consistent.
+        """
+        stats = await self.db.get_trading_stats()
+        historical_pnl = stats.get("total_pnl", 0.0)
+        if historical_pnl != 0.0:
+            self.bankroll = self.initial_bankroll + historical_pnl
+            logger.info(
+                "Restored bankroll from DB: initial=$%.2f + historical_pnl=$%+.2f = $%.2f",
+                self.initial_bankroll,
+                historical_pnl,
+                self.bankroll,
+            )
 
     # ------------------------------------------------------------------
     # Sizing
@@ -128,6 +161,7 @@ class PaperTrader:
             "our_prob": signal["our_prob"],
             "market_prob": signal["market_prob"],
             "edge": signal["edge"],
+            "fee_factor": signal.get("fee_factor", 0.0),
         }
 
         logger.info(
@@ -157,12 +191,24 @@ class PaperTrader:
         won = (side == "UP" and btc_went_up) or (side == "DOWN" and not btc_went_up)
         outcome = "WIN" if won else "LOSS"
 
-        # Calculate PnL
+        # Calculate PnL accounting for taker fees.
+        # Fee factor comes from the signal if available, otherwise compute it.
+        fee_factor = info.get("fee_factor", 0.0)
+        if fee_factor == 0.0 and self.fee_rate > 0.0:
+            fee_factor = compute_fee_factor(
+                entry_price, self.fee_rate, self.fee_exponent
+            )
+
+        # Shares received = (size_usdc / price) * (1 - fee_factor)
+        shares = (size_usdc / entry_price) * (1.0 - fee_factor)
+        fee_usdc = size_usdc * fee_factor  # approximate fee in USDC
+        self._total_fees += fee_usdc
+
         if won:
-            # Bought a share at entry_price that is now worth 1.0
-            pnl = size_usdc * ((1.0 - entry_price) / entry_price)
+            # Each winning share pays $1.00
+            pnl = shares - size_usdc
         else:
-            # Share is now worth 0 -- entire stake is lost
+            # Shares worth $0 -- entire stake lost
             pnl = -size_usdc
 
         # Update bankroll
@@ -177,11 +223,12 @@ class PaperTrader:
         del self._pending_trades[market_slug]
 
         logger.info(
-            "Settled %s %s -> %s | pnl=$%.2f | bankroll=$%.2f",
+            "Settled %s %s -> %s | pnl=$%.2f (fee=$%.2f) | bankroll=$%.2f",
             side,
             market_slug,
             outcome,
             pnl,
+            fee_usdc,
             self.bankroll,
         )
 
@@ -217,6 +264,7 @@ class PaperTrader:
         """Return combined trading statistics including current bankroll."""
         stats = await self.db.get_trading_stats()
         stats["bankroll"] = self.bankroll
+        stats["total_fees"] = self._total_fees
         if self.initial_bankroll > 0:
             stats["roi"] = (self.bankroll - self.initial_bankroll) / self.initial_bankroll
         else:
@@ -235,7 +283,8 @@ class PaperTrader:
             f"Total trades: {stats.get('total_trades', 0)} | "
             f"Settled: {stats.get('settled_trades', 0)}\n"
             f"Win rate: {win_rate_pct:.1f}%\n"
-            f"Total P&L: ${stats.get('total_pnl', 0.0):.2f}\n"
+            f"Total P&L: ${stats.get('total_pnl', 0.0):.2f} | "
+            f"Fees paid: ${stats.get('total_fees', 0.0):.2f}\n"
             f"Bankroll: ${stats.get('bankroll', 0.0):.2f} (ROI: {roi_pct:.1f}%)\n"
             f"Avg edge: {avg_edge_pct:.1f}% | "
             f"Avg P&L/trade: ${stats.get('avg_pnl_per_trade', 0.0):.2f}"
