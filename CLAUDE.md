@@ -62,6 +62,9 @@ python -m py_compile main.py config.py data/models.py data/binance_ws.py data/po
 Copy `.env.example` to `.env`. Key settings:
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — optional, alerts disabled if missing
 - `MIN_EDGE_THRESHOLD` — minimum edge to trigger paper trade (default 0.05 = 5%)
+- `MIN_EDGE_DOWN` — minimum edge for DOWN-side trades (default 0.08 = 8%, higher bar because DOWN trades have lower historical win rate)
+- `MAX_EDGE` — maximum edge cap; edges above this are rejected as likely model error (default 0.20 = 20%)
+- `MAX_SIGNAL_VALUE` — skip trades where any single signal exceeds this magnitude (default 0.45; catches saturated OBI/taker near +-0.5 limits)
 - `BET_SIZE_USDC` — fixed bet size per trade (default 50)
 - `VIRTUAL_BANKROLL` — starting paper bankroll (default 10000)
 - `USE_KELLY` — use half-Kelly sizing instead of fixed (default false)
@@ -111,6 +114,9 @@ Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.25, taker=0.25, mome
 - Trades when |best_edge| > MIN_EDGE_THRESHOLD (default 5%) **after fee adjustment**
 - **Time gate**: Only enters trades in the first 120 seconds (2 min) of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
 - **Trend-conflict filter**: If BTC has already moved >0.15% in one direction within the current window and the model's signal is in the *opposite* direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum that the market has correctly priced.
+- **Max edge cap** (default 20%): Edges above `MAX_EDGE` are rejected. If the model claims 20%+ edge over real-money Polymarket odds, the model is more likely wrong than the market. Historical data confirms 20%+ edges win at ~50% — no better than a coin flip.
+- **DOWN-side higher threshold** (default 8%): DOWN trades require a larger edge (`MIN_EDGE_DOWN`) than UP trades. Historical data shows DOWN trades have significantly lower win rate (~33% vs ~64% for UP at 5% threshold).
+- **Signal saturation filter** (default 0.45): When any individual signal exceeds +-`MAX_SIGNAL_VALUE`, the trade is skipped. Extreme readings (e.g. OBI at -0.495) indicate a single noisy input is dominating the model, producing overconfident but unreliable predictions.
 - One pending trade per market slug (no duplicate bets on same 5-min window)
 - Settlement uses Chainlink BTC/USD stream via Polymarket RTDS WebSocket (the actual resolution source); Binance spot as fallback
 - PnL with fees: shares = (size / price) * (1 - fee_factor); WIN = shares - size, LOSS = -size

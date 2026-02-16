@@ -98,6 +98,14 @@ class Orchestrator:
         # intra-window momentum that the market has already priced in.
         self._TREND_CONFLICT_PCT: float = 0.15  # 0.15%
 
+        # Quality filters — keep only high-quality trades.
+        # DOWN trades require a higher edge (data shows worse win rate).
+        self._MIN_EDGE_DOWN: float = settings.min_edge_down
+        # Edges above this cap are likely model error, not real mispricing.
+        self._MAX_EDGE: float = settings.max_edge
+        # Skip when any single signal is near the +-0.5 saturation limits.
+        self._MAX_SIGNAL_VALUE: float = settings.max_signal_value
+
         # Heartbeat tracking — avoids flooding the console
         self._cycle_count: int = 0
         self._last_heartbeat: float = 0.0
@@ -642,6 +650,46 @@ class Orchestrator:
                     window_move_pct,
                 )
                 return
+
+        # 6e. Max edge cap — edges above this are likely model error.
+        #     If our model says 20%+ edge over the market, the model is
+        #     probably wrong, not the market.
+        if signal["edge"] > self._MAX_EDGE:
+            logger.info(
+                "Skipping edge — too large (%.1f%% > %.1f%% cap): likely noise",
+                signal["edge"] * 100,
+                self._MAX_EDGE * 100,
+            )
+            return
+
+        # 6f. DOWN side higher threshold — require stronger edge for DOWN
+        #     trades.  Historical data shows DOWN has much lower win rate
+        #     than UP at the default threshold.
+        if signal["side"] == "DOWN" and signal["edge"] < self._MIN_EDGE_DOWN:
+            logger.info(
+                "Skipping DOWN edge — below DOWN threshold (%.1f%% < %.1f%%)",
+                signal["edge"] * 100,
+                self._MIN_EDGE_DOWN * 100,
+            )
+            return
+
+        # 6g. Signal saturation filter — when any single signal is near
+        #     the +-0.5 limits, the model is likely overreacting to a
+        #     single noisy input rather than seeing a real pattern.
+        signals_data = signal.get("signals", {})
+        saturated = {
+            k: v for k, v in signals_data.items()
+            if abs(v) > self._MAX_SIGNAL_VALUE
+        }
+        if saturated:
+            sat_str = ", ".join(f"{k}={v:+.3f}" for k, v in saturated.items())
+            logger.info(
+                "Skipping edge — saturated signals [%s] (limit=+-%.2f)",
+                sat_str,
+                self._MAX_SIGNAL_VALUE,
+            )
+            return
+
         signals_brief = signal.get("signals", {})
         top_signals = ", ".join(
             f"{k}={v:+.3f}" for k, v in sorted(

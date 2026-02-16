@@ -8,6 +8,9 @@ class Settings(BaseSettings):
 
     # Strategy
     min_edge_threshold: float = 0.05
+    min_edge_down: float = 0.08          # higher bar for DOWN trades (data shows worse win rate)
+    max_edge: float = 0.20               # cap — edges above this are likely model error, not mispricing
+    max_signal_value: float = 0.45       # skip when any single signal is saturated (near +-0.5 limits)
     bet_size_usdc: float = 50.0
     virtual_bankroll: float = 10000.0
     use_kelly: bool = False
