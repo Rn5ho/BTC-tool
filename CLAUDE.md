@@ -4,7 +4,7 @@
 
 BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), computes directional probability estimates for 5-minute price movements, compares them against Polymarket's implied odds, and paper trades when mispricing is detected. Telegram alerts for notifications.
 
-**Status:** Fully functional. Paper trading works end-to-end. Tested on Windows (user runs from `C:\Users\Rn5ho\BTC-tool`). No real-money trading yet — user has expressed interest in adding live trading via Rabby wallet with small trial capital (~$20).
+**Status:** Fully functional. Paper trading works end-to-end. Deployed on **Hetzner VPS** (Ubuntu, systemd service `btc-edge`). Telegram alerts and interactive bot commands are active. No real-money trading yet — user has expressed interest in adding live trading via Rabby wallet with small trial capital (~$20).
 
 ## Tech Stack
 
@@ -35,13 +35,19 @@ strategy/       → Trading logic
   paper_trader.py → Paper trading engine (Kelly/fixed sizing, PnL, settlement)
 
 alerts/
-  telegram.py   → Telegram notifications (edge alerts, trades, settlements, stats)
+  telegram.py   → Telegram notifications (edge alerts, trades, settlements, stats) + interactive bot commands (/status, /stats, /trades, /help)
 
 storage/
   db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots)
 
 config.py       → Pydantic Settings loaded from .env
 main.py         → Async orchestrator wiring all components, console output formatting
+
+deploy/         → Server deployment
+  setup.sh      → Hetzner VPS setup script (Ubuntu 22.04+/Debian 12+, creates btcedge user, venv, systemd service)
+  btc-edge.service → systemd unit file (auto-restart, log to btc_edge.log)
+
+tests/          → Test directory (scaffolded, __init__.py)
 ```
 
 ## Key Commands
@@ -60,7 +66,7 @@ python -m py_compile main.py config.py data/models.py data/binance_ws.py data/po
 ## Configuration
 
 Copy `.env.example` to `.env`. Key settings:
-- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — optional, alerts disabled if missing
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — configured and active on Hetzner deployment
 - `MIN_EDGE_THRESHOLD` — minimum edge to trigger paper trade (default 0.05 = 5%)
 - `BET_SIZE_USDC` — fixed bet size per trade (default 50)
 - `VIRTUAL_BANKROLL` — starting paper bankroll (default 10000)
@@ -130,7 +136,7 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - Paper trading only — no real money integration yet
 - Settlement happens on 5-min window transitions
 - Tool needs ~5 minutes of warmup to buffer 5 closed 1-minute candles before analysis starts
-- Startup runs 4 concurrent asyncio tasks: binance WS, Chainlink RTDS stream, analysis loop (3s cycle), stats loop (30m)
+- Startup runs 5 concurrent asyncio tasks: binance WS, Chainlink RTDS stream, analysis loop (3s cycle), stats loop (30m), Telegram command listener
 
 ## Known Issues & Fixes Applied
 
@@ -141,15 +147,38 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - **Late-window entries**: The analysis loop could place trades at any point during a 5-min window (e.g., 3 minutes in). By then the market has priced in the move and the "edge" is stale. Fixed with a time gate: trades only allowed in the first 120 seconds of each window.
 - **Contrarian bets against strong trends**: The model's mean-reverting signals (OBI from dip-buyers, VWAP "oversold") would produce UP signals during BTC crashes, while the market correctly priced DOWN at 70-80%. The model would see a large "edge" and bet UP against the trend. Fixed with a trend-conflict filter: if BTC has moved >0.15% in one direction within the window and the signal is opposite, the trade is skipped.
 
+## Deployment (Hetzner VPS)
+
+The tool runs as a systemd service on a Hetzner VPS:
+- **Service**: `btc-edge` (auto-restart on failure, 10s restart delay)
+- **User**: `btcedge`, working dir `/home/btcedge/BTC-tool`
+- **Logs**: `/home/btcedge/BTC-tool/btc_edge.log` + systemd journal
+- **Setup**: `deploy/setup.sh` handles full provisioning (packages, user, repo clone, venv, systemd install)
+- **Useful commands**:
+  - `systemctl status btc-edge` / `systemctl restart btc-edge`
+  - `journalctl -u btc-edge -f`
+  - `tail -f /home/btcedge/BTC-tool/btc_edge.log`
+
+## Telegram Bot
+
+Telegram is active with both push alerts and interactive commands:
+- **Push alerts**: Edge detection, trade placement, settlement results, periodic stats, errors
+- **Interactive commands** (user can query from Telegram):
+  - `/status` — current BTC price (Binance + Chainlink), model P(up), market odds, data state
+  - `/stats` — trading performance summary (trades, win rate, PnL, bankroll, ROI)
+  - `/trades` — list pending paper trades
+  - `/help` — list available commands
+- Command listener runs as a dedicated asyncio task polling for updates
+
 ## Conventions
 
 - All async — use `async def` and `await` consistently
 - Logging via `logging.getLogger(__name__)` in every module
 - Dataclasses for data transfer between components (not dicts)
 - Config via pydantic-settings, never hardcoded values
-- Graceful degradation — Telegram disabled silently if unconfigured
+- Graceful degradation — Telegram falls back silently if library missing or credentials absent
 - Console output must be ASCII-safe (no emojis in logger.info — emojis only in Telegram HTML messages)
-- Windows compatibility — no signal handlers (add_signal_handler wrapped in try/except NotImplementedError)
+- Linux deployment (Hetzner VPS) — signal handlers supported; Windows try/except still present for local dev
 
 ## Potential Next Steps
 
