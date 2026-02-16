@@ -8,8 +8,8 @@ class Settings(BaseSettings):
 
     # Strategy
     min_edge_threshold: float = 0.05
-    bet_size_usdc: float = 50.0
-    virtual_bankroll: float = 10000.0
+    bet_size_usdc: float = 5.0
+    virtual_bankroll: float = 100.0
     use_kelly: bool = False
 
     # Data URLs

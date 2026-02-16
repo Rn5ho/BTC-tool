@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), computes directional probability estimates for 5-minute price movements, compares them against Polymarket's implied odds, and paper trades when mispricing is detected. Telegram alerts for notifications.
+BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), computes directional probability estimates for 5-minute price movements, compares them against Polymarket's implied odds, and paper trades when mispricing is detected. Telegram bot for alerts and interactive commands.
 
-**Status:** Fully functional. Paper trading works end-to-end. Deployed on **Hetzner VPS** (Ubuntu, systemd service `btc-edge`). Telegram alerts and interactive bot commands are active. No real-money trading yet — user has expressed interest in adding live trading via Rabby wallet with small trial capital (~$20).
+**Status:** Fully functional and deployed on Hetzner VPS (46.225.27.241) running 24/7 as a systemd service. Paper trading works end-to-end with Polymarket fee model. Interactive Telegram bot with commands for monitoring and management. No real-money trading yet — user has expressed interest in adding live trading via py-clob-client with small trial capital (~$20).
 
 ## Tech Stack
 
@@ -13,7 +13,7 @@ BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance B
 - Polymarket Gamma/CLOB API (market discovery, live prices, no auth needed)
 - Polymarket RTDS WebSocket for Chainlink BTC/USD stream (settlement price — matches Polymarket's resolution source)
 - SQLite via aiosqlite (persistence)
-- python-telegram-bot v21+ (alerts, optional)
+- python-telegram-bot v21+ (interactive bot with commands)
 - pydantic-settings (config from .env)
 - numpy (indicators), no pandas at runtime
 
@@ -31,23 +31,21 @@ signals/        → Signal generation
   probability.py→ Weighted ensemble model → P(up) in [0.05, 0.95]
 
 strategy/       → Trading logic
-  edge.py       → Edge detection (compare P(up) vs Polymarket implied odds, threshold-based)
-  paper_trader.py → Paper trading engine (Kelly/fixed sizing, PnL, settlement)
+  edge.py       → Edge detection (compare P(up) vs Polymarket implied odds, positive-edge only)
+  paper_trader.py → Paper trading engine (Kelly/fixed sizing, PnL with Polymarket fees, settlement)
 
 alerts/
-  telegram.py   → Telegram notifications (edge alerts, trades, settlements, stats) + interactive bot commands (/status, /stats, /trades, /help)
+  telegram.py   → Telegram bot (edge alerts, trade notifications, settlements, interactive commands)
 
 storage/
-  db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots)
+  db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots, historical price lookup)
+
+deploy/         → Hetzner VPS deployment
+  btc-edge.service → systemd service file (runs as btcedge user, auto-restart)
+  setup.sh      → Automated server setup script (Ubuntu/Debian)
 
 config.py       → Pydantic Settings loaded from .env
-main.py         → Async orchestrator wiring all components, console output formatting
-
-deploy/         → Server deployment
-  setup.sh      → Hetzner VPS setup script (Ubuntu 22.04+/Debian 12+, creates btcedge user, venv, systemd service)
-  btc-edge.service → systemd unit file (auto-restart, log to btc_edge.log)
-
-tests/          → Test directory (scaffolded, __init__.py)
+main.py         → Async orchestrator wiring all components, Telegram command handlers, console output
 ```
 
 ## Key Commands
@@ -63,13 +61,50 @@ python main.py
 python -m py_compile main.py config.py data/models.py data/binance_ws.py data/polymarket.py signals/indicators.py signals/features.py signals/probability.py strategy/edge.py strategy/paper_trader.py alerts/telegram.py storage/db.py
 ```
 
+### Hetzner VPS (46.225.27.241)
+
+```bash
+# SSH into server
+ssh root@46.225.27.241
+
+# Check service status
+systemctl status btc-edge
+
+# View logs
+tail -f /home/btcedge/BTC-tool/btc_edge.log
+
+# Deploy latest code
+cd /home/btcedge/BTC-tool
+sudo -u btcedge git pull origin claude/review-claude-md-UPtDE
+sudo systemctl restart btc-edge
+
+# Reset paper trading data
+sudo -u btcedge sqlite3 /home/btcedge/BTC-tool/btc_edge.db "DELETE FROM paper_trades;"
+```
+
+## Telegram Bot Commands
+
+The bot (`@BTC5mBot`) supports interactive commands:
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Current BTC price (Binance + Chainlink), model P(up), market odds, window info |
+| `/stats` | Trading performance: total trades, win rate, P&L, bankroll, ROI |
+| `/trades` | List pending (unsettled) paper trades |
+| `/reset` | Clear all paper trades from DB and reset bankroll to initial value |
+| `/budget` | Show current bankroll and bet size |
+| `/budget 200` | Set bankroll to $200 (also resets initial_bankroll for ROI calculation) |
+| `/help` | List available commands |
+
+Commands are dispatched via long-polling (`get_updates`) in a dedicated asyncio task. Handlers accept an optional args string for commands like `/budget 200`.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Key settings:
-- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — configured and active on Hetzner deployment
-- `MIN_EDGE_THRESHOLD` — minimum edge to trigger paper trade (default 0.05 = 5%)
-- `BET_SIZE_USDC` — fixed bet size per trade (default 50)
-- `VIRTUAL_BANKROLL` — starting paper bankroll (default 10000)
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — optional, alerts disabled if missing
+- `MIN_EDGE_THRESHOLD` — minimum positive edge to trigger paper trade (default 0.05 = 5%)
+- `BET_SIZE_USDC` — fixed bet size per trade (default 5)
+- `VIRTUAL_BANKROLL` — starting paper bankroll (default 100)
 - `USE_KELLY` — use half-Kelly sizing instead of fixed (default false)
 - `W_OBI`, `W_TAKER`, `W_MOMENTUM`, `W_RSI`, `W_VWAP`, `W_FUNDING` — probability model weights (must sum to 1.0)
 
@@ -84,8 +119,10 @@ Binance WS (spot+futures) → Rolling State (candles, orderbook, trades, funding
                               ↓                          ↓
                         Edge Detection          SQLite (log features)
                               ↓
-Polymarket API → Implied P(up)  →  edge = P(up) - implied_P(up)
-                              ↓ (if |edge| > threshold)
+Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
+                              ↓ (if edge > threshold, positive only)
+                        Safety Filters (time gate + trend conflict)
+                              ↓
                         Paper Trader → simulate bet, log to SQLite
                               ↓
                         Telegram Alert → notify user
@@ -107,68 +144,85 @@ Each signal is normalized to [-0.5, 0.5]:
 
 Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.25, taker=0.25, momentum=0.15, RSI=0.15, VWAP=0.10, funding=0.10.
 
-## Edge Detection & Paper Trading
+## Edge Detection & Safety Filters
 
-- Edge = our_P(side) - market_P(side), evaluated for both UP and DOWN sides
-- Trades when |best_edge| > MIN_EDGE_THRESHOLD (default 5%)
-- **Time gate**: Only enters trades in the first 120 seconds (2 min) of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
-- **Trend-conflict filter**: If BTC has already moved >0.15% in one direction within the current window and the model's signal is in the *opposite* direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum that the market has correctly priced.
-- One pending trade per market slug (no duplicate bets on same 5-min window)
-- Settlement uses Chainlink BTC/USD stream via Polymarket RTDS WebSocket (the actual resolution source); Binance spot as fallback
-- PnL: WIN = size * (1 - entry_price) / entry_price, LOSS = -size
-- Stats tracked: total trades, win rate, cumulative PnL, bankroll, ROI
+The edge detector (`strategy/edge.py`) evaluates both sides and only considers **positive** edges:
+
+1. **Edge calculation**: For each side, `edge = our_P(side) - market_P(side)`. Only sides where we think the market underprices (positive edge) are candidates.
+2. **Side selection**: Pick the side with the larger positive edge. If neither side has positive edge, no trade.
+3. **Threshold**: Only trade if `edge > MIN_EDGE_THRESHOLD` (default 5%).
+4. **Time gate** (`_MAX_ENTRY_SECONDS = 120`): Only enter trades in the first 2 minutes of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
+5. **Trend-conflict filter** (`_TREND_CONFLICT_PCT = 0.15`): If BTC has already moved >0.15% in one direction within the current window and the model's signal is the opposite direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum.
+6. **One trade per window**: Only one pending trade per market slug (no duplicate bets on same 5-min window).
+
+## Paper Trading & Fee Model
+
+Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's actual fee structure:
+
+- **Polymarket fee**: 2% on net profit for winning trades (`PROFIT_FEE_RATE = 0.02`)
+- **No fee on losses**: Full stake is lost on losing trades
+- **PnL**: WIN = `size * (1 - entry_price) / entry_price - fee`, LOSS = `-size`
+- **Sizing**: Fixed ($5/trade default) or half-Kelly criterion, never exceeding bankroll
+- **Kelly formula**: `f* = (p*b - q) / b`, half-Kelly with 5% of bankroll cap
+- **Default config**: $100 bankroll, $5 bet size
+
+## Window Lifecycle & Settlement
+
+1. **Window detection**: Slugs are deterministic (`btc-updown-5m-{unix_ts}` where `unix_ts = now - (now % 300)`). The analysis loop detects transitions every 3-second cycle.
+2. **Settlement source**: Chainlink BTC/USD via Polymarket RTDS WebSocket (the actual resolution source). Binance spot as fallback.
+3. **Settlement is decoupled from market discovery**: Window transitions are detected via `get_current_slug()` BEFORE the Gamma API call. This ensures settlement fires even if the Gamma API is slow/fails.
+4. **Startup recovery**: On restart, after the 5-minute buffering phase, window tracking is initialized and any stale unsettled trades from previous sessions are settled using historical candle data from the DB (`get_btc_price_at()`). Trades with no matching candle data are voided (0 PnL).
+
+## Startup Sequence
+
+1. Initialize DB (create tables if needed)
+2. Create PaperTrader, TelegramAlerter
+3. Start Polymarket aiohttp session
+4. Launch 5 concurrent asyncio tasks:
+   - **Binance WS**: Streams kline_1m, depth20, aggTrade, futures funding
+   - **Chainlink RTDS**: Streams BTC/USD from Polymarket's data service
+   - **Analysis loop**: Buffers 5 candles (~5 min), initializes window tracking, settles stale trades, then runs 3-second poll cycle
+   - **Stats loop**: Periodic stats report every 30 minutes
+   - **Telegram command listener**: Long-polls for incoming /commands
 
 ## Console Output Format
 
 The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - **Buffering phase**: `Buffering: 0/5 candles | BTC: $68,562 | trades: 158 | orderbook: yes`
 - **Edge signals**: `>>> EDGE: DOWN btc-updown-5m-... | our=57.0% mkt=48.5% edge=+8.5%`
-- **Settlement**: `--- WINDOW SETTLED: btc-updown-5m-... | BTC $68544 -> $68544 (+0.00 = UP)`
-- **P&L summary**: `--- P&L: $+818.04 | Win rate: 81% (22/27) | Bankroll: $9999.01`
-- **Status heartbeat** (every 30s): `-- Status: BTC $68,679 | P(up)=55.1% | Mkt=50/50 | Trades: 27 (81% win)`
-
-## Key Design Decisions
-
-- Polymarket 5-min BTC market slugs are deterministic: `btc-updown-5m-{unix_ts}` where `unix_ts = now - (now % 300)`
-- All Polymarket market data endpoints are free (no auth needed)
-- Settlement via Chainlink BTC/USD data stream from Polymarket RTDS WebSocket (`wss://ws-live-data.polymarket.com`, topic `crypto_prices_chainlink`) — matches Polymarket's resolution source. Binance spot as fallback.
-- Probability model is a weighted ensemble of normalized signals (v1, no ML)
-- Paper trading only — no real money integration yet
-- Settlement happens on 5-min window transitions
-- Tool needs ~5 minutes of warmup to buffer 5 closed 1-minute candles before analysis starts
-- Startup runs 5 concurrent asyncio tasks: binance WS, Chainlink RTDS stream, analysis loop (3s cycle), stats loop (30m), Telegram command listener
-
-## Known Issues & Fixes Applied
-
-- **Windows cp1252 encoding**: Telegram alert messages contain emojis for HTML formatting. When Telegram is disabled, these were previously logged at INFO level causing `UnicodeEncodeError` on Windows consoles. Fixed by logging at DEBUG level and stripping non-ASCII before debug output (`alerts/telegram.py:79-87`).
-- **Console spam**: Edge signals were logging every 3-second cycle. Fixed with duplicate trade detection — only logs edge once per market slug when a new paper trade is placed.
-- **Heartbeat flooding**: Added 30-second interval between status heartbeats instead of logging every cycle.
-- **Chainlink stale settlement prices**: The on-chain Chainlink aggregator (`latestRoundData()`) has a ~1h heartbeat, returning identical prices for window start and end within 5-min windows. This caused start==end every time, always resolving as UP, inflating win rates to ~82%. Fixed by streaming Chainlink BTC/USD via Polymarket RTDS WebSocket (`wss://ws-live-data.polymarket.com`, topic `crypto_prices_chainlink`) — the same data source Polymarket uses for market resolution. Binance spot is the fallback if the stream is unavailable.
-- **Late-window entries**: The analysis loop could place trades at any point during a 5-min window (e.g., 3 minutes in). By then the market has priced in the move and the "edge" is stale. Fixed with a time gate: trades only allowed in the first 120 seconds of each window.
-- **Contrarian bets against strong trends**: The model's mean-reverting signals (OBI from dip-buyers, VWAP "oversold") would produce UP signals during BTC crashes, while the market correctly priced DOWN at 70-80%. The model would see a large "edge" and bet UP against the trend. Fixed with a trend-conflict filter: if BTC has moved >0.15% in one direction within the window and the signal is opposite, the trade is skipped.
+- **Settlement**: `--- WINDOW SETTLED: btc-updown-5m-... | BTC $68544 -> $68562 (+18.00 = UP) [Chainlink Stream]`
+- **P&L summary**: `--- P&L: $+3.04 | Win rate: 60% (3/5) | Bankroll: $103.04`
+- **Status heartbeat** (every 30s): `-- Status: BTC $68,679 | P(up)=55.1% | Mkt=50/50 | Trades: 5 (60% win)`
 
 ## Deployment (Hetzner VPS)
 
-The tool runs as a systemd service on a Hetzner VPS:
-- **Service**: `btc-edge` (auto-restart on failure, 10s restart delay)
-- **User**: `btcedge`, working dir `/home/btcedge/BTC-tool`
-- **Logs**: `/home/btcedge/BTC-tool/btc_edge.log` + systemd journal
-- **Setup**: `deploy/setup.sh` handles full provisioning (packages, user, repo clone, venv, systemd install)
-- **Useful commands**:
-  - `systemctl status btc-edge` / `systemctl restart btc-edge`
-  - `journalctl -u btc-edge -f`
-  - `tail -f /home/btcedge/BTC-tool/btc_edge.log`
+The bot runs 24/7 on a Hetzner VPS at `46.225.27.241`:
 
-## Telegram Bot
+- **User**: `btcedge` (dedicated, non-root)
+- **Directory**: `/home/btcedge/BTC-tool`
+- **Service**: `btc-edge.service` via systemd (`Restart=always`, `RestartSec=10`)
+- **Logs**: `/home/btcedge/BTC-tool/btc_edge.log` (also via `journalctl -u btc-edge`)
+- **Hardening**: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths=/home/btcedge/BTC-tool`
+- **Setup**: `deploy/setup.sh` automates user creation, repo clone, venv setup, service install
+- **Branch**: Currently tracking `claude/review-claude-md-UPtDE`
 
-Telegram is active with both push alerts and interactive commands:
-- **Push alerts**: Edge detection, trade placement, settlement results, periodic stats, errors
-- **Interactive commands** (user can query from Telegram):
-  - `/status` — current BTC price (Binance + Chainlink), model P(up), market odds, data state
-  - `/stats` — trading performance summary (trades, win rate, PnL, bankroll, ROI)
-  - `/trades` — list pending paper trades
-  - `/help` — list available commands
-- Command listener runs as a dedicated asyncio task polling for updates
+## Known Issues & Fixes Applied
+
+1. **Edge detector betting wrong side** (CRITICAL — fixed): The edge detector picked the side with the largest *absolute* edge rather than the largest *positive* edge. If `up_edge = -17%` and `down_edge = +17%`, it chose UP because `abs(-17%) >= abs(+17%)`. This caused the bot to systematically bet the opposite direction of what the model predicted. Fixed in `strategy/edge.py` to only consider sides with positive edge (where our probability exceeds the market's).
+
+2. **Trades never settling after restart** (fixed): On service restart, `_current_slug` starts as `None`. The first window transition check (`self._current_slug and ...`) evaluated to `False`, silently skipping settlement of all pre-restart trades. Fixed by: (a) initializing window tracking after the buffering phase, (b) adding `_settle_stale_trades()` that pulls unsettled trades from the DB and settles them using historical candle data on startup.
+
+3. **Settlement gated behind market discovery** (fixed): Settlement only happened inside `_run_one_cycle` after `discover_market()` succeeded. If the Gamma API was slow/failed for a new window, trades would never settle. Fixed by computing the slug via `get_current_slug()` and checking for window transitions BEFORE the Gamma API call.
+
+4. **Late-window entries** (fixed): Trades could enter at any point during a 5-min window (e.g., 3 minutes in). By then the market has priced in the move and the "edge" is stale. Fixed with `_MAX_ENTRY_SECONDS = 120` time gate.
+
+5. **Contrarian bets against strong trends** (fixed): Mean-reverting signals (OBI from dip-buyers, VWAP "oversold") produced UP signals during BTC crashes while the market correctly priced DOWN high. Fixed with `_TREND_CONFLICT_PCT = 0.15` trend-conflict filter.
+
+6. **Chainlink stale settlement prices** (fixed): The on-chain Chainlink aggregator has a ~1h heartbeat, returning identical prices for window start and end. This always resolved as UP, inflating win rates to ~82%. Fixed by streaming via Polymarket RTDS WebSocket — the actual resolution source.
+
+7. **Windows cp1252 encoding** (fixed): Telegram emojis logged at INFO level caused `UnicodeEncodeError`. Fixed by logging at DEBUG level with ASCII-only stripping.
+
+8. **Console spam** (fixed): Edge signals logged every 3-second cycle. Fixed with duplicate trade detection and 30-second heartbeat interval.
 
 ## Conventions
 
@@ -176,13 +230,15 @@ Telegram is active with both push alerts and interactive commands:
 - Logging via `logging.getLogger(__name__)` in every module
 - Dataclasses for data transfer between components (not dicts)
 - Config via pydantic-settings, never hardcoded values
-- Graceful degradation — Telegram falls back silently if library missing or credentials absent
+- Graceful degradation — Telegram disabled silently if unconfigured
 - Console output must be ASCII-safe (no emojis in logger.info — emojis only in Telegram HTML messages)
-- Linux deployment (Hetzner VPS) — signal handlers supported; Windows try/except still present for local dev
+- Windows compatibility — no signal handlers (add_signal_handler wrapped in try/except NotImplementedError)
+- Paper trades stored as dicts in `_pending_trades` (keyed by market slug), persisted to SQLite
 
 ## Potential Next Steps
 
-- **Live trading**: User wants to integrate real Polymarket trading via Rabby wallet with ~$20 trial capital. Would require py-clob-client or direct CLOB API integration with wallet signing.
+- **Live trading**: User wants to integrate real Polymarket trading via py-clob-client with ~$20 trial capital. Would require CLOB API integration with wallet signing.
 - **Model improvements**: ML-based probability model, more features (liquidation data, funding rate momentum, cross-exchange flows)
 - **Backtesting**: Replay historical data to validate signal weights
 - **Signal weight optimization**: Use collected SQLite data to tune weights based on actual win rates per signal
+- **Bankroll persistence**: On restart, restore bankroll from DB (initial + cumulative PnL) rather than resetting to config value

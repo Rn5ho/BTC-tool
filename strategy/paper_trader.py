@@ -11,13 +11,21 @@ logger = logging.getLogger(__name__)
 
 
 class PaperTrader:
-    """Simulates placing and settling binary bets on Polymarket 5-min BTC windows."""
+    """Simulates placing and settling binary bets on Polymarket 5-min BTC windows.
+
+    Fee model mirrors Polymarket's actual fee structure:
+    - 2% fee on net profit for winning trades
+    - No fee on losing trades (full stake is lost)
+    """
+
+    # Polymarket fee: 2% of net profit on winning trades
+    PROFIT_FEE_RATE: float = 0.02
 
     def __init__(
         self,
         db: Database,
-        bankroll: float = 10000.0,
-        bet_size: float = 50.0,
+        bankroll: float = 100.0,
+        bet_size: float = 5.0,
         use_kelly: bool = False,
     ) -> None:
         self.db = db
@@ -157,13 +165,16 @@ class PaperTrader:
         won = (side == "UP" and btc_went_up) or (side == "DOWN" and not btc_went_up)
         outcome = "WIN" if won else "LOSS"
 
-        # Calculate PnL
+        # Calculate PnL (with Polymarket fee on winnings)
         if won:
             # Bought a share at entry_price that is now worth 1.0
-            pnl = size_usdc * ((1.0 - entry_price) / entry_price)
+            gross_profit = size_usdc * ((1.0 - entry_price) / entry_price)
+            fee = gross_profit * self.PROFIT_FEE_RATE
+            pnl = gross_profit - fee
         else:
-            # Share is now worth 0 -- entire stake is lost
+            # Share is now worth 0 -- entire stake is lost, no fee
             pnl = -size_usdc
+            fee = 0.0
 
         # Update bankroll
         self.bankroll += pnl
@@ -177,11 +188,12 @@ class PaperTrader:
         del self._pending_trades[market_slug]
 
         logger.info(
-            "Settled %s %s -> %s | pnl=$%.2f | bankroll=$%.2f",
+            "Settled %s %s -> %s | pnl=$%.2f (fee=$%.2f) | bankroll=$%.2f",
             side,
             market_slug,
             outcome,
             pnl,
+            fee,
             self.bankroll,
         )
 

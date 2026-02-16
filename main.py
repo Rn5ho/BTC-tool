@@ -81,7 +81,7 @@ class Orchestrator:
         self._running = False
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
-        self._window_start_time: float = 0.0  # wall-clock time when window started
+        self._window_start_time: float = 0.0  # unix timestamp of window start (from slug)
 
         # Trade entry timing — only enter trades in the first N seconds of a
         # 5-minute window.  After this cutoff the market has already priced in
@@ -96,6 +96,19 @@ class Orchestrator:
 
         # Heartbeat tracking — avoids flooding the console
         self._cycle_count: int = 0
+    @staticmethod
+    def _slug_start_time(slug: str) -> float:
+        """Extract the window start timestamp (seconds) from a market slug.
+
+        Slug format: ``btc-updown-5m-{unix_ts}``.  Returns the unix_ts as a
+        float so the time gate can compute how far into the window we are.
+        Falls back to ``time.time()`` if the slug is malformed.
+        """
+        try:
+            return float(slug.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return time.time()
+
         self._last_heartbeat: float = 0.0
         self._HEARTBEAT_INTERVAL: float = 30.0  # seconds between status lines
 
@@ -187,8 +200,10 @@ class Orchestrator:
         self.alerter.register_command("status", self._cmd_status)
         self.alerter.register_command("stats", self._cmd_stats)
         self.alerter.register_command("trades", self._cmd_trades)
+        self.alerter.register_command("reset", self._cmd_reset)
+        self.alerter.register_command("budget", self._cmd_budget)
 
-    async def _cmd_status(self) -> str:
+    async def _cmd_status(self, args: str = "") -> str:
         """Handle /status — current BTC price, model output, market odds."""
         btc = self.binance.get_latest_price()
         chainlink = self.polymarket.get_chainlink_stream_price()
@@ -229,7 +244,7 @@ class Orchestrator:
             f"Candles: {candles} | Trades: {trades} | OB: {ob}"
         )
 
-    async def _cmd_stats(self) -> str:
+    async def _cmd_stats(self, args: str = "") -> str:
         """Handle /stats — trading performance summary."""
         if not self.paper_trader:
             return "Paper trader not initialized."
@@ -245,7 +260,7 @@ class Orchestrator:
             f"ROI: {stats.get('roi', 0):+.1%}"
         )
 
-    async def _cmd_trades(self) -> str:
+    async def _cmd_trades(self, args: str = "") -> str:
         """Handle /trades — list recent/pending paper trades."""
         if not self.paper_trader:
             return "Paper trader not initialized."
@@ -263,11 +278,59 @@ class Orchestrator:
         lines = [f"\U0001f4dd <b>PENDING TRADES</b>\n"]
         for slug, trade in pending.items():
             lines.append(
-                f"  {trade.side} {slug}\n"
-                f"  Entry: {trade.entry_price:.3f} | "
-                f"Size: ${trade.size:.2f}"
+                f"  {trade['side']} {slug}\n"
+                f"  Entry: {trade['entry_price']:.3f} | "
+                f"Size: ${trade['size_usdc']:.2f}"
             )
         return "\n".join(lines)
+
+    async def _cmd_reset(self, args: str = "") -> str:
+        """Handle /reset — clear all paper trades and reset bankroll."""
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+
+        count = await self.db.clear_paper_trades()
+        self.paper_trader._pending_trades.clear()
+        self.paper_trader.bankroll = self.paper_trader.initial_bankroll
+
+        return (
+            f"\U0001f504 <b>RESET COMPLETE</b>\n\n"
+            f"Cleared {count} trade(s).\n"
+            f"Bankroll: ${self.paper_trader.bankroll:.2f}"
+        )
+
+    async def _cmd_budget(self, args: str = "") -> str:
+        """Handle /budget [amount] — show or set the bankroll.
+
+        /budget        — show current bankroll and bet size
+        /budget 200    — set bankroll to $200
+        """
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+
+        if not args.strip():
+            return (
+                f"\U0001f4b0 <b>BUDGET</b>\n\n"
+                f"Bankroll: <b>${self.paper_trader.bankroll:.2f}</b>\n"
+                f"Initial: ${self.paper_trader.initial_bankroll:.2f}\n"
+                f"Bet size: ${self.paper_trader.bet_size:.2f}\n"
+                f"Kelly: {'on' if self.paper_trader.use_kelly else 'off'}"
+            )
+
+        try:
+            amount = float(args.strip())
+            if amount <= 0:
+                return "Amount must be positive."
+        except ValueError:
+            return f"Invalid amount: {args.strip()}\nUsage: /budget 200"
+
+        self.paper_trader.bankroll = amount
+        self.paper_trader.initial_bankroll = amount
+
+        return (
+            f"\U0001f4b0 <b>BUDGET UPDATED</b>\n\n"
+            f"Bankroll set to <b>${amount:.2f}</b>"
+        )
 
     # ------------------------------------------------------------------
     # Main analysis loop
@@ -299,6 +362,24 @@ class Orchestrator:
             "Initial data ready — %d candles buffered", len(self.binance.candles)
         )
 
+        # Initialize window tracking now that we have price data
+        self._current_slug = self.polymarket.get_current_slug()
+        self._window_start_time = self._slug_start_time(self._current_slug)
+        self._window_btc_start = self.polymarket.get_chainlink_stream_price()
+        price_source = "Chainlink Stream"
+        if self._window_btc_start is None:
+            self._window_btc_start = self.binance.get_latest_price()
+            price_source = "Binance (fallback)"
+        logger.info(
+            "Initialized window: %s | BTC start: $%.2f [%s]",
+            self._current_slug,
+            self._window_btc_start or 0,
+            price_source,
+        )
+
+        # Settle any stale unsettled trades from previous sessions
+        await self._settle_stale_trades()
+
         while self._running:
             try:
                 await self._run_one_cycle()
@@ -311,17 +392,15 @@ class Orchestrator:
     async def _run_one_cycle(self) -> None:
         """Single iteration of the analysis pipeline."""
 
-        # 1. Discover current Polymarket market
-        market = await self.polymarket.discover_market()
-        if market is None:
-            return
-
-        # Detect window transitions for settlement
-        if self._current_slug and self._current_slug != market.slug:
+        # 0. Check for window transitions BEFORE market discovery.
+        #    Settlement must not depend on the Gamma API succeeding —
+        #    otherwise trades remain unsettled if discovery is slow/fails.
+        current_slug = self.polymarket.get_current_slug()
+        if self._current_slug and self._current_slug != current_slug:
             await self._settle_previous_window()
-        if self._current_slug != market.slug:
-            self._current_slug = market.slug
-            self._window_start_time = time.time()
+        if self._current_slug != current_slug:
+            self._current_slug = current_slug
+            self._window_start_time = self._slug_start_time(current_slug)
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
             price_source = "Chainlink Stream"
@@ -330,10 +409,15 @@ class Orchestrator:
                 price_source = "Binance (fallback)"
             logger.info(
                 "New window: %s | BTC start: $%.2f [%s]",
-                market.slug,
+                current_slug,
                 self._window_btc_start or 0,
                 price_source,
             )
+
+        # 1. Discover current Polymarket market
+        market = await self.polymarket.discover_market()
+        if market is None:
+            return
 
         # 2. Refresh live Polymarket prices
         prices = await self.polymarket.get_live_prices(market)
@@ -544,6 +628,82 @@ class Orchestrator:
 
             if self.alerter:
                 await self.alerter.send_stats_summary(stats)
+
+    async def _settle_stale_trades(self) -> None:
+        """Settle any unsettled trades from previous sessions whose windows have ended.
+
+        On restart, in-memory state is lost and window transitions that
+        occurred while the service was down (or during the buffering phase)
+        are never detected.  This method pulls unsettled trades from the DB,
+        looks up BTC prices from stored candle data, and settles them.
+        """
+        if not self.paper_trader:
+            return
+
+        unsettled = await self.db.get_unsettled_trades()
+        current_slug = self._current_slug or self.polymarket.get_current_slug()
+
+        stale = [r for r in unsettled if r["market_slug"] != current_slug]
+        if not stale:
+            return
+
+        logger.info(
+            "Found %d stale unsettled trade(s) from previous session — settling",
+            len(stale),
+        )
+
+        for row in stale:
+            slug = row["market_slug"]
+
+            # Extract window timestamp from slug: btc-updown-5m-{ts}
+            try:
+                window_ts = int(slug.rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                logger.warning("Cannot parse window ts from slug %s — voiding trade", slug)
+                await self.db.update_paper_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            window_start_ms = window_ts * 1000
+            window_end_ms = (window_ts + 300) * 1000
+
+            btc_start = await self.db.get_btc_price_at(window_start_ms)
+            btc_end = await self.db.get_btc_price_at(window_end_ms)
+
+            if btc_start is None or btc_end is None:
+                logger.warning(
+                    "No candle data for window %s — voiding trade %d",
+                    slug,
+                    row["id"],
+                )
+                await self.db.update_paper_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            btc_went_up = btc_end >= btc_start
+
+            # Load into paper_trader and use its settlement logic
+            self.paper_trader._pending_trades[slug] = {
+                "trade_id": row["id"],
+                "side": row["side"],
+                "size_usdc": row["size_usdc"],
+                "entry_price": row["entry_price"],
+                "our_prob": row["our_prob"],
+                "market_prob": row["market_prob"],
+                "edge": row["edge"],
+            }
+            await self.paper_trader.settle_trade(slug, btc_went_up)
+
+            logger.info(
+                "Settled stale trade: %s %s | BTC $%.2f -> $%.2f (%s)",
+                row["side"],
+                slug,
+                btc_start,
+                btc_end,
+                "UP" if btc_went_up else "DOWN",
+            )
 
     # ------------------------------------------------------------------
     # Periodic stats reporting

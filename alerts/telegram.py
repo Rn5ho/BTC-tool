@@ -41,8 +41,8 @@ class TelegramAlerter:
         self._bot: Optional[object] = None
         self._enabled: bool = bool(bot_token and chat_id)
         self._update_offset: int = 0
-        # Command handlers: command_name -> async fn returning response string
-        self._commands: dict[str, Callable[[], Coroutine[Any, Any, str]]] = {}
+        # Command handlers: command_name -> async fn(args) returning response string
+        self._commands: dict[str, Callable[[str], Coroutine[Any, Any, str]]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -190,13 +190,14 @@ class TelegramAlerter:
     # ------------------------------------------------------------------
 
     def register_command(
-        self, name: str, handler: Callable[[], Coroutine[Any, Any, str]]
+        self, name: str, handler: Callable[[str], Coroutine[Any, Any, str]]
     ) -> None:
         """Register an async handler for a bot command.
 
         Args:
             name: Command name without the leading slash (e.g. ``"status"``).
-            handler: Async callable that returns the response text (HTML).
+            handler: Async callable that accepts an args string and returns
+                the response text (HTML).
         """
         self._commands[name.lower()] = handler
 
@@ -236,7 +237,9 @@ class TelegramAlerter:
                     if not text.startswith("/"):
                         continue
 
-                    cmd = text.split()[0].lstrip("/").lower()
+                    parts = text.split(maxsplit=1)
+                    cmd = parts[0].lstrip("/").lower()
+                    args = parts[1] if len(parts) > 1 else ""
                     # Strip @botname suffix (e.g. /status@Matic5m_bot)
                     if "@" in cmd:
                         cmd = cmd.split("@")[0]
@@ -244,7 +247,7 @@ class TelegramAlerter:
                     handler = self._commands.get(cmd)
                     if handler is not None:
                         try:
-                            response = await handler()
+                            response = await handler(args)
                             await self._send(response)
                         except Exception:
                             logger.exception("Error handling /%s command", cmd)
