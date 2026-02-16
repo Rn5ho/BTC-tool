@@ -125,6 +125,7 @@ class Orchestrator:
             fee_rate=settings.polymarket_fee_rate,
             fee_exponent=settings.polymarket_fee_exponent,
         )
+        await self.paper_trader.restore_bankroll()
 
         # Telegram alerter
         from alerts.telegram import TelegramAlerter

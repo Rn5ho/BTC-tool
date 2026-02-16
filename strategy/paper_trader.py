@@ -41,6 +41,25 @@ class PaperTrader:
         self._pending_trades: dict[str, dict] = {}
         self._total_fees: float = 0.0  # cumulative fees paid
 
+    async def restore_bankroll(self) -> None:
+        """Restore bankroll from historical trades in the database.
+
+        On restart the in-memory bankroll resets to initial_bankroll,
+        but the DB still holds P&L from all previous sessions.  This
+        method adds the cumulative historical P&L so the bankroll and
+        the displayed total_pnl stay consistent.
+        """
+        stats = await self.db.get_trading_stats()
+        historical_pnl = stats.get("total_pnl", 0.0)
+        if historical_pnl != 0.0:
+            self.bankroll = self.initial_bankroll + historical_pnl
+            logger.info(
+                "Restored bankroll from DB: initial=$%.2f + historical_pnl=$%+.2f = $%.2f",
+                self.initial_bankroll,
+                historical_pnl,
+                self.bankroll,
+            )
+
     # ------------------------------------------------------------------
     # Sizing
     # ------------------------------------------------------------------
