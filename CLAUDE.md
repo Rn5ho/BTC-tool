@@ -157,9 +157,22 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - Console output must be ASCII-safe (no emojis in logger.info — emojis only in Telegram HTML messages)
 - Windows compatibility — no signal handlers (add_signal_handler wrapped in try/except NotImplementedError)
 
-## Potential Next Steps
+## Current Status & Performance
 
-- **Live trading**: User wants to integrate real Polymarket trading with ~$20 trial capital on $1 trades. Builder Mode credentials and fee calculation are already configured — remaining work is the order placement layer (py-clob-client or direct CLOB API with wallet signing).
-- **Model improvements**: ML-based probability model, more features (liquidation data, funding rate momentum, cross-exchange flows)
-- **Backtesting**: Replay historical data to validate signal weights
-- **Signal weight optimization**: Use collected SQLite data to tune weights based on actual win rates per signal
+After ~109 settled trades, win rate is **47.7%** — essentially coin-flip territory. The rule-based weighted ensemble does not appear to have real predictive edge against Polymarket's efficient 5-min BTC market. Fee model is verified correct (matches Polymarket docs). The P&L/bankroll inconsistency across restarts has been fixed (`restore_bankroll()`).
+
+An analysis script (`analyze_trades.py`) is available to diagnose which signals help/hurt. Run `python analyze_trades.py` in the same directory as `btc_edge.db`. It includes a logistic regression ML model to test if any feature combination is learnable.
+
+## Infrastructure
+
+- **User runs on Windows** (`C:\Users\Rn5ho\BTC-tool`) — currently the only deployment.
+- **Hetzner VPS available** — user has existing Hetzner infrastructure. BTC tool is NOT yet deployed there.
+- **Goal**: Deploy to Hetzner so it runs 24/7 and is manageable from phone via Telegram.
+
+## Potential Next Steps (Priority Order)
+
+1. **Run `analyze_trades.py`** — before any other work, analyze the collected data to determine if there's any salvageable signal. If ML finds nothing, further development may not be worthwhile.
+2. **Deploy to Hetzner VPS** — set up as a systemd service, auto-restart on failure. Move the DB there so it's always accessible.
+3. **Enhance Telegram bot** — add `/analyze` (run analysis remotely), `/weights` (view/change weights live), `/pause`/`/resume` (stop/start trading without killing process), `/reset` (clear DB).
+4. **ML-based probability model** — if `analyze_trades.py` shows any signal has predictive power, replace the hand-tuned ensemble with a logistic regression or gradient-boosted model trained on collected data.
+5. **Live trading** — only pursue if the model demonstrates consistent >52% win rate after fees. Builder Mode credentials and fee calculation are already configured — remaining work is the order placement layer.
