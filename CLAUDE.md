@@ -103,6 +103,7 @@ Commands are dispatched via long-polling (`get_updates`) in a dedicated asyncio 
 Copy `.env.example` to `.env`. Key settings:
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — optional, alerts disabled if missing
 - `MIN_EDGE_THRESHOLD` — minimum positive edge to trigger paper trade (default 0.05 = 5%)
+- `MAX_EDGE_THRESHOLD` — maximum edge cap; edges above this are rejected as model overconfidence (default 0.20 = 20%)
 - `BET_SIZE_USDC` — fixed bet size per trade (default 5)
 - `VIRTUAL_BANKROLL` — starting paper bankroll (default 100)
 - `USE_KELLY` — use half-Kelly sizing instead of fixed (default false)
@@ -151,6 +152,7 @@ The edge detector (`strategy/edge.py`) evaluates both sides and only considers *
 1. **Edge calculation**: For each side, `edge = our_P(side) - market_P(side)`. Only sides where we think the market underprices (positive edge) are candidates.
 2. **Side selection**: Pick the side with the larger positive edge. If neither side has positive edge, no trade.
 3. **Threshold**: Only trade if `edge > MIN_EDGE_THRESHOLD` (default 5%).
+3b. **Max edge cap** (`MAX_EDGE_THRESHOLD = 0.20`): Edges above 20% are rejected. Data shows the model's 20%+ edge trades win only 31% — when the model massively disagrees with the market, the market is usually right. Added based on analysis of 108 trades on 2026-02-16.
 4. **Time gate** (`_MAX_ENTRY_SECONDS = 120`): Only enter trades in the first 2 minutes of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
 5. **Trend-conflict filter** (`_TREND_CONFLICT_PCT = 0.15`): If BTC has already moved >0.15% in one direction within the current window and the model's signal is the opposite direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum.
 6. **One trade per window**: Only one pending trade per market slug (no duplicate bets on same 5-min window).

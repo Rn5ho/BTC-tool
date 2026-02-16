@@ -13,12 +13,15 @@ class EdgeDetector:
     """Find edges between our probability model and Polymarket prices."""
 
     def __init__(
-        self, model: ProbabilityModel, min_edge: float = 0.05
+        self, model: ProbabilityModel, min_edge: float = 0.05, max_edge: float = 0.20
     ) -> None:
         self.model = model
         self.min_edge = min_edge
+        self.max_edge = max_edge
         logger.info(
-            "EdgeDetector initialised with min_edge=%.2f", self.min_edge
+            "EdgeDetector initialised with min_edge=%.2f, max_edge=%.2f",
+            self.min_edge,
+            self.max_edge,
         )
 
     def evaluate(
@@ -67,6 +70,16 @@ class EdgeDetector:
                 "No actionable edge (best=%.4f, threshold=%.4f)",
                 best_edge,
                 self.min_edge,
+            )
+            return None
+
+        if best_edge > self.max_edge:
+            logger.info(
+                "Skipping edge — too large (%.1f%% > %.1f%% cap) on %s %s — model likely overconfident",
+                best_edge * 100,
+                self.max_edge * 100,
+                best_side,
+                market.slug,
             )
             return None
 

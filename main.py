@@ -73,6 +73,7 @@ class Orchestrator:
         self.edge_detector = EdgeDetector(
             model=self.model,
             min_edge=settings.min_edge_threshold,
+            max_edge=settings.max_edge_threshold,
         )
         self.paper_trader = None  # initialized in start()
         self.alerter = None       # initialized in start()
