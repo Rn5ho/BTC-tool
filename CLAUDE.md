@@ -166,7 +166,7 @@ An analysis script (`analyze_trades.py`) is available to diagnose which signals 
 ## Infrastructure
 
 - **User runs on Windows** (`C:\Users\Rn5ho\BTC-tool`) — currently the only deployment.
-- **Hetzner VPS available** — user has existing Hetzner infrastructure. BTC tool is NOT yet deployed there.
+- **Hetzner VPS**: Server name **matic-tb**, IP `46.225.27.241`, CPX22 (3 vCPU, 4GB RAM), Nuremberg DC, Debian/Ubuntu. SSH: `ssh root@46.225.27.241`. BTC tool is NOT yet deployed there.
 - **Goal**: Deploy to Hetzner so it runs 24/7 and is manageable from phone via Telegram.
 
 ## Potential Next Steps (Priority Order)
