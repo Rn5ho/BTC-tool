@@ -136,7 +136,7 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - Paper trading only — no real money integration yet (order placement layer still needed)
 - Settlement happens on 5-min window transitions
 - Tool needs ~5 minutes of warmup to buffer 5 closed 1-minute candles before analysis starts
-- Startup runs 4 concurrent asyncio tasks: binance WS, Chainlink RTDS stream, analysis loop (3s cycle), stats loop (30m)
+- Startup runs 5 concurrent asyncio tasks: binance WS, Chainlink RTDS stream, analysis loop (3s cycle), stats loop (30m), Telegram command listener
 
 ## Known Issues & Fixes Applied
 
@@ -146,6 +146,8 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - **Chainlink stale settlement prices**: The on-chain Chainlink aggregator (`latestRoundData()`) has a ~1h heartbeat, returning identical prices for window start and end within 5-min windows. This caused start==end every time, always resolving as UP, inflating win rates to ~82%. Fixed by streaming Chainlink BTC/USD via Polymarket RTDS WebSocket (`wss://ws-live-data.polymarket.com`, topic `crypto_prices_chainlink`) — the same data source Polymarket uses for market resolution. Binance spot is the fallback if the stream is unavailable.
 - **Late-window entries**: The analysis loop could place trades at any point during a 5-min window (e.g., 3 minutes in). By then the market has priced in the move and the "edge" is stale. Fixed with a time gate: trades only allowed in the first 120 seconds of each window.
 - **Contrarian bets against strong trends**: The model's mean-reverting signals (OBI from dip-buyers, VWAP "oversold") would produce UP signals during BTC crashes, while the market correctly priced DOWN at 70-80%. The model would see a large "edge" and bet UP against the trend. Fixed with a trend-conflict filter: if BTC has moved >0.15% in one direction within the window and the signal is opposite, the trade is skipped.
+- **Duplicate log lines on Hetzner**: `setup_logging()` added both a StreamHandler and FileHandler(`btc_edge.log`). Under systemd, stdout is already captured to the same file via `StandardOutput=append`, causing every line to appear twice. Fixed by only adding FileHandler when stdout is a TTY (interactive).
+- **httpx log spam**: Telegram's `getUpdates` polling logged every 10 seconds via httpx at INFO level. Fixed by setting httpx/httpcore loggers to WARNING.
 
 ## Conventions
 
@@ -159,20 +161,21 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 
 ## Current Status & Performance
 
-After ~109 settled trades, win rate is **47.7%** — essentially coin-flip territory. The rule-based weighted ensemble does not appear to have real predictive edge against Polymarket's efficient 5-min BTC market. Fee model is verified correct (matches Polymarket docs). The P&L/bankroll inconsistency across restarts has been fixed (`restore_bankroll()`).
+After ~115 settled trades on Hetzner, win rate is **48.7%** with **+$36.14 P&L** (+8.5% ROI, $5 bets). Profitable despite sub-50% win rate because winners pay more than losers cost at asymmetric prices. Fee model is verified correct (matches Polymarket docs). The P&L/bankroll inconsistency across restarts has been fixed (`restore_bankroll()`).
 
 An analysis script (`analyze_trades.py`) is available to diagnose which signals help/hurt. Run `python analyze_trades.py` in the same directory as `btc_edge.db`. It includes a logistic regression ML model to test if any feature combination is learnable.
 
 ## Infrastructure
 
-- **User runs on Windows** (`C:\Users\Rn5ho\BTC-tool`) — currently the only deployment.
-- **Hetzner VPS**: Server name **matic-tb**, IP `46.225.27.241`, CPX22 (3 vCPU, 4GB RAM), Nuremberg DC, Debian/Ubuntu. SSH: `ssh root@46.225.27.241`. BTC tool is NOT yet deployed there.
-- **Goal**: Deploy to Hetzner so it runs 24/7 and is manageable from phone via Telegram.
+- **User runs on Windows** (`C:\Users\Rn5ho\BTC-tool`) — local development.
+- **Hetzner VPS**: Server name **matic-tb**, IP `46.225.27.241`, CPX22 (3 vCPU, 4GB RAM), Nuremberg DC, Ubuntu 24.04. SSH: `ssh root@46.225.27.241`. Deployed as systemd service `btc-edge` under user `btcedge` at `/home/btcedge/BTC-tool`.
+- Deployment via `deploy/setup.sh` (run as root) — clones repo, sets up venv, installs deps, configures systemd.
+- To update after code changes: SSH in, `cd /home/btcedge/BTC-tool && sudo -u btcedge git pull origin master && systemctl restart btc-edge`.
 
 ## Potential Next Steps (Priority Order)
 
-1. **Run `analyze_trades.py`** — before any other work, analyze the collected data to determine if there's any salvageable signal. If ML finds nothing, further development may not be worthwhile.
-2. **Deploy to Hetzner VPS** — set up as a systemd service, auto-restart on failure. Move the DB there so it's always accessible.
-3. **Enhance Telegram bot** — add `/analyze` (run analysis remotely), `/weights` (view/change weights live), `/pause`/`/resume` (stop/start trading without killing process), `/reset` (clear DB).
-4. **ML-based probability model** — if `analyze_trades.py` shows any signal has predictive power, replace the hand-tuned ensemble with a logistic regression or gradient-boosted model trained on collected data.
+1. ~~**Run `analyze_trades.py`**~~ — use `/analyze` command in Telegram or run `python analyze_trades.py` on the server.
+2. ~~**Deploy to Hetzner VPS**~~ — DONE. Running as `btc-edge` systemd service.
+3. ~~**Enhance Telegram bot**~~ — DONE. Commands: `/status`, `/stats`, `/trades`, `/pause`, `/resume`, `/weights`, `/analyze`, `/reset`, `/help`.
+4. **ML-based probability model** — if `/analyze` shows any signal has predictive power, replace the hand-tuned ensemble with a logistic regression or gradient-boosted model trained on collected data.
 5. **Live trading** — only pursue if the model demonstrates consistent >52% win rate after fees. Builder Mode credentials and fee calculation are already configured — remaining work is the order placement layer.

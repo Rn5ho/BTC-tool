@@ -31,17 +31,18 @@ logger = logging.getLogger("btc_edge")
 
 def setup_logging() -> None:
     fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("btc_edge.log"),
-        ],
-    )
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    # Only add a FileHandler when running interactively (TTY).  Under systemd,
+    # stdout is already redirected to btc_edge.log via StandardOutput=append,
+    # so a second FileHandler would duplicate every line.
+    if sys.stdout.isatty():
+        handlers.append(logging.FileHandler("btc_edge.log"))
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
     # Quieten noisy libraries
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,7 @@ class Orchestrator:
 
         # State
         self._running = False
+        self._paused = False  # when True, analysis loop skips trading
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
         self._window_start_time: float = 0.0  # wall-clock time when window started
@@ -192,6 +194,11 @@ class Orchestrator:
         self.alerter.register_command("status", self._cmd_status)
         self.alerter.register_command("stats", self._cmd_stats)
         self.alerter.register_command("trades", self._cmd_trades)
+        self.alerter.register_command("pause", self._cmd_pause)
+        self.alerter.register_command("resume", self._cmd_resume)
+        self.alerter.register_command("weights", self._cmd_weights)
+        self.alerter.register_command("analyze", self._cmd_analyze)
+        self.alerter.register_command("reset", self._cmd_reset)
 
     async def _cmd_status(self) -> str:
         """Handle /status — current BTC price, model output, market odds."""
@@ -223,9 +230,11 @@ class Orchestrator:
             mkt_str = f"Up {market.up_price:.0%} / Down {market.down_price:.0%}"
 
         slug = self._current_slug or "none"
+        state = "\u23f8 PAUSED" if self._paused else "\u25b6 ACTIVE"
 
         return (
             f"\U0001f4ca <b>STATUS</b>\n\n"
+            f"State: <b>{state}</b>\n"
             f"BTC (Binance): <b>${btc:,.2f}</b>\n"
             f"BTC (Chainlink): {f'<b>${chainlink:,.2f}</b>' if chainlink else 'N/A'}\n"
             f"Window: {slug}\n"
@@ -273,6 +282,182 @@ class Orchestrator:
                 f"Size: ${trade.size:.2f}"
             )
         return "\n".join(lines)
+
+    async def _cmd_pause(self) -> str:
+        """Handle /pause — stop placing new trades (data collection continues)."""
+        if self._paused:
+            return "\u23f8 Already paused. Use /resume to restart trading."
+        self._paused = True
+        logger.info("Trading PAUSED via Telegram command")
+        return (
+            "\u23f8 <b>Trading PAUSED</b>\n\n"
+            "Data collection and analysis continue.\n"
+            "No new trades will be placed.\n"
+            "Pending trades will still settle.\n"
+            "Use /resume to restart."
+        )
+
+    async def _cmd_resume(self) -> str:
+        """Handle /resume — resume placing trades."""
+        if not self._paused:
+            return "\u25b6 Already running. Trading is active."
+        self._paused = False
+        logger.info("Trading RESUMED via Telegram command")
+        return (
+            "\u25b6 <b>Trading RESUMED</b>\n\n"
+            "New trades will be placed when edge is detected."
+        )
+
+    async def _cmd_weights(self) -> str:
+        """Handle /weights — show current probability model weights."""
+        w = self.model.weights
+        lines = ["\u2696 <b>MODEL WEIGHTS</b>\n"]
+        for name, value in sorted(w.items()):
+            bar_len = int(value * 40)
+            bar = "\u2588" * bar_len
+            lines.append(f"  {name:<10s} {value:.2f}  {bar}")
+        total = sum(w.values())
+        lines.append(f"\n  Total: {total:.2f}")
+        return "\n".join(lines)
+
+    async def _cmd_analyze(self) -> str:
+        """Handle /analyze — run trade analysis on the server DB."""
+        try:
+            import sqlite3 as _sqlite3
+            from collections import defaultdict as _defaultdict
+
+            conn = _sqlite3.connect(self.db.db_path)
+            conn.row_factory = _sqlite3.Row
+            trades = [dict(r) for r in conn.execute(
+                "SELECT * FROM paper_trades WHERE outcome IS NOT NULL ORDER BY timestamp"
+            ).fetchall()]
+            conn.close()
+
+            if not trades:
+                return "\u26a0 No settled trades to analyze."
+
+            total = len(trades)
+            wins = sum(1 for t in trades if t["outcome"] == "WIN")
+            losses = total - wins
+            total_pnl = sum(t["pnl"] or 0 for t in trades)
+            avg_pnl = total_pnl / total if total else 0
+
+            # Edge bucket analysis
+            buckets = [
+                ("5-8%", 0.05, 0.08), ("8-12%", 0.08, 0.12),
+                ("12-16%", 0.12, 0.16), ("16-20%", 0.16, 0.20),
+                ("20%+", 0.20, 1.00),
+            ]
+            edge_lines = []
+            for label, lo, hi in buckets:
+                subset = [t for t in trades if lo <= t["edge"] < hi]
+                if not subset:
+                    continue
+                bwins = sum(1 for t in subset if t["outcome"] == "WIN")
+                bwr = bwins / len(subset) * 100
+                bpnl = sum(t["pnl"] or 0 for t in subset)
+                edge_lines.append(
+                    f"  {label:>6s}: {bwr:.0f}% ({bwins}/{len(subset)}) ${bpnl:+.2f}"
+                )
+
+            # Side analysis
+            side_lines = []
+            for side in ("UP", "DOWN"):
+                subset = [t for t in trades if t["side"] == side]
+                if not subset:
+                    continue
+                swins = sum(1 for t in subset if t["outcome"] == "WIN")
+                swr = swins / len(subset) * 100
+                spnl = sum(t["pnl"] or 0 for t in subset)
+                side_lines.append(
+                    f"  {side}: {swr:.0f}% ({swins}/{len(subset)}) ${spnl:+.2f}"
+                )
+
+            # Hour analysis (top 3 best, worst)
+            from datetime import datetime, timezone
+            hour_stats: dict[int, list[bool]] = _defaultdict(list)
+            for t in trades:
+                ts = t["timestamp"] / 1000
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                hour_stats[dt.hour].append(t["outcome"] == "WIN")
+
+            hour_lines = []
+            if hour_stats:
+                ranked_hours = sorted(
+                    hour_stats.items(),
+                    key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 0,
+                    reverse=True,
+                )
+                best = ranked_hours[:3]
+                worst = ranked_hours[-3:]
+                hour_lines.append("  Best hours:")
+                for h, ws in best:
+                    wr = sum(ws) / len(ws) * 100
+                    hour_lines.append(f"    {h:02d}:00 UTC  {wr:.0f}% ({len(ws)} trades)")
+                hour_lines.append("  Worst hours:")
+                for h, ws in worst:
+                    wr = sum(ws) / len(ws) * 100
+                    hour_lines.append(f"    {h:02d}:00 UTC  {wr:.0f}% ({len(ws)} trades)")
+
+            text = (
+                f"\U0001f4ca <b>TRADE ANALYSIS</b>\n\n"
+                f"<b>Overall:</b>\n"
+                f"  Trades: {total} | W/L: {wins}/{losses}\n"
+                f"  Win rate: {wins/total*100:.1f}%\n"
+                f"  P&amp;L: ${total_pnl:+.2f} (avg ${avg_pnl:+.2f})\n\n"
+                f"<b>By edge size:</b>\n"
+                + "\n".join(edge_lines) + "\n\n"
+                f"<b>By side:</b>\n"
+                + "\n".join(side_lines)
+            )
+            if hour_lines:
+                text += "\n\n<b>By hour (UTC):</b>\n" + "\n".join(hour_lines)
+
+            return text
+
+        except Exception as e:
+            logger.exception("Error running /analyze")
+            return f"\u26a0 Analysis error: {e}"
+
+    async def _cmd_reset(self) -> str:
+        """Handle /reset — clear all trade data and reset bankroll.
+
+        This is a destructive operation so requires confirmation via
+        a second /reset within 30 seconds.
+        """
+        now = time.time()
+        # Simple confirmation: first /reset sets a timestamp, second /reset
+        # within 30s actually resets.
+        if hasattr(self, "_reset_requested_at") and now - self._reset_requested_at < 30:
+            try:
+                # Clear trades from DB
+                await self.db._db.execute("DELETE FROM paper_trades")
+                await self.db._db.execute("DELETE FROM feature_snapshots")
+                await self.db._db.execute("DELETE FROM market_snapshots")
+                await self.db._db.commit()
+
+                # Reset in-memory state
+                self.paper_trader._pending_trades.clear()
+                self.paper_trader._total_fees = 0.0
+                self.paper_trader.bankroll = self.paper_trader.initial_bankroll
+
+                self._reset_requested_at = 0
+                logger.info("Database RESET via Telegram command")
+                return (
+                    "\U0001f5d1 <b>RESET COMPLETE</b>\n\n"
+                    f"All trades cleared.\n"
+                    f"Bankroll reset to ${self.paper_trader.initial_bankroll:.2f}"
+                )
+            except Exception as e:
+                logger.exception("Error during reset")
+                return f"\u26a0 Reset failed: {e}"
+        else:
+            self._reset_requested_at = now
+            return (
+                "\u26a0 <b>CONFIRM RESET</b>\n\n"
+                "This will delete ALL trade data and reset the bankroll.\n"
+                "Send /reset again within 30 seconds to confirm."
+            )
 
     # ------------------------------------------------------------------
     # Main analysis loop
@@ -417,7 +602,11 @@ class Orchestrator:
 
         # 6. Edge found — apply safety filters before trading.
 
-        # 6a. Skip if we already have a pending trade on this market.
+        # 6a. Skip if trading is paused.
+        if self._paused:
+            return
+
+        # 6b. Skip if we already have a pending trade on this market.
         if (
             self.paper_trader
             and market.slug in self.paper_trader._pending_trades
@@ -426,7 +615,7 @@ class Orchestrator:
 
         btc_now = self.binance.get_latest_price()
 
-        # 6b. Time gate — only enter trades in the first portion of the window.
+        # 6c. Time gate — only enter trades in the first portion of the window.
         #     After the cutoff the market has already priced in the move.
         seconds_in_window = time.time() - self._window_start_time
         if seconds_in_window > self._MAX_ENTRY_SECONDS:
@@ -437,7 +626,7 @@ class Orchestrator:
             )
             return
 
-        # 6c. Trend-conflict filter — don't bet against a strong intra-window
+        # 6d. Trend-conflict filter — don't bet against a strong intra-window
         #     price move.  If BTC has already moved more than TREND_CONFLICT_PCT
         #     in one direction this window and our signal is the opposite, the
         #     market odds already reflect reality and our "edge" is an artefact.
