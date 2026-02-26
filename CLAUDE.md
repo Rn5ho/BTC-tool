@@ -44,8 +44,9 @@ deploy/         → Hetzner VPS deployment
   btc-edge.service → systemd service file (runs as btcedge user, auto-restart)
   setup.sh      → Automated server setup script (Ubuntu/Debian)
 
-config.py       → Pydantic Settings loaded from .env
-main.py         → Async orchestrator wiring all components, Telegram command handlers, console output
+config.py            → Pydantic Settings loaded from .env
+main.py              → Async orchestrator wiring all components, Telegram command handlers, console output
+analyze_trades.py    → Standalone trade analysis script (run on VPS: python analyze_trades.py)
 ```
 
 ## Key Commands
@@ -75,7 +76,7 @@ tail -f /home/btcedge/BTC-tool/btc_edge.log
 
 # Deploy latest code
 cd /home/btcedge/BTC-tool
-sudo -u btcedge git pull origin claude/review-claude-md-UPtDE
+sudo -u btcedge git pull origin claude/read-claude-docs-jBeBH
 sudo systemctl restart btc-edge
 
 # Reset paper trading data
@@ -103,10 +104,12 @@ Commands are dispatched via long-polling (`get_updates`) in a dedicated asyncio 
 Copy `.env.example` to `.env`. Key settings:
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — optional, alerts disabled if missing
 - `MIN_EDGE_THRESHOLD` — minimum positive edge to trigger paper trade (default 0.05 = 5%)
-- `MAX_EDGE_THRESHOLD` — maximum edge cap; edges above this are rejected as model overconfidence (default 0.20 = 20%)
+- `MAX_EDGE_THRESHOLD` — maximum edge cap; edges above this are rejected as model overconfidence (default 0.18 = 18%)
 - `BET_SIZE_USDC` — fixed bet size per trade (default 5)
 - `VIRTUAL_BANKROLL` — starting paper bankroll (default 100)
 - `USE_KELLY` — use half-Kelly sizing instead of fixed (default false)
+- `CONFIDENCE_DAMPEN` — shrink P(up) toward 50% to counter overconfidence (default 0.6; 1.0 = no dampening)
+- `BLACKLIST_HOURS` — comma-separated UTC hours to skip trading (default "2" — 02:00 UTC has 37% WR)
 - `W_OBI`, `W_TAKER`, `W_MOMENTUM`, `W_RSI`, `W_VWAP`, `W_FUNDING` — probability model weights (must sum to 1.0)
 
 ## Data Flow
@@ -122,7 +125,7 @@ Binance WS (spot+futures) → Rolling State (candles, orderbook, trades, funding
                               ↓
 Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
                               ↓ (if edge > threshold, positive only)
-                        Safety Filters (time gate + trend conflict)
+                        Safety Filters (time gate + hour blacklist + trend conflict)
                               ↓
                         Paper Trader → simulate bet, log to SQLite
                               ↓
@@ -132,8 +135,11 @@ Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
 ## Probability Model (v1 — Rule-Based Weighted Ensemble)
 
 ```
-P(up) = 0.5 + w_obi*OBI + w_taker*taker + w_momentum*momentum + w_rsi*rsi + w_vwap*vwap + w_funding*funding
+P_raw = 0.5 + w_obi*OBI + w_taker*taker + w_momentum*momentum + w_rsi*rsi + w_vwap*vwap + w_funding*funding
+P(up) = 0.5 + CONFIDENCE_DAMPEN * (P_raw - 0.5)
 ```
+
+Confidence dampening (default 0.6) shrinks predictions toward 50% to counter the model's systematic overconfidence (calibration analysis on 2,736 trades showed 10-20% overestimation at every probability bucket).
 
 Each signal is normalized to [-0.5, 0.5]:
 - **OBI** (order book imbalance): bid/ask volume ratio → [-0.5, 0.5]
@@ -152,10 +158,11 @@ The edge detector (`strategy/edge.py`) evaluates both sides and only considers *
 1. **Edge calculation**: For each side, `edge = our_P(side) - market_P(side)`. Only sides where we think the market underprices (positive edge) are candidates.
 2. **Side selection**: Pick the side with the larger positive edge. If neither side has positive edge, no trade.
 3. **Threshold**: Only trade if `edge > MIN_EDGE_THRESHOLD` (default 5%).
-3b. **Max edge cap** (`MAX_EDGE_THRESHOLD = 0.20`): Edges above 20% are rejected. Data shows the model's 20%+ edge trades win only 31% — when the model massively disagrees with the market, the market is usually right. Added based on analysis of 108 trades on 2026-02-16.
+3b. **Max edge cap** (`MAX_EDGE_THRESHOLD = 0.18`): Edges above 18% are rejected. Analysis of 2,736 trades showed 18-20% edge trades are net negative, and 20%+ trades win only 31%. Lowered from 0.20 to 0.18 based on data showing $501 P&L at 18% cap vs $445 at 20%.
 4. **Time gate** (`_MAX_ENTRY_SECONDS = 120`): Only enter trades in the first 2 minutes of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
-5. **Trend-conflict filter** (`_TREND_CONFLICT_PCT = 0.15`): If BTC has already moved >0.15% in one direction within the current window and the model's signal is the opposite direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum.
-6. **One trade per window**: Only one pending trade per market slug (no duplicate bets on same 5-min window).
+5. **Hour blacklist** (`BLACKLIST_HOURS`): Skip trading during configured UTC hours. Default: 02:00 UTC (37% win rate, -$114 P&L over 108 trades in analysis). Configurable via comma-separated env var.
+6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT = 0.15`): If BTC has already moved >0.15% in one direction within the current window and the model's signal is the opposite direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum.
+7. **One trade per window**: Only one pending trade per market slug (no duplicate bets on same 5-min window).
 
 ## Paper Trading & Fee Model
 
@@ -206,7 +213,24 @@ The bot runs 24/7 on a Hetzner VPS at `46.225.27.241`:
 - **Logs**: `/home/btcedge/BTC-tool/btc_edge.log` (also via `journalctl -u btc-edge`)
 - **Hardening**: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths=/home/btcedge/BTC-tool`
 - **Setup**: `deploy/setup.sh` automates user creation, repo clone, venv setup, service install
-- **Branch**: Currently tracking `claude/review-claude-md-UPtDE`
+- **Branch**: Currently tracking `claude/read-claude-docs-jBeBH`
+
+## Trade Analysis Results (2,736 trades, 2026-02-16 to 2026-02-26)
+
+Analysis script: `python analyze_trades.py` (run on VPS).
+
+**Overall**: 2,736 trades over 10.5 days, 49.7% win rate, +$416 P&L ($40/day), 3% ROI on stakes. Model is profitable due to asymmetric payouts (avg entry 0.479 = better-than-even payout on wins).
+
+**Key findings that drove code changes:**
+- **Model overconfidence**: Every calibration bucket showed OVER by 7-20%. Model predicts 60-65% but actual WR is 49.8%. Fixed with `CONFIDENCE_DAMPEN=0.6`.
+- **MAX_EDGE 18% > 20%**: P&L at 18% cap = $501 vs $445 at 20% cap. Trades in 18-20% range are net losers.
+- **02:00 UTC terrible**: 37% WR, -$114 over 108 trades — by far the worst hour. Added to `BLACKLIST_HOURS`.
+- **Best hours**: 05:00 (61% WR, +$144), 07:00-08:00 (55-56% WR, +$103 each).
+- **Best edge buckets**: 5-6% (52% WR, +$0.44/trade), 8-12% (51% WR, +$245 combined).
+- **Features**: taker_ratio and volume_zscore are the strongest win/loss differentiators. OBI and momentum show near-zero predictive delta.
+- **Streaks**: Max 10 win and 10 loss. Avg streak length 2.0 for both. No serial correlation (after-win WR = after-loss WR).
+- **Max drawdown**: $200 (43% of peak equity) over 657 trades (Feb 18-21).
+- **Friday**: 38.1% WR (-$98) but only 1 Friday in sample — needs more data.
 
 ## Known Issues & Fixes Applied
 
@@ -240,7 +264,9 @@ The bot runs 24/7 on a Hetzner VPS at `46.225.27.241`:
 ## Potential Next Steps
 
 - **Live trading**: User wants to integrate real Polymarket trading via py-clob-client with ~$20 trial capital. Would require CLOB API integration with wallet signing.
+- **Weight rebalancing**: Data shows taker_ratio and volume_zscore are the strongest features; OBI and momentum have near-zero predictive delta. Consider increasing W_TAKER, adding volume_zscore as a weighted signal, and reducing W_OBI/W_MOMENTUM.
+- **Hour scheduling**: Consider expanding blacklist to other weak hours (11:00=42.5% WR, 19:00-21:00=44-46% WR) once more data confirms the pattern.
+- **Friday filter**: Only 1 Friday in sample (38.1% WR, -$98) — collect more data before adding a day-of-week filter.
 - **Model improvements**: ML-based probability model, more features (liquidation data, funding rate momentum, cross-exchange flows)
-- **Backtesting**: Replay historical data to validate signal weights
-- **Signal weight optimization**: Use collected SQLite data to tune weights based on actual win rates per signal
+- **Backtesting**: Replay historical data to validate signal weights and dampening factor
 - **Bankroll persistence**: On restart, restore bankroll from DB (initial + cumulative PnL) rather than resetting to config value

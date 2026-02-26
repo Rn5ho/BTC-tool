@@ -68,7 +68,8 @@ class Orchestrator:
                 "rsi": settings.w_rsi,
                 "vwap": settings.w_vwap,
                 "funding": settings.w_funding,
-            }
+            },
+            confidence_dampen=settings.confidence_dampen,
         )
         self.edge_detector = EdgeDetector(
             model=self.model,
@@ -102,6 +103,14 @@ class Orchestrator:
 
         # Pause flag — when True, analysis continues but no new trades are placed
         self._paused: bool = False
+
+        # Hour blacklist — UTC hours where the model underperforms.
+        # Parsed once from config; empty set = no blacklist.
+        self._blacklist_hours: set[int] = set()
+        for h in settings.blacklist_hours.split(","):
+            h = h.strip()
+            if h.isdigit():
+                self._blacklist_hours.add(int(h))
 
     @staticmethod
     def _slug_start_time(slug: str) -> float:
@@ -666,7 +675,16 @@ class Orchestrator:
             )
             return
 
-        # 6d. Trend-conflict filter — don't bet against a strong intra-window
+        # 6d. Hour blacklist — skip hours with historically poor performance.
+        from datetime import datetime, timezone as _tz
+        current_hour = datetime.now(_tz.utc).hour
+        if current_hour in self._blacklist_hours:
+            logger.debug(
+                "Skipping edge — hour %02d:00 UTC is blacklisted", current_hour
+            )
+            return
+
+        # 6e. Trend-conflict filter — don't bet against a strong intra-window
         #     price move.  If BTC has already moved more than TREND_CONFLICT_PCT
         #     in one direction this window and our signal is the opposite, the
         #     market odds already reflect reality and our "edge" is an artefact.
