@@ -31,17 +31,18 @@ logger = logging.getLogger("btc_edge")
 
 def setup_logging() -> None:
     fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("btc_edge.log"),
-        ],
-    )
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    # Only add a FileHandler when running interactively (TTY).  Under systemd,
+    # stdout is already redirected to btc_edge.log via StandardOutput=append,
+    # so a second FileHandler would duplicate every line.
+    if sys.stdout.isatty():
+        handlers.append(logging.FileHandler("btc_edge.log"))
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
     # Quieten noisy libraries
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +76,15 @@ class Orchestrator:
             model=self.model,
             min_edge=settings.min_edge_threshold,
             max_edge=settings.max_edge_threshold,
+            fee_rate=settings.polymarket_fee_rate,
+            fee_exponent=settings.polymarket_fee_exponent,
         )
         self.paper_trader = None  # initialized in start()
         self.alerter = None       # initialized in start()
 
         # State
         self._running = False
+        self._paused = False  # when True, analysis loop skips trading
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
         self._window_start_time: float = 0.0  # unix timestamp of window start (from slug)
@@ -96,13 +100,18 @@ class Orchestrator:
         # intra-window momentum that the market has already priced in.
         self._TREND_CONFLICT_PCT: float = 0.15  # 0.15%
 
+        # Quality filters — keep only high-quality trades.
+        # DOWN trades require a higher edge (data shows worse win rate).
+        self._MIN_EDGE_DOWN: float = settings.min_edge_down
+        # Edges above this cap are likely model error, not real mispricing.
+        self._MAX_EDGE: float = settings.max_edge_threshold
+        # Skip when any single signal is near the +-0.5 saturation limits.
+        self._MAX_SIGNAL_VALUE: float = settings.max_signal_value
+
         # Heartbeat tracking — avoids flooding the console
         self._cycle_count: int = 0
         self._last_heartbeat: float = 0.0
         self._HEARTBEAT_INTERVAL: float = 30.0  # seconds between status lines
-
-        # Pause flag — when True, analysis continues but no new trades are placed
-        self._paused: bool = False
 
         # Hour blacklist — UTC hours where the model underperforms.
         # Parsed once from config; empty set = no blacklist.
@@ -146,7 +155,10 @@ class Orchestrator:
             bankroll=settings.virtual_bankroll,
             bet_size=settings.bet_size_usdc,
             use_kelly=settings.use_kelly,
+            fee_rate=settings.polymarket_fee_rate,
+            fee_exponent=settings.polymarket_fee_exponent,
         )
+        await self.paper_trader.restore_bankroll()
 
         # Telegram alerter
         from alerts.telegram import TelegramAlerter
@@ -304,19 +316,47 @@ class Orchestrator:
         return "\n".join(lines)
 
     async def _cmd_reset(self, args: str = "") -> str:
-        """Handle /reset — clear all paper trades and reset bankroll."""
+        """Handle /reset — clear all trade data and reset bankroll.
+
+        This is a destructive operation so requires confirmation via
+        a second /reset within 30 seconds.
+        """
         if not self.paper_trader:
             return "Paper trader not initialized."
 
-        count = await self.db.clear_paper_trades()
-        self.paper_trader._pending_trades.clear()
-        self.paper_trader.bankroll = self.paper_trader.initial_bankroll
+        now = time.time()
+        # Simple confirmation: first /reset sets a timestamp, second /reset
+        # within 30s actually resets.
+        if hasattr(self, "_reset_requested_at") and now - self._reset_requested_at < 30:
+            try:
+                # Clear trades from DB
+                await self.db._db.execute("DELETE FROM paper_trades")
+                await self.db._db.execute("DELETE FROM feature_snapshots")
+                await self.db._db.execute("DELETE FROM market_snapshots")
+                await self.db._db.commit()
 
-        return (
-            f"\U0001f504 <b>RESET COMPLETE</b>\n\n"
-            f"Cleared {count} trade(s).\n"
-            f"Bankroll: ${self.paper_trader.bankroll:.2f}"
-        )
+                # Reset in-memory state
+                self.paper_trader._pending_trades.clear()
+                self.paper_trader._total_fees = 0.0
+                self.paper_trader.bankroll = self.paper_trader.initial_bankroll
+
+                self._reset_requested_at = 0
+                logger.info("Database RESET via Telegram command")
+                return (
+                    "\U0001f5d1 <b>RESET COMPLETE</b>\n\n"
+                    f"All trades cleared.\n"
+                    f"Bankroll reset to ${self.paper_trader.initial_bankroll:.2f}"
+                )
+            except Exception as e:
+                logger.exception("Error during reset")
+                return f"\u26a0 Reset failed: {e}"
+        else:
+            self._reset_requested_at = now
+            return (
+                "\u26a0 <b>CONFIRM RESET</b>\n\n"
+                "This will delete ALL trade data and reset the bankroll.\n"
+                "Send /reset again within 30 seconds to confirm."
+            )
 
     async def _cmd_budget(self, args: str = "") -> str:
         """Handle /budget [amount] — show or set the bankroll.
@@ -442,7 +482,7 @@ class Orchestrator:
                     f"  {side}: {swr:.0f}% ({swins}/{len(subset)}) ${spnl:+.2f}"
                 )
 
-            # Hour analysis
+            # Hour analysis (top 3 best, worst)
             hour_stats: dict[int, list[bool]] = _defaultdict(list)
             for t in trades:
                 ts = t["timestamp"] / 1000
@@ -700,20 +740,62 @@ class Orchestrator:
                     window_move_pct,
                 )
                 return
+
+        # 6f. Max edge cap — edges above this are likely model error.
+        #     If our model says 20%+ edge over the market, the model is
+        #     probably wrong, not the market.
+        if signal["edge"] > self._MAX_EDGE:
+            logger.info(
+                "Skipping edge — too large (%.1f%% > %.1f%% cap): likely noise",
+                signal["edge"] * 100,
+                self._MAX_EDGE * 100,
+            )
+            return
+
+        # 6g. DOWN side higher threshold — require stronger edge for DOWN
+        #     trades.  Historical data shows DOWN has much lower win rate
+        #     than UP at the default threshold.
+        if signal["side"] == "DOWN" and signal["edge"] < self._MIN_EDGE_DOWN:
+            logger.info(
+                "Skipping DOWN edge — below DOWN threshold (%.1f%% < %.1f%%)",
+                signal["edge"] * 100,
+                self._MIN_EDGE_DOWN * 100,
+            )
+            return
+
+        # 6h. Signal saturation filter — when any single signal is near
+        #     the +-0.5 limits, the model is likely overreacting to a
+        #     single noisy input rather than seeing a real pattern.
+        signals_data = signal.get("signals", {})
+        saturated = {
+            k: v for k, v in signals_data.items()
+            if abs(v) > self._MAX_SIGNAL_VALUE
+        }
+        if saturated:
+            sat_str = ", ".join(f"{k}={v:+.3f}" for k, v in saturated.items())
+            logger.info(
+                "Skipping edge — saturated signals [%s] (limit=+-%.2f)",
+                sat_str,
+                self._MAX_SIGNAL_VALUE,
+            )
+            return
+
         signals_brief = signal.get("signals", {})
         top_signals = ", ".join(
             f"{k}={v:+.3f}" for k, v in sorted(
                 signals_brief.items(), key=lambda x: abs(x[1]), reverse=True
             )[:3]
         )
+        fee_pct = signal.get("fee_factor", 0.0) * 100
         logger.info(
             ">>> EDGE: %s %s | our=%.1f%% mkt=%.1f%% edge=%+.1f%% "
-            "| BTC=$%s | [%s]",
+            "fee=%.2f%% | BTC=$%s | [%s]",
             signal["side"],
             signal["market_slug"],
             signal["our_prob"] * 100,
             signal["market_prob"] * 100,
             signal["edge"] * 100,
+            fee_pct,
             f"{btc_now:,.2f}" if btc_now else "N/A",
             top_signals,
         )

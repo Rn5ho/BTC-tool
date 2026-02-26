@@ -36,7 +36,9 @@ fi
 echo "[3/6] Setting up repository..."
 if [ -d "${APP_DIR}/.git" ]; then
     echo "  Repo already exists, pulling latest..."
-    sudo -u "${APP_USER}" git -C "${APP_DIR}" pull origin main
+    DEFAULT_BRANCH=$(sudo -u "${APP_USER}" git -C "${APP_DIR}" remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}')
+    DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
+    sudo -u "${APP_USER}" git -C "${APP_DIR}" pull origin "${DEFAULT_BRANCH}"
 else
     sudo -u "${APP_USER}" git clone "${REPO_URL}" "${APP_DIR}"
 fi
