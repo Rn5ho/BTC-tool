@@ -808,22 +808,7 @@ class Orchestrator:
             )
             return
 
-        # 6h. Conviction filter — never bet a side where the model's own
-        #     probability is below 50%.  During extreme market moves the
-        #     dampened model can't express strong enough conviction, so the
-        #     edge detector finds "positive edge" on the side the model
-        #     thinks is LESS likely.  This filter prevents the model from
-        #     betting against its own directional prediction.
-        if signal["our_prob"] < 0.50:
-            logger.info(
-                "Skipping edge — model P(%s)=%.1f%% is below 50%% "
-                "(model favors opposite side)",
-                signal["side"],
-                signal["our_prob"] * 100,
-            )
-            return
-
-        # 6i. Signal saturation filter — when any single signal is near
+        # 6h. Signal saturation filter — when any single signal is near
         #     the +-0.5 limits, the model is likely overreacting to a
         #     single noisy input rather than seeing a real pattern.
         signals_data = signal.get("signals", {})
