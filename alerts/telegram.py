@@ -180,6 +180,40 @@ class TelegramAlerter:
         )
         await self._send(text)
 
+    async def send_live_trade_alert(
+        self,
+        side: str,
+        slug: str,
+        size: float,
+        entry_price: float,
+        our_prob: float,
+        edge: float,
+        order_id: str = "",
+    ) -> None:
+        """Send a live trade placement notification."""
+        text = (
+            f"\U0001f4b5 <b>LIVE TRADE PLACED</b>\n\n"
+            f"Market: {slug}\n"
+            f"Side: {side} @ {entry_price:.3f}\n"
+            f"Size: <b>${size:.2f}</b> (real money)\n"
+            f"Our prob: {our_prob:.1%} | Edge: {edge:+.1%}\n"
+            f"Order: {order_id[:16]}..."
+        )
+        await self._send(text)
+
+    async def send_live_stats_summary(self, stats: dict) -> None:
+        """Send a periodic live trading statistics summary."""
+        text = (
+            f"\U0001f4b5 <b>LIVE STATS</b>\n\n"
+            f"Trades: {stats.get('total_trades', 0)} | "
+            f"Settled: {stats.get('settled_trades', 0)}\n"
+            f"Win rate: {stats.get('win_rate', 0):.1%}\n"
+            f"P&amp;L: <b>${stats.get('total_pnl', 0):+.2f}</b>\n"
+            f"Bankroll: ${stats.get('bankroll', 0):.2f}\n"
+            f"ROI: {stats.get('roi', 0):+.1%}"
+        )
+        await self._send(text)
+
     async def send_error_alert(self, error: str) -> None:
         """Send an error notification."""
         text = f"\u26a0\ufe0f <b>ERROR:</b> {error}"

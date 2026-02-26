@@ -80,6 +80,7 @@ class Orchestrator:
             fee_exponent=settings.polymarket_fee_exponent,
         )
         self.paper_trader = None  # initialized in start()
+        self.live_trader = None   # initialized in start() if credentials present
         self.alerter = None       # initialized in start()
 
         # State
@@ -160,6 +161,41 @@ class Orchestrator:
         )
         await self.paper_trader.restore_bankroll()
 
+        # Live trader (only if credentials are configured and enabled)
+        if (
+            settings.live_trading_enabled
+            and settings.polygon_private_key
+            and settings.polymarket_api_key
+            and settings.polymarket_api_secret
+            and settings.polymarket_passphrase
+            and settings.polygon_wallet_address
+        ):
+            from strategy.live_trader import LiveTrader
+            self.live_trader = LiveTrader(
+                db=self.db,
+                private_key=settings.polygon_private_key,
+                api_key=settings.polymarket_api_key,
+                api_secret=settings.polymarket_api_secret,
+                passphrase=settings.polymarket_passphrase,
+                funder=settings.polygon_wallet_address,
+                bankroll=settings.live_bankroll,
+                bet_pct=settings.live_bet_pct,
+                fee_rate=settings.polymarket_fee_rate,
+                fee_exponent=settings.polymarket_fee_exponent,
+            )
+            if self.live_trader.is_ready:
+                await self.live_trader.restore_bankroll()
+                logger.info(
+                    "Live trading ENABLED: bankroll=$%.2f, bet=%.1f%% of bankroll",
+                    self.live_trader.bankroll,
+                    settings.live_bet_pct * 100,
+                )
+            else:
+                logger.warning("Live trader failed to initialize — disabled")
+                self.live_trader = None
+        else:
+            logger.info("Live trading disabled (missing credentials or LIVE_TRADING_ENABLED=false)")
+
         # Telegram alerter
         from alerts.telegram import TelegramAlerter
         self.alerter = TelegramAlerter(
@@ -203,6 +239,10 @@ class Orchestrator:
         await self.polymarket.stop()
         if self.alerter:
             await self.alerter.stop()
+        if self.live_trader:
+            logger.info(
+                "Live trader final bankroll: $%.2f", self.live_trader.bankroll
+            )
         await self.db.close()
         logger.info("Shutdown complete")
 
@@ -231,6 +271,9 @@ class Orchestrator:
         self.alerter.register_command("resume", self._cmd_resume)
         self.alerter.register_command("weights", self._cmd_weights)
         self.alerter.register_command("analyze", self._cmd_analyze)
+        self.alerter.register_command("live", self._cmd_live)
+        self.alerter.register_command("live_pause", self._cmd_live_pause)
+        self.alerter.register_command("live_resume", self._cmd_live_resume)
 
     async def _cmd_status(self, args: str = "") -> str:
         """Handle /status — current BTC price, model output, market odds."""
@@ -527,6 +570,73 @@ class Orchestrator:
             logger.exception("Error running /analyze")
             return f"\u26a0 Analysis error: {e}"
 
+    async def _cmd_live(self, args: str = "") -> str:
+        """Handle /live — show live trading status and stats."""
+        if not self.live_trader or not self.live_trader.is_ready:
+            return (
+                "\U0001f534 <b>LIVE TRADING</b>\n\n"
+                "Live trading is <b>disabled</b>.\n"
+                "Set LIVE_TRADING_ENABLED=true and configure\n"
+                "Polymarket credentials in .env to enable."
+            )
+
+        stats = await self.live_trader.get_stats()
+        state = "\u23f8 PAUSED" if self.live_trader._paused else "\u25b6 ACTIVE"
+        pending = len(self.live_trader._pending_trades)
+
+        # Try to fetch on-chain balance
+        balance_str = "N/A"
+        try:
+            balance = await self.live_trader.get_usdc_balance()
+            if balance is not None:
+                balance_str = f"${balance:,.2f}"
+        except Exception:
+            pass
+
+        return (
+            f"\U0001f4b5 <b>LIVE TRADING</b>\n\n"
+            f"State: <b>{state}</b>\n"
+            f"Bankroll: <b>${stats.get('bankroll', 0):.2f}</b>\n"
+            f"On-chain USDC: {balance_str}\n"
+            f"Bet size: {self.live_trader.bet_pct * 100:.1f}% = "
+            f"${self.live_trader.compute_bet_size():.2f}\n"
+            f"Pending: {pending}\n\n"
+            f"Trades: {stats.get('total_trades', 0)} | "
+            f"Settled: {stats.get('settled_trades', 0)}\n"
+            f"Wins: {stats.get('wins', 0)} | Losses: {stats.get('losses', 0)}\n"
+            f"Win rate: <b>{stats.get('win_rate', 0):.1%}</b>\n"
+            f"P&amp;L: <b>${stats.get('total_pnl', 0):+.2f}</b>\n"
+            f"ROI: {stats.get('roi', 0):+.1%}"
+        )
+
+    async def _cmd_live_pause(self, args: str = "") -> str:
+        """Handle /live_pause — pause live trading only (paper continues)."""
+        if not self.live_trader or not self.live_trader.is_ready:
+            return "\u26a0 Live trading is not enabled."
+        if self.live_trader._paused:
+            return "\u23f8 Live trading is already paused."
+        self.live_trader._paused = True
+        logger.info("Live trading PAUSED via Telegram command")
+        return (
+            "\u23f8 <b>LIVE TRADING PAUSED</b>\n\n"
+            "Paper trading continues.\n"
+            "Pending live trades will still settle.\n"
+            "Use /live_resume to restart."
+        )
+
+    async def _cmd_live_resume(self, args: str = "") -> str:
+        """Handle /live_resume — resume live trading."""
+        if not self.live_trader or not self.live_trader.is_ready:
+            return "\u26a0 Live trading is not enabled."
+        if not self.live_trader._paused:
+            return "\u25b6 Live trading is already active."
+        self.live_trader._paused = False
+        logger.info("Live trading RESUMED via Telegram command")
+        return (
+            "\u25b6 <b>LIVE TRADING RESUMED</b>\n\n"
+            "Live orders will be placed when edge is detected."
+        )
+
     # ------------------------------------------------------------------
     # Main analysis loop
     # ------------------------------------------------------------------
@@ -816,6 +926,29 @@ class Orchestrator:
                     edge=signal["edge"],
                 )
 
+        # Live trade (mirrors paper trade with real money)
+        if self.live_trader and self.live_trader.is_ready:
+            # Inject token_id for the chosen side so CLOB knows which token to buy
+            token_id = (
+                market.up_token_id if signal["side"] == "UP"
+                else market.down_token_id
+            )
+            live_signal = {**signal, "token_id": token_id}
+            live_order_id = await self.live_trader.place_trade(live_signal)
+            if live_order_id is not None and self.alerter:
+                live_size = self.live_trader.compute_bet_size(
+                    signal["our_prob"], signal["market_prob"]
+                )
+                await self.alerter.send_live_trade_alert(
+                    side=signal["side"],
+                    slug=signal["market_slug"],
+                    size=live_size,
+                    entry_price=signal["entry_price"],
+                    our_prob=signal["our_prob"],
+                    edge=signal["edge"],
+                    order_id=live_order_id,
+                )
+
         # Telegram edge alert (only fires once per market — when trade is placed)
         if self.alerter:
             await self.alerter.send_edge_alert(
@@ -879,6 +1012,25 @@ class Orchestrator:
             if self.alerter:
                 await self.alerter.send_stats_summary(stats)
 
+        # Settle live trades
+        if self.live_trader and self.live_trader.is_ready:
+            await self.live_trader.settle_all_pending(
+                btc_start_price=self._window_btc_start,
+                btc_end_price=btc_end,
+            )
+            live_stats = await self.live_trader.get_stats()
+            if live_stats.get("settled_trades", 0) > 0:
+                logger.info(
+                    "--- LIVE P&L: $%+.2f | Win rate: %.0f%% (%d/%d) | Bankroll: $%.2f",
+                    live_stats.get("total_pnl", 0),
+                    live_stats.get("win_rate", 0) * 100,
+                    live_stats.get("wins", 0),
+                    live_stats.get("settled_trades", 0),
+                    live_stats.get("bankroll", 0),
+                )
+                if self.alerter:
+                    await self.alerter.send_live_stats_summary(live_stats)
+
     async def _settle_stale_trades(self) -> None:
         """Settle any unsettled trades from previous sessions whose windows have ended.
 
@@ -887,20 +1039,23 @@ class Orchestrator:
         are never detected.  This method pulls unsettled trades from the DB,
         looks up BTC prices from stored candle data, and settles them.
         """
+        current_slug = self._current_slug or self.polymarket.get_current_slug()
+
+        # Settle stale paper trades
         if not self.paper_trader:
             return
 
         unsettled = await self.db.get_unsettled_trades()
-        current_slug = self._current_slug or self.polymarket.get_current_slug()
 
         stale = [r for r in unsettled if r["market_slug"] != current_slug]
         if not stale:
-            return
-
-        logger.info(
-            "Found %d stale unsettled trade(s) from previous session — settling",
-            len(stale),
-        )
+            # Still check live trades below
+            pass
+        else:
+            logger.info(
+                "Found %d stale unsettled paper trade(s) from previous session — settling",
+                len(stale),
+            )
 
         for row in stale:
             slug = row["market_slug"]
@@ -955,6 +1110,48 @@ class Orchestrator:
                 "UP" if btc_went_up else "DOWN",
             )
 
+        # Settle stale live trades (same logic)
+        if self.live_trader and self.live_trader.is_ready:
+            live_unsettled = await self.db.get_unsettled_live_trades()
+            live_stale = [r for r in live_unsettled if r["market_slug"] != current_slug]
+            if live_stale:
+                logger.info(
+                    "Found %d stale unsettled LIVE trade(s) — settling", len(live_stale)
+                )
+            for row in live_stale:
+                slug = row["market_slug"]
+                try:
+                    window_ts = int(slug.rsplit("-", 1)[-1])
+                except (ValueError, IndexError):
+                    await self.db.update_live_trade(
+                        row["id"], "VOID", 0.0, int(time.time() * 1000)
+                    )
+                    continue
+
+                window_start_ms = window_ts * 1000
+                window_end_ms = (window_ts + 300) * 1000
+                btc_start = await self.db.get_btc_price_at(window_start_ms)
+                btc_end_price = await self.db.get_btc_price_at(window_end_ms)
+
+                if btc_start is None or btc_end_price is None:
+                    await self.db.update_live_trade(
+                        row["id"], "VOID", 0.0, int(time.time() * 1000)
+                    )
+                    continue
+
+                btc_went_up = btc_end_price >= btc_start
+                self.live_trader._pending_trades[slug] = {
+                    "trade_id": row["id"],
+                    "order_id": row.get("order_id", ""),
+                    "side": row["side"],
+                    "size_usdc": row["size_usdc"],
+                    "entry_price": row["entry_price"],
+                    "our_prob": row["our_prob"],
+                    "market_prob": row["market_prob"],
+                    "edge": row["edge"],
+                }
+                await self.live_trader.settle_trade(slug, btc_went_up)
+
     # ------------------------------------------------------------------
     # Periodic stats reporting
     # ------------------------------------------------------------------
@@ -970,6 +1167,18 @@ class Orchestrator:
                     logger.info("\n%s", report)
                     if self.alerter:
                         await self.alerter.send_stats_summary(stats)
+                if self.live_trader and self.live_trader.is_ready:
+                    live_stats = await self.live_trader.get_stats()
+                    if live_stats.get("total_trades", 0) > 0:
+                        logger.info(
+                            "Live Stats: trades=%d WR=%.0f%% P&L=$%+.2f bankroll=$%.2f",
+                            live_stats.get("settled_trades", 0),
+                            live_stats.get("win_rate", 0) * 100,
+                            live_stats.get("total_pnl", 0),
+                            live_stats.get("bankroll", 0),
+                        )
+                        if self.alerter:
+                            await self.alerter.send_live_stats_summary(live_stats)
             except asyncio.CancelledError:
                 raise
             except Exception:

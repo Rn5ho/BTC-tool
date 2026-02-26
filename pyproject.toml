@@ -16,6 +16,7 @@ dependencies = [
     "python-telegram-bot>=21.0",
     "pydantic-settings>=2.0",
     "aiosqlite>=0.20",
+    "py-clob-client>=0.34",
 ]
 
 [tool.setuptools.packages.find]

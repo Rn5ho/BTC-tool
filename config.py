@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     polymarket_api_secret: str = ""
     polymarket_passphrase: str = ""
 
+    # Live trading
+    polygon_private_key: str = ""       # Polygon wallet private key (hex, with or without 0x prefix)
+    polygon_wallet_address: str = ""    # Polygon wallet address that holds USDC.e
+    live_trading_enabled: bool = False  # Must be explicitly enabled
+    live_bet_pct: float = 0.02          # Bet size as fraction of live bankroll (2%)
+    live_bankroll: float = 100.0        # Starting live bankroll in USDC
+
     # Polymarket fee parameters (crypto 5-min / 15-min markets)
     # These are the curve parameters from the Maker Rebates Program docs.
     # fee_per_share = price * fee_rate * (price * (1 - price))^fee_exponent

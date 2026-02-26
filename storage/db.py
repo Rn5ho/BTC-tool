@@ -89,11 +89,30 @@ class Database:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS live_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    market_slug TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    our_prob REAL NOT NULL,
+                    market_prob REAL NOT NULL,
+                    edge REAL NOT NULL,
+                    size_usdc REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    order_id TEXT,
+                    outcome TEXT,
+                    pnl REAL,
+                    settled_at INTEGER,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_candles_ts ON candles(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_features_ts ON feature_snapshots(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_trades_ts ON paper_trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_trades_slug ON paper_trades(market_slug);
                 CREATE INDEX IF NOT EXISTS idx_snapshots_slug ON market_snapshots(slug);
+                CREATE INDEX IF NOT EXISTS idx_live_trades_ts ON live_trades(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_live_trades_slug ON live_trades(market_slug);
                 """
             )
             await self._db.commit()
@@ -399,5 +418,133 @@ class Database:
             logger.info("Trading stats: %s", stats)
         except Exception:
             logger.exception("Failed to compute trading stats")
+
+        return stats
+
+    # ------------------------------------------------------------------
+    # Live trades
+    # ------------------------------------------------------------------
+
+    async def save_live_trade(
+        self,
+        timestamp: int,
+        market_slug: str,
+        side: str,
+        our_prob: float,
+        market_prob: float,
+        edge: float,
+        size_usdc: float,
+        entry_price: float,
+        order_id: str = "",
+    ) -> Optional[int]:
+        """Insert a new live trade and return its row id."""
+        try:
+            cursor = await self._db.execute(
+                """
+                INSERT INTO live_trades
+                    (timestamp, market_slug, side, our_prob, market_prob,
+                     edge, size_usdc, entry_price, order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (timestamp, market_slug, side, our_prob, market_prob,
+                 edge, size_usdc, entry_price, order_id),
+            )
+            await self._db.commit()
+            logger.info(
+                "Saved live trade: %s %s edge=%.4f size=%.2f order=%s",
+                side, market_slug, edge, size_usdc, order_id,
+            )
+            return cursor.lastrowid
+        except Exception:
+            logger.exception("Failed to save live trade")
+            return None
+
+    async def update_live_trade(
+        self, trade_id: int, outcome: str, pnl: float, settled_at: int
+    ) -> None:
+        """Update an existing live trade with settlement data."""
+        try:
+            await self._db.execute(
+                """
+                UPDATE live_trades
+                SET outcome = ?, pnl = ?, settled_at = ?
+                WHERE id = ?
+                """,
+                (outcome, pnl, settled_at, trade_id),
+            )
+            await self._db.commit()
+            logger.info(
+                "Updated live trade %d: outcome=%s pnl=%.4f",
+                trade_id, outcome, pnl,
+            )
+        except Exception:
+            logger.exception("Failed to update live trade %d", trade_id)
+
+    async def get_unsettled_live_trades(self) -> list[dict]:
+        """Return all live trades that have not yet been settled."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM live_trades WHERE outcome IS NULL"
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch unsettled live trades")
+            return []
+
+    async def get_live_trading_stats(self) -> dict:
+        """Compute aggregate statistics for live trades."""
+        stats = {
+            "total_trades": 0,
+            "settled_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "avg_edge": 0.0,
+            "avg_pnl_per_trade": 0.0,
+        }
+        try:
+            cursor = await self._db.execute("SELECT COUNT(*) FROM live_trades")
+            row = await cursor.fetchone()
+            stats["total_trades"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE outcome IS NOT NULL"
+            )
+            row = await cursor.fetchone()
+            stats["settled_trades"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE outcome = 'WIN'"
+            )
+            row = await cursor.fetchone()
+            stats["wins"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE outcome = 'LOSS'"
+            )
+            row = await cursor.fetchone()
+            stats["losses"] = row[0]
+
+            if stats["settled_trades"] > 0:
+                stats["win_rate"] = stats["wins"] / stats["settled_trades"]
+
+            cursor = await self._db.execute(
+                "SELECT COALESCE(SUM(pnl), 0.0) FROM live_trades WHERE pnl IS NOT NULL"
+            )
+            row = await cursor.fetchone()
+            stats["total_pnl"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COALESCE(AVG(edge), 0.0) FROM live_trades"
+            )
+            row = await cursor.fetchone()
+            stats["avg_edge"] = row[0]
+
+            if stats["settled_trades"] > 0:
+                stats["avg_pnl_per_trade"] = stats["total_pnl"] / stats["settled_trades"]
+        except Exception:
+            logger.exception("Failed to compute live trading stats")
 
         return stats
