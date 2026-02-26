@@ -69,11 +69,13 @@ class Orchestrator:
                 "rsi": settings.w_rsi,
                 "vwap": settings.w_vwap,
                 "funding": settings.w_funding,
-            }
+            },
+            confidence_dampen=settings.confidence_dampen,
         )
         self.edge_detector = EdgeDetector(
             model=self.model,
             min_edge=settings.min_edge_threshold,
+            max_edge=settings.max_edge_threshold,
             fee_rate=settings.polymarket_fee_rate,
             fee_exponent=settings.polymarket_fee_exponent,
         )
@@ -85,7 +87,7 @@ class Orchestrator:
         self._paused = False  # when True, analysis loop skips trading
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
-        self._window_start_time: float = 0.0  # wall-clock time when window started
+        self._window_start_time: float = 0.0  # unix timestamp of window start (from slug)
 
         # Trade entry timing — only enter trades in the first N seconds of a
         # 5-minute window.  After this cutoff the market has already priced in
@@ -102,7 +104,7 @@ class Orchestrator:
         # DOWN trades require a higher edge (data shows worse win rate).
         self._MIN_EDGE_DOWN: float = settings.min_edge_down
         # Edges above this cap are likely model error, not real mispricing.
-        self._MAX_EDGE: float = settings.max_edge
+        self._MAX_EDGE: float = settings.max_edge_threshold
         # Skip when any single signal is near the +-0.5 saturation limits.
         self._MAX_SIGNAL_VALUE: float = settings.max_signal_value
 
@@ -110,6 +112,27 @@ class Orchestrator:
         self._cycle_count: int = 0
         self._last_heartbeat: float = 0.0
         self._HEARTBEAT_INTERVAL: float = 30.0  # seconds between status lines
+
+        # Hour blacklist — UTC hours where the model underperforms.
+        # Parsed once from config; empty set = no blacklist.
+        self._blacklist_hours: set[int] = set()
+        for h in settings.blacklist_hours.split(","):
+            h = h.strip()
+            if h.isdigit():
+                self._blacklist_hours.add(int(h))
+
+    @staticmethod
+    def _slug_start_time(slug: str) -> float:
+        """Extract the window start timestamp (seconds) from a market slug.
+
+        Slug format: ``btc-updown-5m-{unix_ts}``.  Returns the unix_ts as a
+        float so the time gate can compute how far into the window we are.
+        Falls back to ``time.time()`` if the slug is malformed.
+        """
+        try:
+            return float(slug.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return time.time()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -202,13 +225,14 @@ class Orchestrator:
         self.alerter.register_command("status", self._cmd_status)
         self.alerter.register_command("stats", self._cmd_stats)
         self.alerter.register_command("trades", self._cmd_trades)
+        self.alerter.register_command("reset", self._cmd_reset)
+        self.alerter.register_command("budget", self._cmd_budget)
         self.alerter.register_command("pause", self._cmd_pause)
         self.alerter.register_command("resume", self._cmd_resume)
         self.alerter.register_command("weights", self._cmd_weights)
         self.alerter.register_command("analyze", self._cmd_analyze)
-        self.alerter.register_command("reset", self._cmd_reset)
 
-    async def _cmd_status(self) -> str:
+    async def _cmd_status(self, args: str = "") -> str:
         """Handle /status — current BTC price, model output, market odds."""
         btc = self.binance.get_latest_price()
         chainlink = self.polymarket.get_chainlink_stream_price()
@@ -251,7 +275,7 @@ class Orchestrator:
             f"Candles: {candles} | Trades: {trades} | OB: {ob}"
         )
 
-    async def _cmd_stats(self) -> str:
+    async def _cmd_stats(self, args: str = "") -> str:
         """Handle /stats — trading performance summary."""
         if not self.paper_trader:
             return "Paper trader not initialized."
@@ -267,7 +291,7 @@ class Orchestrator:
             f"ROI: {stats.get('roi', 0):+.1%}"
         )
 
-    async def _cmd_trades(self) -> str:
+    async def _cmd_trades(self, args: str = "") -> str:
         """Handle /trades — list recent/pending paper trades."""
         if not self.paper_trader:
             return "Paper trader not initialized."
@@ -285,13 +309,89 @@ class Orchestrator:
         lines = [f"\U0001f4dd <b>PENDING TRADES</b>\n"]
         for slug, trade in pending.items():
             lines.append(
-                f"  {trade.side} {slug}\n"
-                f"  Entry: {trade.entry_price:.3f} | "
-                f"Size: ${trade.size:.2f}"
+                f"  {trade['side']} {slug}\n"
+                f"  Entry: {trade['entry_price']:.3f} | "
+                f"Size: ${trade['size_usdc']:.2f}"
             )
         return "\n".join(lines)
 
-    async def _cmd_pause(self) -> str:
+    async def _cmd_reset(self, args: str = "") -> str:
+        """Handle /reset — clear all trade data and reset bankroll.
+
+        This is a destructive operation so requires confirmation via
+        a second /reset within 30 seconds.
+        """
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+
+        now = time.time()
+        # Simple confirmation: first /reset sets a timestamp, second /reset
+        # within 30s actually resets.
+        if hasattr(self, "_reset_requested_at") and now - self._reset_requested_at < 30:
+            try:
+                # Clear trades from DB
+                await self.db._db.execute("DELETE FROM paper_trades")
+                await self.db._db.execute("DELETE FROM feature_snapshots")
+                await self.db._db.execute("DELETE FROM market_snapshots")
+                await self.db._db.commit()
+
+                # Reset in-memory state
+                self.paper_trader._pending_trades.clear()
+                self.paper_trader._total_fees = 0.0
+                self.paper_trader.bankroll = self.paper_trader.initial_bankroll
+
+                self._reset_requested_at = 0
+                logger.info("Database RESET via Telegram command")
+                return (
+                    "\U0001f5d1 <b>RESET COMPLETE</b>\n\n"
+                    f"All trades cleared.\n"
+                    f"Bankroll reset to ${self.paper_trader.initial_bankroll:.2f}"
+                )
+            except Exception as e:
+                logger.exception("Error during reset")
+                return f"\u26a0 Reset failed: {e}"
+        else:
+            self._reset_requested_at = now
+            return (
+                "\u26a0 <b>CONFIRM RESET</b>\n\n"
+                "This will delete ALL trade data and reset the bankroll.\n"
+                "Send /reset again within 30 seconds to confirm."
+            )
+
+    async def _cmd_budget(self, args: str = "") -> str:
+        """Handle /budget [amount] — show or set the bankroll.
+
+        /budget        — show current bankroll and bet size
+        /budget 200    — set bankroll to $200
+        """
+        if not self.paper_trader:
+            return "Paper trader not initialized."
+
+        if not args.strip():
+            return (
+                f"\U0001f4b0 <b>BUDGET</b>\n\n"
+                f"Bankroll: <b>${self.paper_trader.bankroll:.2f}</b>\n"
+                f"Initial: ${self.paper_trader.initial_bankroll:.2f}\n"
+                f"Bet size: ${self.paper_trader.bet_size:.2f}\n"
+                f"Kelly: {'on' if self.paper_trader.use_kelly else 'off'}"
+            )
+
+        try:
+            amount = float(args.strip())
+            if amount <= 0:
+                return "Amount must be positive."
+        except ValueError:
+            return f"Invalid amount: {args.strip()}\nUsage: /budget 200"
+
+        self.paper_trader.bankroll = amount
+        self.paper_trader.initial_bankroll = amount
+
+        return (
+            f"\U0001f4b0 <b>BUDGET UPDATED</b>\n\n"
+            f"Bankroll set to <b>${amount:.2f}</b>"
+        )
+
+    async def _cmd_pause(self, args: str = "") -> str:
         """Handle /pause — stop placing new trades (data collection continues)."""
         if self._paused:
             return "\u23f8 Already paused. Use /resume to restart trading."
@@ -305,7 +405,7 @@ class Orchestrator:
             "Use /resume to restart."
         )
 
-    async def _cmd_resume(self) -> str:
+    async def _cmd_resume(self, args: str = "") -> str:
         """Handle /resume — resume placing trades."""
         if not self._paused:
             return "\u25b6 Already running. Trading is active."
@@ -316,7 +416,7 @@ class Orchestrator:
             "New trades will be placed when edge is detected."
         )
 
-    async def _cmd_weights(self) -> str:
+    async def _cmd_weights(self, args: str = "") -> str:
         """Handle /weights — show current probability model weights."""
         w = self.model.weights
         lines = ["\u2696 <b>MODEL WEIGHTS</b>\n"]
@@ -328,11 +428,12 @@ class Orchestrator:
         lines.append(f"\n  Total: {total:.2f}")
         return "\n".join(lines)
 
-    async def _cmd_analyze(self) -> str:
-        """Handle /analyze — run trade analysis on the server DB."""
+    async def _cmd_analyze(self, args: str = "") -> str:
+        """Handle /analyze — run trade analysis on the DB."""
         try:
             import sqlite3 as _sqlite3
             from collections import defaultdict as _defaultdict
+            from datetime import datetime, timezone
 
             conn = _sqlite3.connect(self.db.db_path)
             conn.row_factory = _sqlite3.Row
@@ -382,14 +483,13 @@ class Orchestrator:
                 )
 
             # Hour analysis (top 3 best, worst)
-            from datetime import datetime, timezone
             hour_stats: dict[int, list[bool]] = _defaultdict(list)
             for t in trades:
                 ts = t["timestamp"] / 1000
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc)
                 hour_stats[dt.hour].append(t["outcome"] == "WIN")
 
-            hour_lines = []
+            hour_lines: list[str] = []
             if hour_stats:
                 ranked_hours = sorted(
                     hour_stats.items(),
@@ -427,46 +527,6 @@ class Orchestrator:
             logger.exception("Error running /analyze")
             return f"\u26a0 Analysis error: {e}"
 
-    async def _cmd_reset(self) -> str:
-        """Handle /reset — clear all trade data and reset bankroll.
-
-        This is a destructive operation so requires confirmation via
-        a second /reset within 30 seconds.
-        """
-        now = time.time()
-        # Simple confirmation: first /reset sets a timestamp, second /reset
-        # within 30s actually resets.
-        if hasattr(self, "_reset_requested_at") and now - self._reset_requested_at < 30:
-            try:
-                # Clear trades from DB
-                await self.db._db.execute("DELETE FROM paper_trades")
-                await self.db._db.execute("DELETE FROM feature_snapshots")
-                await self.db._db.execute("DELETE FROM market_snapshots")
-                await self.db._db.commit()
-
-                # Reset in-memory state
-                self.paper_trader._pending_trades.clear()
-                self.paper_trader._total_fees = 0.0
-                self.paper_trader.bankroll = self.paper_trader.initial_bankroll
-
-                self._reset_requested_at = 0
-                logger.info("Database RESET via Telegram command")
-                return (
-                    "\U0001f5d1 <b>RESET COMPLETE</b>\n\n"
-                    f"All trades cleared.\n"
-                    f"Bankroll reset to ${self.paper_trader.initial_bankroll:.2f}"
-                )
-            except Exception as e:
-                logger.exception("Error during reset")
-                return f"\u26a0 Reset failed: {e}"
-        else:
-            self._reset_requested_at = now
-            return (
-                "\u26a0 <b>CONFIRM RESET</b>\n\n"
-                "This will delete ALL trade data and reset the bankroll.\n"
-                "Send /reset again within 30 seconds to confirm."
-            )
-
     # ------------------------------------------------------------------
     # Main analysis loop
     # ------------------------------------------------------------------
@@ -497,6 +557,24 @@ class Orchestrator:
             "Initial data ready — %d candles buffered", len(self.binance.candles)
         )
 
+        # Initialize window tracking now that we have price data
+        self._current_slug = self.polymarket.get_current_slug()
+        self._window_start_time = self._slug_start_time(self._current_slug)
+        self._window_btc_start = self.polymarket.get_chainlink_stream_price()
+        price_source = "Chainlink Stream"
+        if self._window_btc_start is None:
+            self._window_btc_start = self.binance.get_latest_price()
+            price_source = "Binance (fallback)"
+        logger.info(
+            "Initialized window: %s | BTC start: $%.2f [%s]",
+            self._current_slug,
+            self._window_btc_start or 0,
+            price_source,
+        )
+
+        # Settle any stale unsettled trades from previous sessions
+        await self._settle_stale_trades()
+
         while self._running:
             try:
                 await self._run_one_cycle()
@@ -509,17 +587,15 @@ class Orchestrator:
     async def _run_one_cycle(self) -> None:
         """Single iteration of the analysis pipeline."""
 
-        # 1. Discover current Polymarket market
-        market = await self.polymarket.discover_market()
-        if market is None:
-            return
-
-        # Detect window transitions for settlement
-        if self._current_slug and self._current_slug != market.slug:
+        # 0. Check for window transitions BEFORE market discovery.
+        #    Settlement must not depend on the Gamma API succeeding —
+        #    otherwise trades remain unsettled if discovery is slow/fails.
+        current_slug = self.polymarket.get_current_slug()
+        if self._current_slug and self._current_slug != current_slug:
             await self._settle_previous_window()
-        if self._current_slug != market.slug:
-            self._current_slug = market.slug
-            self._window_start_time = time.time()
+        if self._current_slug != current_slug:
+            self._current_slug = current_slug
+            self._window_start_time = self._slug_start_time(current_slug)
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
             price_source = "Chainlink Stream"
@@ -528,10 +604,15 @@ class Orchestrator:
                 price_source = "Binance (fallback)"
             logger.info(
                 "New window: %s | BTC start: $%.2f [%s]",
-                market.slug,
+                current_slug,
                 self._window_btc_start or 0,
                 price_source,
             )
+
+        # 1. Discover current Polymarket market
+        market = await self.polymarket.discover_market()
+        if market is None:
+            return
 
         # 2. Refresh live Polymarket prices
         prices = await self.polymarket.get_live_prices(market)
@@ -634,7 +715,16 @@ class Orchestrator:
             )
             return
 
-        # 6d. Trend-conflict filter — don't bet against a strong intra-window
+        # 6d. Hour blacklist — skip hours with historically poor performance.
+        from datetime import datetime, timezone as _tz
+        current_hour = datetime.now(_tz.utc).hour
+        if current_hour in self._blacklist_hours:
+            logger.debug(
+                "Skipping edge — hour %02d:00 UTC is blacklisted", current_hour
+            )
+            return
+
+        # 6e. Trend-conflict filter — don't bet against a strong intra-window
         #     price move.  If BTC has already moved more than TREND_CONFLICT_PCT
         #     in one direction this window and our signal is the opposite, the
         #     market odds already reflect reality and our "edge" is an artefact.
@@ -651,7 +741,7 @@ class Orchestrator:
                 )
                 return
 
-        # 6e. Max edge cap — edges above this are likely model error.
+        # 6f. Max edge cap — edges above this are likely model error.
         #     If our model says 20%+ edge over the market, the model is
         #     probably wrong, not the market.
         if signal["edge"] > self._MAX_EDGE:
@@ -662,7 +752,7 @@ class Orchestrator:
             )
             return
 
-        # 6f. DOWN side higher threshold — require stronger edge for DOWN
+        # 6g. DOWN side higher threshold — require stronger edge for DOWN
         #     trades.  Historical data shows DOWN has much lower win rate
         #     than UP at the default threshold.
         if signal["side"] == "DOWN" and signal["edge"] < self._MIN_EDGE_DOWN:
@@ -673,7 +763,7 @@ class Orchestrator:
             )
             return
 
-        # 6g. Signal saturation filter — when any single signal is near
+        # 6h. Signal saturation filter — when any single signal is near
         #     the +-0.5 limits, the model is likely overreacting to a
         #     single noisy input rather than seeing a real pattern.
         signals_data = signal.get("signals", {})
@@ -788,6 +878,82 @@ class Orchestrator:
 
             if self.alerter:
                 await self.alerter.send_stats_summary(stats)
+
+    async def _settle_stale_trades(self) -> None:
+        """Settle any unsettled trades from previous sessions whose windows have ended.
+
+        On restart, in-memory state is lost and window transitions that
+        occurred while the service was down (or during the buffering phase)
+        are never detected.  This method pulls unsettled trades from the DB,
+        looks up BTC prices from stored candle data, and settles them.
+        """
+        if not self.paper_trader:
+            return
+
+        unsettled = await self.db.get_unsettled_trades()
+        current_slug = self._current_slug or self.polymarket.get_current_slug()
+
+        stale = [r for r in unsettled if r["market_slug"] != current_slug]
+        if not stale:
+            return
+
+        logger.info(
+            "Found %d stale unsettled trade(s) from previous session — settling",
+            len(stale),
+        )
+
+        for row in stale:
+            slug = row["market_slug"]
+
+            # Extract window timestamp from slug: btc-updown-5m-{ts}
+            try:
+                window_ts = int(slug.rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                logger.warning("Cannot parse window ts from slug %s — voiding trade", slug)
+                await self.db.update_paper_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            window_start_ms = window_ts * 1000
+            window_end_ms = (window_ts + 300) * 1000
+
+            btc_start = await self.db.get_btc_price_at(window_start_ms)
+            btc_end = await self.db.get_btc_price_at(window_end_ms)
+
+            if btc_start is None or btc_end is None:
+                logger.warning(
+                    "No candle data for window %s — voiding trade %d",
+                    slug,
+                    row["id"],
+                )
+                await self.db.update_paper_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            btc_went_up = btc_end >= btc_start
+
+            # Load into paper_trader and use its settlement logic
+            self.paper_trader._pending_trades[slug] = {
+                "trade_id": row["id"],
+                "side": row["side"],
+                "size_usdc": row["size_usdc"],
+                "entry_price": row["entry_price"],
+                "our_prob": row["our_prob"],
+                "market_prob": row["market_prob"],
+                "edge": row["edge"],
+            }
+            await self.paper_trader.settle_trade(slug, btc_went_up)
+
+            logger.info(
+                "Settled stale trade: %s %s | BTC $%.2f -> $%.2f (%s)",
+                row["side"],
+                slug,
+                btc_start,
+                btc_end,
+                "UP" if btc_went_up else "DOWN",
+            )
 
     # ------------------------------------------------------------------
     # Periodic stats reporting

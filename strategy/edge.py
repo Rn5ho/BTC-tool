@@ -27,16 +27,19 @@ class EdgeDetector:
         self,
         model: ProbabilityModel,
         min_edge: float = 0.05,
+        max_edge: float = 0.20,
         fee_rate: float = 0.0,
         fee_exponent: int = 2,
     ) -> None:
         self.model = model
         self.min_edge = min_edge
+        self.max_edge = max_edge
         self.fee_rate = fee_rate
         self.fee_exponent = fee_exponent
         logger.info(
-            "EdgeDetector initialised with min_edge=%.2f, fee_rate=%.3f, fee_exponent=%d",
+            "EdgeDetector initialised with min_edge=%.2f, max_edge=%.2f, fee_rate=%.3f, fee_exponent=%d",
             self.min_edge,
+            self.max_edge,
             self.fee_rate,
             self.fee_exponent,
         )
@@ -62,8 +65,8 @@ class EdgeDetector:
     ) -> Optional[dict]:
         """Compare our probability estimate against Polymarket prices.
 
-        Returns an edge-report dict when the absolute edge on the best
-        side exceeds *min_edge* **after taker fees**, otherwise ``None``.
+        Returns an edge-report dict when the best positive edge exceeds
+        *min_edge* **after taker fees**, otherwise ``None``.
         """
         p_up = self.model.predict(features)
 
@@ -90,21 +93,40 @@ class EdgeDetector:
             down_edge,
         )
 
-        # Choose the side with the larger *positive* edge.
-        # A negative edge means the market price already exceeds our model's
-        # probability — buying that side would be trading against ourselves.
-        if up_edge > down_edge:
-            best_side = "UP"
-            best_edge = up_edge
-        else:
-            best_side = "DOWN"
-            best_edge = down_edge
+        # Only consider sides where we have a POSITIVE edge
+        # (our probability exceeds the market's implied probability).
+        candidates = []
+        if up_edge > 0:
+            candidates.append(("UP", up_edge))
+        if down_edge > 0:
+            candidates.append(("DOWN", down_edge))
+
+        if not candidates:
+            logger.debug(
+                "No positive edge on either side (up=%.4f, down=%.4f)",
+                up_edge,
+                down_edge,
+            )
+            return None
+
+        # Pick the side with the larger positive edge
+        best_side, best_edge = max(candidates, key=lambda x: x[1])
 
         if best_edge < self.min_edge:
             logger.debug(
                 "No actionable edge (best=%.4f, threshold=%.4f)",
                 best_edge,
                 self.min_edge,
+            )
+            return None
+
+        if best_edge > self.max_edge:
+            logger.info(
+                "Skipping edge — too large (%.1f%% > %.1f%% cap) on %s %s — model likely overconfident",
+                best_edge * 100,
+                self.max_edge * 100,
+                best_side,
+                market.slug,
             )
             return None
 

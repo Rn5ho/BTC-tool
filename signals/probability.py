@@ -19,9 +19,20 @@ class ProbabilityModel:
         "funding": 0.10,
     }
 
-    def __init__(self, weights: dict[str, float] | None = None) -> None:
+    def __init__(
+        self,
+        weights: dict[str, float] | None = None,
+        confidence_dampen: float = 1.0,
+    ) -> None:
         self.weights = weights if weights is not None else dict(self.DEFAULT_WEIGHTS)
-        logger.info("ProbabilityModel initialised with weights: %s", self.weights)
+        # Shrink predictions toward 0.5 to counter overconfidence.
+        # 1.0 = no dampening, 0.0 = always predict 50%.
+        self.confidence_dampen = max(0.0, min(1.0, confidence_dampen))
+        logger.info(
+            "ProbabilityModel initialised with weights: %s, dampen=%.2f",
+            self.weights,
+            self.confidence_dampen,
+        )
 
     # ------------------------------------------------------------------
     # Normalisation helpers – each returns a value in [-0.5, 0.5]
@@ -91,7 +102,10 @@ class ProbabilityModel:
         }
 
         weighted_sum = sum(self.weights[k] * signals[k] for k in signals)
-        p_up = 0.5 + weighted_sum
+        p_up_raw = 0.5 + weighted_sum
+
+        # Dampen confidence: shrink toward 0.5
+        p_up = 0.5 + self.confidence_dampen * (p_up_raw - 0.5)
 
         p_up = max(0.05, min(0.95, p_up))
         logger.debug(

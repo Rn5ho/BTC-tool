@@ -12,7 +12,7 @@ import logging
 import time
 from typing import Optional
 
-from data.models import PaperTrade, PolymarketMarket
+from data.models import PaperTrade
 from data.polymarket import compute_fee_factor
 from storage.db import Database
 
@@ -20,13 +20,17 @@ logger = logging.getLogger(__name__)
 
 
 class PaperTrader:
-    """Simulates placing and settling binary bets on Polymarket 5-min BTC windows."""
+    """Simulates placing and settling binary bets on Polymarket 5-min BTC windows.
+
+    Fee model mirrors Polymarket's actual taker fee structure using the
+    bell-curve formula: fee_factor = fee_rate * (price * (1 - price))^exponent.
+    """
 
     def __init__(
         self,
         db: Database,
-        bankroll: float = 10000.0,
-        bet_size: float = 50.0,
+        bankroll: float = 100.0,
+        bet_size: float = 5.0,
         use_kelly: bool = False,
         fee_rate: float = 0.0,
         fee_exponent: int = 2,

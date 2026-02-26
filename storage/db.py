@@ -276,6 +276,41 @@ class Database:
     # Queries
     # ------------------------------------------------------------------
 
+    async def clear_paper_trades(self) -> int:
+        """Delete all paper trades and return the number of rows removed."""
+        try:
+            cursor = await self._db.execute("DELETE FROM paper_trades")
+            await self._db.commit()
+            count = cursor.rowcount
+            logger.info("Cleared %d paper trade(s) from database", count)
+            return count
+        except Exception:
+            logger.exception("Failed to clear paper trades")
+            return 0
+
+    async def get_btc_price_at(self, timestamp_ms: int, tolerance_ms: int = 120000) -> Optional[float]:
+        """Get BTC close price from the candle nearest to the given timestamp.
+
+        Args:
+            timestamp_ms: Target timestamp in milliseconds.
+            tolerance_ms: Search window around the target (default 2 minutes).
+
+        Returns:
+            The close price of the nearest candle, or None if no candle found.
+        """
+        try:
+            cursor = await self._db.execute(
+                """SELECT close FROM candles
+                   WHERE timestamp BETWEEN ? AND ?
+                   ORDER BY ABS(timestamp - ?) LIMIT 1""",
+                (timestamp_ms - tolerance_ms, timestamp_ms + tolerance_ms, timestamp_ms),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+        except Exception:
+            logger.exception("Failed to query BTC price at %d", timestamp_ms)
+            return None
+
     async def get_unsettled_trades(self) -> list[dict]:
         """Return all paper trades that have not yet been settled."""
         try:

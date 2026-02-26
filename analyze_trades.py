@@ -1,489 +1,611 @@
-"""Analyze paper trading data to find which signals are predictive.
+#!/usr/bin/env python3
+"""Comprehensive trade analysis for BTC Polymarket Edge Finder.
 
-Run from the same directory as btc_edge.db:
+Run on the VPS:
+    cd /home/btcedge/BTC-tool
+    source venv/bin/activate
     python analyze_trades.py
 
-Outputs:
-  1. Overall stats
-  2. Win rate by signal direction (which signals predict correctly?)
-  3. Signal strength vs outcome (do strong signals win more?)
-  4. Edge bucket analysis (are high-edge trades better?)
-  5. ML model — logistic regression on raw features to find if any
-     combination is predictive. Prints coefficients and cross-validated
-     accuracy.
+Or specify a custom DB path:
+    python analyze_trades.py /path/to/btc_edge.db
 """
 
 import sqlite3
 import sys
 from collections import defaultdict
-from pathlib import Path
+from datetime import datetime, timezone
 
-DB_PATH = Path("btc_edge.db")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _pct(n: float) -> str:
-    return f"{n * 100:.1f}%"
+# Polymarket fee: 2% on net profit for wins
+PROFIT_FEE_RATE = 0.02
 
 
-def _bar(value: float, width: int = 30) -> str:
-    """Simple ASCII bar for visualisation."""
-    filled = int(abs(value) * width)
-    if value >= 0:
-        return "[" + "#" * filled + "." * (width - filled) + "]"
-    return "[" + "." * (width - filled) + "#" * filled + "]"
-
-
-def print_header(title: str) -> None:
-    print()
-    print("=" * 60)
-    print(f"  {title}")
-    print("=" * 60)
-
-
-# ---------------------------------------------------------------------------
-# 1. Load data
-# ---------------------------------------------------------------------------
-
-def load_data(db_path: Path) -> tuple[list[dict], list[dict]]:
-    """Load trades and matching feature snapshots from SQLite."""
-    conn = sqlite3.connect(str(db_path))
+def load_trades(db_path: str) -> list[dict]:
+    """Load all settled trades from the database."""
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-
-    # All settled trades
-    trades = [dict(r) for r in conn.execute(
+    rows = conn.execute(
         "SELECT * FROM paper_trades WHERE outcome IS NOT NULL ORDER BY timestamp"
-    ).fetchall()]
-
-    # All feature snapshots
-    features = [dict(r) for r in conn.execute(
-        "SELECT * FROM feature_snapshots ORDER BY timestamp"
-    ).fetchall()]
-
+    ).fetchall()
+    trades = [dict(r) for r in rows]
     conn.close()
-    return trades, features
+    return trades
 
 
-def match_features_to_trades(
-    trades: list[dict], features: list[dict]
-) -> list[dict]:
-    """Join each trade with the closest-in-time feature snapshot for the same slug."""
-
-    # Build index: slug -> list of feature rows sorted by timestamp
-    by_slug: dict[str, list[dict]] = defaultdict(list)
-    for f in features:
-        slug = f.get("market_slug", "")
+def load_feature_snapshots(db_path: str) -> dict[str, dict]:
+    """Load feature snapshots keyed by market_slug for joining with trades."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM feature_snapshots ORDER BY timestamp"
+    ).fetchall()
+    conn.close()
+    # Keep the latest snapshot per slug
+    by_slug: dict[str, dict] = {}
+    for r in rows:
+        d = dict(r)
+        slug = d.get("market_slug")
         if slug:
-            by_slug[slug].append(f)
-
-    merged = []
-    for t in trades:
-        slug = t["market_slug"]
-        candidates = by_slug.get(slug, [])
-        if not candidates:
-            continue
-        # Find the feature snapshot closest to trade timestamp
-        best = min(candidates, key=lambda f: abs(f["timestamp"] - t["timestamp"]))
-        row = {**t}
-        for col in ("obi", "taker_ratio", "momentum_1m", "momentum_5m",
-                     "rsi", "vwap_deviation", "bb_position", "ema_cross",
-                     "funding_rate", "volume_zscore", "atr", "prob_up"):
-            row[f"feat_{col}"] = best.get(col, 0.0) or 0.0
-        merged.append(row)
-    return merged
+            by_slug[slug] = d
+    return by_slug
 
 
-# ---------------------------------------------------------------------------
-# 2. Overall stats
-# ---------------------------------------------------------------------------
+def pnl_for_trade(trade: dict) -> float:
+    """Recompute PnL from trade data (sanity check)."""
+    if trade["outcome"] == "WIN":
+        gross = trade["size_usdc"] * ((1.0 - trade["entry_price"]) / trade["entry_price"])
+        return gross * (1.0 - PROFIT_FEE_RATE)
+    else:
+        return -trade["size_usdc"]
 
-def print_overall_stats(trades: list[dict]) -> None:
-    print_header("OVERALL STATS")
+
+def fmt_pct(x: float) -> str:
+    return f"{x * 100:.1f}%"
+
+
+def fmt_usd(x: float) -> str:
+    return f"${x:+,.2f}"
+
+
+def section(title: str) -> str:
+    return f"\n{'=' * 60}\n  {title}\n{'=' * 60}"
+
+
+def analyze(db_path: str) -> None:
+    trades = load_trades(db_path)
+    if not trades:
+        print("No settled trades found.")
+        return
+
+    features_by_slug = load_feature_snapshots(db_path)
+
     total = len(trades)
-    wins = sum(1 for t in trades if t["outcome"] == "WIN")
-    losses = total - wins
+    wins = [t for t in trades if t["outcome"] == "WIN"]
+    losses = [t for t in trades if t["outcome"] == "LOSS"]
+    voids = [t for t in trades if t["outcome"] == "VOID"]
+    n_wins = len(wins)
+    n_losses = len(losses)
+    n_voids = len(voids)
+    # Exclude voids from win rate
+    settled = n_wins + n_losses
+    win_rate = n_wins / settled if settled > 0 else 0
+
     total_pnl = sum(t["pnl"] or 0 for t in trades)
-    avg_pnl = total_pnl / total if total else 0
+    avg_pnl = total_pnl / settled if settled > 0 else 0
+    total_staked = sum(t["size_usdc"] for t in trades if t["outcome"] in ("WIN", "LOSS"))
+    roi_on_stakes = total_pnl / total_staked if total_staked > 0 else 0
 
-    print(f"  Settled trades : {total}")
-    print(f"  Wins / Losses  : {wins} / {losses}")
-    print(f"  Win rate       : {_pct(wins / total) if total else 'N/A'}")
-    print(f"  Total P&L      : ${total_pnl:+.2f}")
-    print(f"  Avg P&L/trade  : ${avg_pnl:+.4f}")
-    print(f"  Break-even WR  : ~50.8% (at p=0.50 with 1.56% fee)")
+    avg_edge = sum(t["edge"] for t in trades) / total
+    avg_win_edge = sum(t["edge"] for t in wins) / n_wins if n_wins else 0
+    avg_loss_edge = sum(t["edge"] for t in losses) / n_losses if n_losses else 0
 
+    avg_entry = sum(t["entry_price"] for t in trades) / total
+    avg_win_entry = sum(t["entry_price"] for t in wins) / n_wins if n_wins else 0
+    avg_loss_entry = sum(t["entry_price"] for t in losses) / n_losses if n_losses else 0
 
-# ---------------------------------------------------------------------------
-# 3. Signal direction analysis
-# ---------------------------------------------------------------------------
+    # Date range
+    first_ts = trades[0]["timestamp"] / 1000
+    last_ts = trades[-1]["timestamp"] / 1000
+    first_dt = datetime.fromtimestamp(first_ts, tz=timezone.utc)
+    last_dt = datetime.fromtimestamp(last_ts, tz=timezone.utc)
+    days_active = max((last_ts - first_ts) / 86400, 1)
 
-SIGNAL_COLS = [
-    ("feat_obi",            "OBI",         "high=bullish"),
-    ("feat_taker_ratio",    "Taker Ratio", "high=bullish"),
-    ("feat_momentum_1m",    "Momentum 1m", "high=bullish"),
-    ("feat_momentum_5m",    "Momentum 5m", "high=bullish"),
-    ("feat_rsi",            "RSI",         ">50=bullish"),
-    ("feat_vwap_deviation", "VWAP Dev",    "high=bullish"),
-    ("feat_funding_rate",   "Funding",     "high=bearish"),
-    ("feat_volume_zscore",  "Vol Z-Score", "high=active"),
-]
-
-
-def print_signal_direction_analysis(data: list[dict]) -> None:
-    """For each signal, split trades by signal direction and compare win rates."""
-    print_header("WIN RATE BY SIGNAL DIRECTION")
-    print(f"  {'Signal':<14s} {'Bullish WR':>12s} {'Bearish WR':>12s} {'Delta':>8s}  Note")
-    print("  " + "-" * 56)
-
-    for col, name, note in SIGNAL_COLS:
-        bullish_wins, bullish_total = 0, 0
-        bearish_wins, bearish_total = 0, 0
-
-        for row in data:
-            val = row.get(col, 0.0)
-            won = row["outcome"] == "WIN"
-            side = row["side"]
-
-            # Determine if the signal was bullish or bearish.
-            # For RSI, bullish = > 50.  For funding, inverted.  For others, > 0.
-            if col == "feat_rsi":
-                is_bullish = val > 50
-            elif col == "feat_funding_rate":
-                is_bullish = val < 0  # negative funding = bullish
-            else:
-                is_bullish = val > 0
-
-            if is_bullish:
-                bullish_total += 1
-                if won:
-                    bullish_wins += 1
-            else:
-                bearish_total += 1
-                if won:
-                    bearish_wins += 1
-
-        bwr = bullish_wins / bullish_total if bullish_total else 0
-        brwr = bearish_wins / bearish_total if bearish_total else 0
-        delta = bwr - brwr
-
-        flag = " <-- useful" if abs(delta) > 0.05 else ""
-        print(
-            f"  {name:<14s} {_pct(bwr):>8s} ({bullish_total:>3d}) "
-            f"{_pct(brwr):>8s} ({bearish_total:>3d}) {delta:>+7.1%}{flag}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 4. Signal strength analysis
-# ---------------------------------------------------------------------------
-
-def print_signal_strength_analysis(data: list[dict]) -> None:
-    """Split trades by signal strength (weak/medium/strong) and compare win rates."""
-    print_header("SIGNAL STRENGTH VS WIN RATE")
-    print("  (Absolute signal value: weak < 0.1, medium 0.1-0.3, strong > 0.3)")
+    # ===================================================================
+    # 1. OVERALL SUMMARY
+    # ===================================================================
+    print(section("OVERALL SUMMARY"))
+    print(f"  Period:         {first_dt:%Y-%m-%d %H:%M} to {last_dt:%Y-%m-%d %H:%M} UTC")
+    print(f"  Days active:    {days_active:.1f}")
+    print(f"  Total trades:   {total} (settled: {settled}, void: {n_voids})")
+    print(f"  Wins / Losses:  {n_wins} / {n_losses}")
+    print(f"  Win rate:       {fmt_pct(win_rate)}")
+    print(f"  Total P&L:      {fmt_usd(total_pnl)}")
+    print(f"  Avg P&L/trade:  {fmt_usd(avg_pnl)}")
+    print(f"  Total staked:   ${total_staked:,.2f}")
+    print(f"  ROI on stakes:  {fmt_pct(roi_on_stakes)}")
+    print(f"  Trades/day:     {settled / days_active:.1f}")
+    print(f"  P&L/day:        {fmt_usd(total_pnl / days_active)}")
     print()
+    print(f"  Avg edge:       {fmt_pct(avg_edge)}")
+    print(f"  Avg edge (W):   {fmt_pct(avg_win_edge)}")
+    print(f"  Avg edge (L):   {fmt_pct(avg_loss_edge)}")
+    print(f"  Avg entry:      {avg_entry:.4f}")
+    print(f"  Avg entry (W):  {avg_win_entry:.4f}")
+    print(f"  Avg entry (L):  {avg_loss_entry:.4f}")
 
-    for col, name, _ in SIGNAL_COLS:
-        if col in ("feat_rsi", "feat_volume_zscore"):
-            continue  # different scale, skip for this analysis
-
-        buckets = {"weak": [0, 0], "medium": [0, 0], "strong": [0, 0]}
-        for row in data:
-            val = abs(row.get(col, 0.0))
-            won = 1 if row["outcome"] == "WIN" else 0
-            if val < 0.1:
-                b = "weak"
-            elif val < 0.3:
-                b = "medium"
-            else:
-                b = "strong"
-            buckets[b][0] += 1
-            buckets[b][1] += won
-
-        parts = []
-        for bname in ("weak", "medium", "strong"):
-            total, wins = buckets[bname]
-            wr = wins / total if total else 0
-            parts.append(f"{bname}: {_pct(wr)} ({total})")
-        print(f"  {name:<14s}  {' | '.join(parts)}")
-
-
-# ---------------------------------------------------------------------------
-# 5. Edge bucket analysis
-# ---------------------------------------------------------------------------
-
-def print_edge_analysis(trades: list[dict]) -> None:
-    """Bucket trades by edge size and see if larger edges perform better."""
-    print_header("EDGE SIZE VS ACTUAL WIN RATE")
-    print("  (Does a bigger detected edge actually win more often?)")
-    print()
-
+    # ===================================================================
+    # 2. EDGE BUCKET ANALYSIS
+    # ===================================================================
+    print(section("EDGE BUCKET ANALYSIS"))
     buckets = [
-        ("5-8%",   0.05, 0.08),
-        ("8-12%",  0.08, 0.12),
-        ("12-16%", 0.12, 0.16),
-        ("16-20%", 0.16, 0.20),
-        ("20%+",   0.20, 1.00),
+        ("5.0-6.0%",  0.050, 0.060),
+        ("6.0-7.0%",  0.060, 0.070),
+        ("7.0-8.0%",  0.070, 0.080),
+        ("8.0-10.0%", 0.080, 0.100),
+        ("10.0-12.0%",0.100, 0.120),
+        ("12.0-15.0%",0.120, 0.150),
+        ("15.0-20.0%",0.150, 0.200),
+        ("20.0%+",    0.200, 1.000),
     ]
-
+    print(f"  {'Bucket':>12s}  {'Trades':>7s}  {'WinRate':>8s}  {'P&L':>10s}  {'AvgPnL':>8s}  {'AvgEdge':>8s}  {'EV/trade':>9s}")
+    print(f"  {'-'*12}  {'-'*7}  {'-'*8}  {'-'*10}  {'-'*8}  {'-'*8}  {'-'*9}")
     for label, lo, hi in buckets:
-        subset = [t for t in trades if lo <= t["edge"] < hi]
+        subset = [t for t in trades if lo <= t["edge"] < hi and t["outcome"] in ("WIN", "LOSS")]
         if not subset:
-            print(f"  Edge {label:>6s}: no trades")
             continue
-        wins = sum(1 for t in subset if t["outcome"] == "WIN")
-        wr = wins / len(subset)
-        pnl = sum(t["pnl"] or 0 for t in subset)
-        bar = _bar(wr - 0.5, 20)  # center at 50%
-        print(
-            f"  Edge {label:>6s}: {_pct(wr):>6s} win ({wins}/{len(subset)}) "
-            f" P&L=${pnl:+.2f}  {bar}"
-        )
+        bwins = sum(1 for t in subset if t["outcome"] == "WIN")
+        bwr = bwins / len(subset)
+        bpnl = sum(t["pnl"] or 0 for t in subset)
+        bavg = bpnl / len(subset)
+        bedge = sum(t["edge"] for t in subset) / len(subset)
+        # EV per trade: expected_pnl based on win rate and avg win/loss amounts
+        avg_win_pnl = sum(t["pnl"] for t in subset if t["outcome"] == "WIN") / max(bwins, 1)
+        avg_loss_pnl = sum(t["pnl"] for t in subset if t["outcome"] == "LOSS") / max(len(subset) - bwins, 1)
+        ev = bwr * avg_win_pnl + (1 - bwr) * avg_loss_pnl
+        print(f"  {label:>12s}  {len(subset):>7d}  {bwr:>7.1%}  {bpnl:>+10.2f}  {bavg:>+8.2f}  {bedge:>7.1%}  {ev:>+9.2f}")
 
-
-# ---------------------------------------------------------------------------
-# 6. Side analysis
-# ---------------------------------------------------------------------------
-
-def print_side_analysis(trades: list[dict]) -> None:
-    """Compare win rate for UP vs DOWN bets."""
-    print_header("WIN RATE BY SIDE")
-
+    # ===================================================================
+    # 3. SIDE ANALYSIS (UP vs DOWN)
+    # ===================================================================
+    print(section("SIDE ANALYSIS"))
     for side in ("UP", "DOWN"):
-        subset = [t for t in trades if t["side"] == side]
+        subset = [t for t in trades if t["side"] == side and t["outcome"] in ("WIN", "LOSS")]
         if not subset:
-            print(f"  {side}: no trades")
             continue
-        wins = sum(1 for t in subset if t["outcome"] == "WIN")
-        wr = wins / len(subset)
-        pnl = sum(t["pnl"] or 0 for t in subset)
-        print(f"  {side:>5s}: {_pct(wr):>6s} win ({wins}/{len(subset)})  P&L=${pnl:+.2f}")
+        sw = sum(1 for t in subset if t["outcome"] == "WIN")
+        swr = sw / len(subset)
+        spnl = sum(t["pnl"] or 0 for t in subset)
+        savg = spnl / len(subset)
+        se = sum(t["edge"] for t in subset) / len(subset)
+        print(f"  {side}:")
+        print(f"    Trades:   {len(subset)}")
+        print(f"    Win rate: {fmt_pct(swr)}")
+        print(f"    P&L:      {fmt_usd(spnl)}")
+        print(f"    Avg P&L:  {fmt_usd(savg)}")
+        print(f"    Avg edge: {fmt_pct(se)}")
+        print()
 
-
-# ---------------------------------------------------------------------------
-# 7. Signal agreement analysis
-# ---------------------------------------------------------------------------
-
-def print_signal_agreement(data: list[dict]) -> None:
-    """Check if trades where more signals agree perform better."""
-    print_header("SIGNAL AGREEMENT (how many signals point in the trade direction?)")
-
-    agreement_buckets: dict[int, list[bool]] = defaultdict(list)
-
-    for row in data:
-        side = row["side"]
-        agreeing = 0
-        # Count how many signals agree with the trade side
-        for col, _, _ in SIGNAL_COLS:
-            val = row.get(col, 0.0)
-            if col == "feat_rsi":
-                signal_bullish = val > 50
-            elif col == "feat_funding_rate":
-                signal_bullish = val < 0
-            elif col == "feat_volume_zscore":
-                continue  # non-directional
-            else:
-                signal_bullish = val > 0
-
-            if (side == "UP" and signal_bullish) or (side == "DOWN" and not signal_bullish):
-                agreeing += 1
-
-        agreement_buckets[agreeing].append(row["outcome"] == "WIN")
-
-    print(f"  {'Signals agreeing':>18s}  {'Win Rate':>10s}  {'Trades':>8s}")
-    print("  " + "-" * 40)
-    for n in sorted(agreement_buckets.keys()):
-        wins_list = agreement_buckets[n]
-        wr = sum(wins_list) / len(wins_list)
-        print(f"  {n:>18d}  {_pct(wr):>10s}  {len(wins_list):>8d}")
-
-
-# ---------------------------------------------------------------------------
-# 8. ML analysis (logistic regression)
-# ---------------------------------------------------------------------------
-
-def run_ml_analysis(data: list[dict]) -> None:
-    """Train a logistic regression on feature snapshots to predict trade outcome."""
-    print_header("ML ANALYSIS — Logistic Regression")
-
-    try:
-        import numpy as np
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.model_selection import cross_val_score
-        from sklearn.preprocessing import StandardScaler
-    except ImportError:
-        print("  scikit-learn not installed. Run: pip install scikit-learn numpy")
-        return
-
-    feature_cols = [
-        "feat_obi", "feat_taker_ratio", "feat_momentum_1m", "feat_momentum_5m",
-        "feat_rsi", "feat_vwap_deviation", "feat_bb_position", "feat_ema_cross",
-        "feat_funding_rate", "feat_volume_zscore", "feat_atr",
-    ]
-
-    X = []
-    y = []
-    for row in data:
-        features = [row.get(c, 0.0) for c in feature_cols]
-        if any(v is None for v in features):
+    # ===================================================================
+    # 4. HOUR OF DAY ANALYSIS
+    # ===================================================================
+    print(section("HOUR OF DAY ANALYSIS (UTC)"))
+    hour_data: dict[int, list[dict]] = defaultdict(list)
+    for t in trades:
+        if t["outcome"] not in ("WIN", "LOSS"):
             continue
-        # Target: 1 if the trade won, 0 if lost
-        X.append(features)
-        y.append(1 if row["outcome"] == "WIN" else 0)
+        dt = datetime.fromtimestamp(t["timestamp"] / 1000, tz=timezone.utc)
+        hour_data[dt.hour].append(t)
 
-    X = np.array(X, dtype=float)
-    y = np.array(y, dtype=int)
+    print(f"  {'Hour':>6s}  {'Trades':>7s}  {'WinRate':>8s}  {'P&L':>10s}  {'AvgPnL':>8s}")
+    print(f"  {'-'*6}  {'-'*7}  {'-'*8}  {'-'*10}  {'-'*8}")
+    for hour in range(24):
+        subset = hour_data.get(hour, [])
+        if not subset:
+            continue
+        hw = sum(1 for t in subset if t["outcome"] == "WIN")
+        hwr = hw / len(subset)
+        hpnl = sum(t["pnl"] or 0 for t in subset)
+        havg = hpnl / len(subset)
+        bar = "#" * int(hwr * 20)
+        print(f"  {hour:02d}:00  {len(subset):>7d}  {hwr:>7.1%}  {hpnl:>+10.2f}  {havg:>+8.2f}  {bar}")
 
-    if len(X) < 20:
-        print(f"  Only {len(X)} samples — need at least 20 for meaningful analysis.")
-        return
-
-    print(f"  Samples: {len(X)} trades with matched features")
-    print(f"  Features: {len(feature_cols)}")
-    print(f"  Base win rate: {_pct(y.mean())} (this is what random guessing gets)")
-    print()
-
-    # Standardize features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Cross-validated accuracy
-    model = LogisticRegression(max_iter=1000, random_state=42)
-    n_folds = min(5, len(X) // 10) or 2
-    scores = cross_val_score(model, X_scaled, y, cv=n_folds, scoring="accuracy")
-    print(f"  {n_folds}-fold CV accuracy: {_pct(scores.mean())} (+/- {_pct(scores.std())})")
-    print(f"  (If this is close to base win rate, features aren't predictive)")
-    print()
-
-    # Fit on all data to inspect coefficients
-    model.fit(X_scaled, y)
-    coefs = model.coef_[0]
-
-    print("  Feature importance (logistic regression coefficients):")
-    print(f"  {'Feature':<18s} {'Coeff':>8s}  {'Direction':<20s}  Strength")
-    print("  " + "-" * 65)
-
+    # Best/worst hours
     ranked = sorted(
-        zip(feature_cols, coefs),
-        key=lambda x: abs(x[1]),
+        [(h, ts) for h, ts in hour_data.items() if len(ts) >= 10],
+        key=lambda x: sum(t["pnl"] or 0 for t in x[1]),
         reverse=True,
     )
+    if ranked:
+        print(f"\n  Best hours (by P&L, min 10 trades):")
+        for h, ts in ranked[:3]:
+            hw = sum(1 for t in ts if t["outcome"] == "WIN")
+            hpnl = sum(t["pnl"] or 0 for t in ts)
+            print(f"    {h:02d}:00 UTC  {hw}/{len(ts)} wins ({hw/len(ts):.0%})  P&L: {fmt_usd(hpnl)}")
+        print(f"  Worst hours:")
+        for h, ts in ranked[-3:]:
+            hw = sum(1 for t in ts if t["outcome"] == "WIN")
+            hpnl = sum(t["pnl"] or 0 for t in ts)
+            print(f"    {h:02d}:00 UTC  {hw}/{len(ts)} wins ({hw/len(ts):.0%})  P&L: {fmt_usd(hpnl)}")
 
-    for col, coef in ranked:
-        name = col.replace("feat_", "")
-        direction = "helps WIN" if coef > 0 else "helps LOSE"
-        strength = _bar(coef / (max(abs(c) for c in coefs) + 1e-9), 15)
-        print(f"  {name:<18s} {coef:>+8.4f}  {direction:<20s}  {strength}")
-
-    # Predict on training data to see if there's any separation
-    y_pred = model.predict(X_scaled)
-    train_acc = (y_pred == y).mean()
-    print()
-    print(f"  Training accuracy: {_pct(train_acc)}")
-
-    # Check if the model learns anything beyond the base rate
-    improvement = train_acc - y.mean()
-    if improvement > 0.05:
-        print(f"  Model improves over base rate by {_pct(improvement)} -- signals have some info!")
-        print()
-        print("  Suggested action: Upweight the top positive coefficients,")
-        print("  downweight or remove the negative ones.")
-    elif improvement > 0.02:
-        print(f"  Model improves over base rate by {_pct(improvement)} -- marginal signal.")
-        print("  Might be noise. Need more data.")
-    else:
-        print(f"  Model does NOT improve over base rate ({_pct(improvement)}).")
-        print("  The features are not predictive of trade outcomes.")
-        print("  The Polymarket 5-min BTC market may be too efficient for these signals.")
-
-    # Optimal weights suggestion
-    print()
-    print("  SUGGESTED WEIGHTS (based on positive coefficients only):")
-    positive_coefs = [(col.replace("feat_", ""), c) for col, c in ranked if c > 0]
-    if positive_coefs:
-        total_pos = sum(c for _, c in positive_coefs)
-        for name, c in positive_coefs:
-            weight = c / total_pos
-            print(f"    {name:<18s}: {weight:.3f}")
-    else:
-        print("    No features with positive coefficients — model finds nothing useful.")
-
-
-# ---------------------------------------------------------------------------
-# 9. Time-of-day analysis
-# ---------------------------------------------------------------------------
-
-def print_time_analysis(trades: list[dict]) -> None:
-    """Check if certain hours perform better (BTC volatility varies by hour)."""
-    print_header("WIN RATE BY HOUR (UTC)")
-
-    from datetime import datetime, timezone
-
-    hour_stats: dict[int, list[bool]] = defaultdict(list)
+    # ===================================================================
+    # 5. DAY OF WEEK ANALYSIS
+    # ===================================================================
+    print(section("DAY OF WEEK ANALYSIS"))
+    dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    dow_data: dict[int, list[dict]] = defaultdict(list)
     for t in trades:
-        ts = t["timestamp"] / 1000  # ms -> s
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        hour_stats[dt.hour].append(t["outcome"] == "WIN")
+        if t["outcome"] not in ("WIN", "LOSS"):
+            continue
+        dt = datetime.fromtimestamp(t["timestamp"] / 1000, tz=timezone.utc)
+        dow_data[dt.weekday()].append(t)
 
-    if not hour_stats:
-        print("  No data")
-        return
+    print(f"  {'Day':>5s}  {'Trades':>7s}  {'WinRate':>8s}  {'P&L':>10s}  {'AvgPnL':>8s}")
+    print(f"  {'-'*5}  {'-'*7}  {'-'*8}  {'-'*10}  {'-'*8}")
+    for dow in range(7):
+        subset = dow_data.get(dow, [])
+        if not subset:
+            continue
+        dw = sum(1 for t in subset if t["outcome"] == "WIN")
+        dwr = dw / len(subset)
+        dpnl = sum(t["pnl"] or 0 for t in subset)
+        davg = dpnl / len(subset)
+        print(f"  {dow_names[dow]:>5s}  {len(subset):>7d}  {dwr:>7.1%}  {dpnl:>+10.2f}  {davg:>+8.2f}")
 
-    print(f"  {'Hour':>6s}  {'Win Rate':>10s}  {'Trades':>8s}  Bar")
-    print("  " + "-" * 45)
-    for h in sorted(hour_stats.keys()):
-        wins = hour_stats[h]
-        wr = sum(wins) / len(wins)
-        bar = _bar(wr - 0.5, 15)
-        marker = " <--" if wr > 0.55 else (" !!!" if wr < 0.40 else "")
-        print(f"  {h:>4d}:00  {_pct(wr):>10s}  {len(wins):>8d}  {bar}{marker}")
+    # ===================================================================
+    # 6. MODEL CALIBRATION
+    # ===================================================================
+    print(section("MODEL CALIBRATION (predicted P vs actual win rate)"))
+    prob_buckets = [
+        ("50-55%", 0.50, 0.55),
+        ("55-60%", 0.55, 0.60),
+        ("60-65%", 0.60, 0.65),
+        ("65-70%", 0.65, 0.70),
+        ("70-75%", 0.70, 0.75),
+        ("75-80%", 0.75, 0.80),
+        ("80%+",   0.80, 1.00),
+    ]
+    print(f"  {'Predicted':>10s}  {'Trades':>7s}  {'Actual WR':>10s}  {'Delta':>8s}  {'P&L':>10s}")
+    print(f"  {'-'*10}  {'-'*7}  {'-'*10}  {'-'*8}  {'-'*10}")
+    for label, lo, hi in prob_buckets:
+        subset = [t for t in trades if lo <= t["our_prob"] < hi and t["outcome"] in ("WIN", "LOSS")]
+        if not subset:
+            continue
+        cw = sum(1 for t in subset if t["outcome"] == "WIN")
+        cwr = cw / len(subset)
+        mid = (lo + hi) / 2
+        delta = cwr - mid
+        cpnl = sum(t["pnl"] or 0 for t in subset)
+        cal = "GOOD" if abs(delta) < 0.05 else ("OVER" if delta < 0 else "UNDER")
+        print(f"  {label:>10s}  {len(subset):>7d}  {cwr:>9.1%}  {delta:>+7.1%}  {cpnl:>+10.2f}  {cal}")
 
+    # ===================================================================
+    # 7. ENTRY PRICE ANALYSIS
+    # ===================================================================
+    print(section("ENTRY PRICE ANALYSIS (market-implied probability at entry)"))
+    entry_buckets = [
+        ("40-45c", 0.40, 0.45),
+        ("45-48c", 0.45, 0.48),
+        ("48-50c", 0.48, 0.50),
+        ("50-52c", 0.50, 0.52),
+        ("52-55c", 0.52, 0.55),
+        ("55-60c", 0.55, 0.60),
+        ("60c+",   0.60, 1.00),
+    ]
+    print(f"  {'Entry':>8s}  {'Trades':>7s}  {'WinRate':>8s}  {'P&L':>10s}  {'Payout':>8s}")
+    print(f"  {'-'*8}  {'-'*7}  {'-'*8}  {'-'*10}  {'-'*8}")
+    for label, lo, hi in entry_buckets:
+        subset = [t for t in trades if lo <= t["entry_price"] < hi and t["outcome"] in ("WIN", "LOSS")]
+        if not subset:
+            continue
+        ew = sum(1 for t in subset if t["outcome"] == "WIN")
+        ewr = ew / len(subset)
+        epnl = sum(t["pnl"] or 0 for t in subset)
+        # avg payout ratio for wins
+        avg_payout = sum(
+            (1.0 - t["entry_price"]) / t["entry_price"]
+            for t in subset if t["outcome"] == "WIN"
+        ) / max(ew, 1)
+        print(f"  {label:>8s}  {len(subset):>7d}  {ewr:>7.1%}  {epnl:>+10.2f}  {avg_payout:>7.2f}x")
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    # ===================================================================
+    # 8. STREAK ANALYSIS
+    # ===================================================================
+    print(section("STREAK ANALYSIS"))
+    settled_trades = [t for t in trades if t["outcome"] in ("WIN", "LOSS")]
+    max_win_streak = 0
+    max_loss_streak = 0
+    current_streak = 0
+    current_type = None
+    streaks_win = []
+    streaks_loss = []
 
-def main() -> None:
-    if not DB_PATH.exists():
-        print(f"Database not found at {DB_PATH.resolve()}")
-        print("Run this script from the same directory as btc_edge.db")
-        sys.exit(1)
+    for t in settled_trades:
+        if t["outcome"] == current_type:
+            current_streak += 1
+        else:
+            if current_type == "WIN" and current_streak > 0:
+                streaks_win.append(current_streak)
+            elif current_type == "LOSS" and current_streak > 0:
+                streaks_loss.append(current_streak)
+            current_type = t["outcome"]
+            current_streak = 1
 
-    trades, features = load_data(DB_PATH)
+    # Don't forget the last streak
+    if current_type == "WIN":
+        streaks_win.append(current_streak)
+    elif current_type == "LOSS":
+        streaks_loss.append(current_streak)
 
-    if not trades:
-        print("No settled trades found in the database.")
-        sys.exit(1)
+    max_win_streak = max(streaks_win) if streaks_win else 0
+    max_loss_streak = max(streaks_loss) if streaks_loss else 0
+    avg_win_streak = sum(streaks_win) / len(streaks_win) if streaks_win else 0
+    avg_loss_streak = sum(streaks_loss) / len(streaks_loss) if streaks_loss else 0
 
-    print(f"\nLoaded {len(trades)} settled trades, {len(features)} feature snapshots")
+    print(f"  Max win streak:   {max_win_streak}")
+    print(f"  Avg win streak:   {avg_win_streak:.1f}")
+    print(f"  Max loss streak:  {max_loss_streak}")
+    print(f"  Avg loss streak:  {avg_loss_streak:.1f}")
 
-    # Join features to trades
-    data = match_features_to_trades(trades, features)
-    print(f"Matched features to {len(data)} trades")
+    # Streak distribution
+    print(f"\n  Win streak distribution:")
+    streak_dist_w = defaultdict(int)
+    for s in streaks_win:
+        streak_dist_w[s] += 1
+    for length in sorted(streak_dist_w.keys()):
+        print(f"    {length:>3d}x: {streak_dist_w[length]:>4d} times")
 
-    # Run all analyses
-    print_overall_stats(trades)
-    print_side_analysis(trades)
-    print_edge_analysis(trades)
+    print(f"  Loss streak distribution:")
+    streak_dist_l = defaultdict(int)
+    for s in streaks_loss:
+        streak_dist_l[s] += 1
+    for length in sorted(streak_dist_l.keys()):
+        print(f"    {length:>3d}x: {streak_dist_l[length]:>4d} times")
 
-    if data:
-        print_signal_direction_analysis(data)
-        print_signal_strength_analysis(data)
-        print_signal_agreement(data)
-        print_time_analysis(trades)
-        run_ml_analysis(data)
-    else:
-        print("\nCould not match features to trades — no feature_snapshots data?")
-        print("The signal and ML analyses require feature data.")
+    # ===================================================================
+    # 9. DRAWDOWN ANALYSIS
+    # ===================================================================
+    print(section("DRAWDOWN ANALYSIS"))
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    max_dd_start = 0
+    max_dd_end = 0
+    dd_start = 0
+    in_drawdown = False
 
-    print()
-    print("=" * 60)
-    print("  DONE — review the results above to decide next steps.")
-    print("=" * 60)
+    equity_curve = []
+    for i, t in enumerate(settled_trades):
+        equity += t["pnl"] or 0
+        equity_curve.append(equity)
+        if equity > peak:
+            peak = equity
+            in_drawdown = False
+        dd = peak - equity
+        if dd > 0 and not in_drawdown:
+            dd_start = i
+            in_drawdown = True
+        if dd > max_dd:
+            max_dd = dd
+            max_dd_start = dd_start
+            max_dd_end = i
+
+    print(f"  Peak equity:      {fmt_usd(peak)}")
+    print(f"  Final equity:     {fmt_usd(equity)}")
+    print(f"  Max drawdown:     {fmt_usd(-max_dd)}")
+    if peak > 0:
+        print(f"  Max DD %:         {max_dd / peak:.1%} of peak")
+
+    if max_dd > 0 and max_dd_start < len(settled_trades) and max_dd_end < len(settled_trades):
+        dd_start_dt = datetime.fromtimestamp(
+            settled_trades[max_dd_start]["timestamp"] / 1000, tz=timezone.utc
+        )
+        dd_end_dt = datetime.fromtimestamp(
+            settled_trades[max_dd_end]["timestamp"] / 1000, tz=timezone.utc
+        )
+        dd_trades = max_dd_end - max_dd_start
+        print(f"  DD period:        {dd_start_dt:%m-%d %H:%M} to {dd_end_dt:%m-%d %H:%M} ({dd_trades} trades)")
+
+    # ===================================================================
+    # 10. ROLLING PERFORMANCE (daily buckets)
+    # ===================================================================
+    print(section("ROLLING PERFORMANCE (by day)"))
+    daily: dict[str, list[dict]] = defaultdict(list)
+    for t in settled_trades:
+        dt = datetime.fromtimestamp(t["timestamp"] / 1000, tz=timezone.utc)
+        daily[dt.strftime("%m-%d")].append(t)
+
+    print(f"  {'Date':>6s}  {'Trades':>7s}  {'WinRate':>8s}  {'P&L':>10s}  {'Cumul':>10s}")
+    print(f"  {'-'*6}  {'-'*7}  {'-'*8}  {'-'*10}  {'-'*10}")
+    cumulative = 0.0
+    for day_key in sorted(daily.keys()):
+        day_trades = daily[day_key]
+        dw = sum(1 for t in day_trades if t["outcome"] == "WIN")
+        dwr = dw / len(day_trades)
+        dpnl = sum(t["pnl"] or 0 for t in day_trades)
+        cumulative += dpnl
+        bar = "+" * max(0, int(dpnl / 2)) if dpnl >= 0 else "-" * max(0, int(-dpnl / 2))
+        print(f"  {day_key:>6s}  {len(day_trades):>7d}  {dwr:>7.1%}  {dpnl:>+10.2f}  {cumulative:>+10.2f}  {bar}")
+
+    # ===================================================================
+    # 11. OPTIMAL EDGE THRESHOLD
+    # ===================================================================
+    print(section("OPTIMAL EDGE THRESHOLD"))
+    print("  Simulates cumulative P&L at different MIN_EDGE thresholds:\n")
+    thresholds = [0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.14, 0.16, 0.18, 0.20]
+    print(f"  {'MinEdge':>8s}  {'Trades':>7s}  {'WinRate':>8s}  {'P&L':>10s}  {'PnL/trade':>10s}  {'PnL/day':>9s}")
+    print(f"  {'-'*8}  {'-'*7}  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*9}")
+    best_threshold = 0.05
+    best_pnl = -float("inf")
+    for threshold in thresholds:
+        subset = [t for t in settled_trades if t["edge"] >= threshold]
+        if not subset:
+            continue
+        tw = sum(1 for t in subset if t["outcome"] == "WIN")
+        twr = tw / len(subset)
+        tpnl = sum(t["pnl"] or 0 for t in subset)
+        tavg = tpnl / len(subset)
+        tpd = tpnl / days_active
+        marker = " <-- current" if abs(threshold - 0.05) < 0.001 else ""
+        if tpnl > best_pnl:
+            best_pnl = tpnl
+            best_threshold = threshold
+        print(f"  {threshold:>7.0%}  {len(subset):>7d}  {twr:>7.1%}  {tpnl:>+10.2f}  {tavg:>+10.2f}  {tpd:>+9.2f}{marker}")
+    print(f"\n  Optimal threshold: {best_threshold:.0%} (max cumulative P&L: {fmt_usd(best_pnl)})")
+
+    # Also check max_edge cap
+    print(f"\n  Effect of MAX_EDGE cap (removing trades above cap):")
+    max_caps = [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 1.00]
+    print(f"  {'MaxEdge':>8s}  {'Trades':>7s}  {'WinRate':>8s}  {'P&L':>10s}")
+    print(f"  {'-'*8}  {'-'*7}  {'-'*8}  {'-'*10}")
+    for cap in max_caps:
+        subset = [t for t in settled_trades if t["edge"] < cap]
+        if not subset:
+            continue
+        cw = sum(1 for t in subset if t["outcome"] == "WIN")
+        cwr = cw / len(subset)
+        cpnl = sum(t["pnl"] or 0 for t in subset)
+        marker = " <-- current" if abs(cap - 0.20) < 0.001 else ""
+        label = "No cap" if cap >= 1.0 else f"{cap:.0%}"
+        print(f"  {label:>8s}  {len(subset):>7d}  {cwr:>7.1%}  {cpnl:>+10.2f}{marker}")
+
+    # ===================================================================
+    # 12. MARKET PROBABILITY AT ENTRY (how often does market = 50/50?)
+    # ===================================================================
+    print(section("MARKET PRICE DISTRIBUTION AT ENTRY"))
+    mkt_dist = defaultdict(int)
+    for t in settled_trades:
+        bucket = round(t["market_prob"] * 20) / 20  # 5% buckets
+        mkt_dist[bucket] += 1
+    print(f"  {'MktProb':>8s}  {'Count':>6s}  {'%':>6s}")
+    print(f"  {'-'*8}  {'-'*6}  {'-'*6}")
+    for prob in sorted(mkt_dist.keys()):
+        count = mkt_dist[prob]
+        pct = count / len(settled_trades) * 100
+        bar = "#" * int(pct)
+        print(f"  {prob:>7.0%}  {count:>6d}  {pct:>5.1f}%  {bar}")
+
+    # ===================================================================
+    # 13. FEATURE ANALYSIS (if snapshots available)
+    # ===================================================================
+    if features_by_slug:
+        print(section("FEATURE ANALYSIS (from feature_snapshots)"))
+
+        feature_names = ["obi", "taker_ratio", "momentum_1m", "momentum_5m",
+                         "rsi", "vwap_deviation", "funding_rate", "volume_zscore"]
+
+        # Collect feature values for wins vs losses
+        win_features: dict[str, list[float]] = defaultdict(list)
+        loss_features: dict[str, list[float]] = defaultdict(list)
+
+        matched = 0
+        for t in settled_trades:
+            slug = t["market_slug"]
+            if slug not in features_by_slug:
+                continue
+            matched += 1
+            feat = features_by_slug[slug]
+            target = win_features if t["outcome"] == "WIN" else loss_features
+            for fn in feature_names:
+                val = feat.get(fn)
+                if val is not None:
+                    target[fn].append(val)
+
+        print(f"  Matched {matched}/{len(settled_trades)} trades to feature snapshots\n")
+
+        if matched > 0:
+            print(f"  {'Feature':>16s}  {'Win Avg':>10s}  {'Loss Avg':>10s}  {'Delta':>10s}  {'Signal':>8s}")
+            print(f"  {'-'*16}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*8}")
+            for fn in feature_names:
+                wvals = win_features.get(fn, [])
+                lvals = loss_features.get(fn, [])
+                wavg = sum(wvals) / len(wvals) if wvals else 0
+                lavg = sum(lvals) / len(lvals) if lvals else 0
+                delta = wavg - lavg
+                # Positive delta = feature is higher in wins
+                sig = "BULLISH" if delta > 0 else "BEARISH" if delta < 0 else "-"
+                print(f"  {fn:>16s}  {wavg:>+10.4f}  {lavg:>+10.4f}  {delta:>+10.4f}  {sig:>8s}")
+
+    # ===================================================================
+    # 14. CONSECUTIVE WINDOW ANALYSIS
+    # ===================================================================
+    print(section("POST-OUTCOME ANALYSIS"))
+    print("  Win rate of trade after previous outcome:\n")
+    prev_outcome = None
+    after_win_results = []
+    after_loss_results = []
+    for t in settled_trades:
+        if prev_outcome == "WIN":
+            after_win_results.append(t["outcome"] == "WIN")
+        elif prev_outcome == "LOSS":
+            after_loss_results.append(t["outcome"] == "WIN")
+        prev_outcome = t["outcome"]
+
+    if after_win_results:
+        aw_wr = sum(after_win_results) / len(after_win_results)
+        print(f"  After WIN:   {fmt_pct(aw_wr)} win rate ({len(after_win_results)} trades)")
+    if after_loss_results:
+        al_wr = sum(after_loss_results) / len(after_loss_results)
+        print(f"  After LOSS:  {fmt_pct(al_wr)} win rate ({len(after_loss_results)} trades)")
+
+    # ===================================================================
+    # 15. SUMMARY & RECOMMENDATIONS
+    # ===================================================================
+    print(section("RECOMMENDATIONS"))
+
+    recs = []
+
+    # Check if win rate is above break-even for the avg entry price
+    # Break-even WR = entry_price / (1 - fee_rate * (1 - entry_price))
+    if avg_entry > 0:
+        be_wr = avg_entry  # Simplified: need to win at least entry_price fraction
+        if win_rate > be_wr + 0.02:
+            recs.append(f"  [+] Model has positive edge: WR {fmt_pct(win_rate)} > break-even ~{fmt_pct(be_wr)}")
+        elif win_rate > be_wr:
+            recs.append(f"  [~] Model is marginal: WR {fmt_pct(win_rate)} near break-even ~{fmt_pct(be_wr)}")
+        else:
+            recs.append(f"  [-] Model is underwater: WR {fmt_pct(win_rate)} < break-even ~{fmt_pct(be_wr)}")
+
+    # Optimal threshold recommendation
+    if best_threshold != 0.05:
+        recs.append(f"  [!] Consider changing MIN_EDGE_THRESHOLD to {best_threshold:.0%} (currently 5%)")
+
+    # Hour filtering
+    if ranked:
+        worst_h, worst_ts = ranked[-1]
+        worst_wr = sum(1 for t in worst_ts if t["outcome"] == "WIN") / len(worst_ts)
+        worst_pnl = sum(t["pnl"] or 0 for t in worst_ts)
+        if worst_wr < 0.45 and len(worst_ts) >= 20:
+            recs.append(f"  [!] Consider avoiding {worst_h:02d}:00 UTC: {fmt_pct(worst_wr)} WR, {fmt_usd(worst_pnl)} P&L over {len(worst_ts)} trades")
+
+    # Side imbalance
+    up_trades = [t for t in settled_trades if t["side"] == "UP"]
+    down_trades = [t for t in settled_trades if t["side"] == "DOWN"]
+    if up_trades and down_trades:
+        up_wr = sum(1 for t in up_trades if t["outcome"] == "WIN") / len(up_trades)
+        down_wr = sum(1 for t in down_trades if t["outcome"] == "WIN") / len(down_trades)
+        if abs(up_wr - down_wr) > 0.05:
+            better = "UP" if up_wr > down_wr else "DOWN"
+            worse = "DOWN" if better == "UP" else "UP"
+            recs.append(
+                f"  [!] {better} trades ({fmt_pct(up_wr if better == 'UP' else down_wr)}) "
+                f"outperform {worse} ({fmt_pct(down_wr if better == 'UP' else up_wr)}) "
+                f"— consider weighting"
+            )
+
+    # Large loss streaks
+    if max_loss_streak >= 8:
+        recs.append(f"  [!] Max loss streak of {max_loss_streak} — consider reducing bet size or adding circuit breaker")
+
+    if not recs:
+        recs.append("  No specific recommendations — model appears well-calibrated.")
+
+    for r in recs:
+        print(r)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Analysis complete: {total} trades analyzed")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
-    main()
+    db_path = sys.argv[1] if len(sys.argv) > 1 else "btc_edge.db"
+    analyze(db_path)

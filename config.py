@@ -9,10 +9,10 @@ class Settings(BaseSettings):
     # Strategy
     min_edge_threshold: float = 0.05
     min_edge_down: float = 0.08          # higher bar for DOWN trades (data shows worse win rate)
-    max_edge: float = 0.20               # cap — edges above this are likely model error, not mispricing
+    max_edge_threshold: float = 0.18     # cap — edges above this are likely model error, not mispricing
     max_signal_value: float = 0.45       # skip when any single signal is saturated (near +-0.5 limits)
-    bet_size_usdc: float = 50.0
-    virtual_bankroll: float = 10000.0
+    bet_size_usdc: float = 5.0
+    virtual_bankroll: float = 100.0
     use_kelly: bool = False
 
     # Polymarket Builder Mode (for live trading — leave blank for paper-only)
@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_url: str = "https://clob.polymarket.com"
+
+    # Confidence dampening — shrink P(up) toward 0.5 to counter model
+    # overconfidence.  1.0 = no dampening, 0.0 = always 50%.
+    # Calibration data shows ~10-20% overconfidence; 0.6 is a good fit.
+    confidence_dampen: float = 0.6
+
+    # Hour blacklist (UTC hours where model underperforms; skip trading)
+    blacklist_hours: str = "2"  # comma-separated UTC hours, e.g. "2,11,19"
 
     # Feature weights
     w_obi: float = 0.25
