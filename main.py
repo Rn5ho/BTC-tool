@@ -69,6 +69,7 @@ class Orchestrator:
                 "rsi": settings.w_rsi,
                 "vwap": settings.w_vwap,
                 "funding": settings.w_funding,
+                "regime": settings.w_regime,
             },
             confidence_dampen=settings.confidence_dampen,
         )
@@ -271,6 +272,7 @@ class Orchestrator:
         self.alerter.register_command("resume", self._cmd_resume)
         self.alerter.register_command("weights", self._cmd_weights)
         self.alerter.register_command("analyze", self._cmd_analyze)
+        self.alerter.register_command("regime", self._cmd_regime)
         self.alerter.register_command("live", self._cmd_live)
         self.alerter.register_command("live_pause", self._cmd_live_pause)
         self.alerter.register_command("live_resume", self._cmd_live_resume)
@@ -569,6 +571,58 @@ class Orchestrator:
         except Exception as e:
             logger.exception("Error running /analyze")
             return f"\u26a0 Analysis error: {e}"
+
+    async def _cmd_regime(self, args: str = "") -> str:
+        """Handle /regime — show current market regime indicators."""
+        candles = self.binance.get_candles(n=50)
+        if len(candles) < 5:
+            return "\u26a0 Not enough data yet (need 5+ candles)."
+
+        try:
+            feature_vec = self.features.compute_features(
+                candles=candles,
+                orderbook=self.binance.orderbook,
+                trades=list(self.binance.recent_trades),
+                funding=self.binance.funding,
+            )
+
+            from signals.probability import ProbabilityModel
+            regime_val = ProbabilityModel._normalize_regime(feature_vec)
+
+            # Raw components for display
+            ema_raw = feature_vec.ema_cross
+            bb_raw = feature_vec.bb_position
+            mom_raw = feature_vec.momentum_5m
+
+            # Determine regime label
+            if regime_val > 0.15:
+                label = "BULLISH"
+                icon = "\U0001f7e2"  # green circle
+            elif regime_val < -0.15:
+                label = "BEARISH"
+                icon = "\U0001f534"  # red circle
+            else:
+                label = "NEUTRAL"
+                icon = "\u26aa"  # white circle
+
+            # Bar visualization
+            bar_pos = int((regime_val + 0.5) * 20)  # 0-20 scale
+            bar = "\u2591" * bar_pos + "\u2588" + "\u2591" * (20 - bar_pos)
+
+            return (
+                f"\U0001f30a <b>MARKET REGIME</b>\n\n"
+                f"Regime: {icon} <b>{label}</b> ({regime_val:+.3f})\n"
+                f"[{bar}]\n"
+                f" -0.5          0         +0.5\n\n"
+                f"<b>Components:</b>\n"
+                f"  EMA cross (9/21): {ema_raw:+.4f}%\n"
+                f"  BB position: {bb_raw:.3f}\n"
+                f"  5m momentum: {mom_raw:+.4f}%\n\n"
+                f"Weight in model: {self.model.weights.get('regime', 0):.0%}"
+            )
+        except Exception as e:
+            logger.exception("Error computing regime")
+            return f"\u26a0 Error: {e}"
 
     async def _cmd_live(self, args: str = "") -> str:
         """Handle /live — show live trading status and stats."""

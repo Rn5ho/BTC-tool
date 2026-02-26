@@ -11,12 +11,13 @@ class ProbabilityModel:
     """Combine normalised feature signals into a single P(up) probability."""
 
     DEFAULT_WEIGHTS: dict[str, float] = {
-        "obi": 0.25,
+        "obi": 0.15,
         "taker": 0.25,
-        "momentum": 0.15,
-        "rsi": 0.15,
+        "momentum": 0.10,
+        "rsi": 0.10,
         "vwap": 0.10,
         "funding": 0.10,
+        "regime": 0.20,
     }
 
     def __init__(
@@ -84,6 +85,34 @@ class ProbabilityModel:
         """
         return max(-0.5, min(0.5, -funding_zscore / 4.0 * 0.5))
 
+    @staticmethod
+    def _normalize_regime(features: FeatureVector) -> float:
+        """Market regime signal from trend indicators already in FeatureVector.
+
+        Combines three trend measures into a single [-0.5, 0.5] signal:
+        - EMA cross (EMA9 vs EMA21): direction and magnitude of short-term trend
+        - BB position: where price sits in the Bollinger Band (momentum proxy)
+        - 5-min momentum: multi-candle return direction
+
+        Positive = bullish regime (pushes P(up) higher).
+        Negative = bearish regime (pushes P(up) lower).
+        """
+        # EMA cross: (fast-slow)/slow * 100.  For BTC, +-0.3% is a clear trend.
+        ema_signal = max(-1.0, min(1.0, features.ema_cross / 0.3))
+
+        # BB position: 0-1 range (can exceed), center at 0.5.  Map to [-1, 1].
+        bb_signal = max(-1.0, min(1.0, (features.bb_position - 0.5) * 2.0))
+
+        # 5m momentum: return over 5 candles.  +-0.5% is significant for 5-min.
+        mom_signal = max(-1.0, min(1.0, features.momentum_5m / 0.005))
+
+        # Weighted combination: EMA cross is the strongest trend measure,
+        # BB position captures momentum, 5m momentum captures recent direction.
+        combined = 0.4 * ema_signal + 0.3 * bb_signal + 0.3 * mom_signal
+
+        # Scale to [-0.5, 0.5] for consistency with other signals
+        return max(-0.5, min(0.5, combined * 0.5))
+
     # ------------------------------------------------------------------
     # Prediction
     # ------------------------------------------------------------------
@@ -99,6 +128,7 @@ class ProbabilityModel:
             "rsi": self._normalize_rsi(features.rsi),
             "vwap": self._normalize_vwap(features.vwap_deviation),
             "funding": self._normalize_funding(features.funding_rate),
+            "regime": self._normalize_regime(features),
         }
 
         weighted_sum = sum(self.weights[k] * signals[k] for k in signals)
@@ -127,6 +157,7 @@ class ProbabilityModel:
             "rsi": self._normalize_rsi(features.rsi),
             "vwap": self._normalize_vwap(features.vwap_deviation),
             "funding": self._normalize_funding(features.funding_rate),
+            "regime": self._normalize_regime(features),
         }
         logger.debug("signal_breakdown: %s", breakdown)
         return breakdown

@@ -98,6 +98,7 @@ The bot (`@BTC5mBot`) supports interactive commands:
 | `/resume` | Resume placing trades |
 | `/weights` | Display current probability model weights with ASCII bar chart |
 | `/analyze` | Full trade analysis: overall stats, edge buckets, side breakdown, hourly win rate |
+| `/regime` | Current market regime: bullish/bearish/neutral score, EMA cross, BB position, momentum |
 | `/reset` | Two-step confirmation to clear all trade data and reset bankroll |
 | `/budget` | Show current bankroll and bet size |
 | `/budget 200` | Set bankroll to $200 (also resets initial_bankroll for ROI calculation) |
@@ -146,7 +147,7 @@ Copy `.env.example` to `.env`. Key settings:
 - `POLYMARKET_CLOB_URL` — CLOB API for live prices (default `https://clob.polymarket.com`)
 
 ### Model Weights
-- `W_OBI`, `W_TAKER`, `W_MOMENTUM`, `W_RSI`, `W_VWAP`, `W_FUNDING` — probability model weights (must sum to 1.0)
+- `W_OBI`, `W_TAKER`, `W_MOMENTUM`, `W_RSI`, `W_VWAP`, `W_FUNDING`, `W_REGIME` — probability model weights (must sum to 1.0)
 
 ## Data Flow
 
@@ -172,10 +173,10 @@ Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
                         Telegram Alert → notify user
 ```
 
-## Probability Model (v1 — Rule-Based Weighted Ensemble)
+## Probability Model (v2 — Regime-Aware Weighted Ensemble)
 
 ```
-P_raw = 0.5 + w_obi*OBI + w_taker*taker + w_momentum*momentum + w_rsi*rsi + w_vwap*vwap + w_funding*funding
+P_raw = 0.5 + w_obi*OBI + w_taker*taker + w_momentum*momentum + w_rsi*rsi + w_vwap*vwap + w_funding*funding + w_regime*regime
 P(up) = 0.5 + CONFIDENCE_DAMPEN * (P_raw - 0.5)
 ```
 
@@ -188,8 +189,9 @@ Each signal is normalized to [-0.5, 0.5]:
 - **RSI(9)**: (rsi - 50) / 100 → [-0.5, 0.5]
 - **VWAP deviation**: price vs VWAP, clipped at ±1% → [-0.5, 0.5]
 - **Funding rate**: z-score inverted (high funding = bearish) → [-0.5, 0.5]
+- **Regime** (market trend): composite of EMA cross (40%), BB position (30%), 5m momentum (30%) → [-0.5, 0.5]. Positive = bullish trend, negative = bearish trend. Steers the model toward the prevailing direction so it naturally produces DOWN edges in downtrends and UP edges in uptrends.
 
-Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.25, taker=0.25, momentum=0.15, RSI=0.15, VWAP=0.10, funding=0.10.
+Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.15, taker=0.25, momentum=0.10, RSI=0.10, VWAP=0.10, funding=0.10, regime=0.20.
 
 ## Edge Detection & Safety Filters
 
