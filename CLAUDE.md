@@ -4,7 +4,7 @@
 
 BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), computes directional probability estimates for 5-minute price movements, compares them against Polymarket's implied odds, and paper trades when mispricing is detected. Telegram bot for alerts and interactive commands.
 
-**Status:** Fully functional and deployed on Hetzner VPS (46.225.27.241) running 24/7 as a systemd service. Paper trading works end-to-end with Polymarket fee model. Interactive Telegram bot with commands for monitoring and management. No real-money trading yet — user has expressed interest in adding live trading via py-clob-client with small trial capital (~$20).
+**Status:** Fully functional and deployed on Hetzner VPS (46.225.27.241) running 24/7 as a systemd service. Paper trading works end-to-end with Polymarket fee model. Live trading via py-clob-client is implemented and runs in parallel with paper trading (disabled by default, toggle via `LIVE_TRADING_ENABLED`). Interactive Telegram bot with commands for monitoring and management of both paper and live trading.
 
 ## Tech Stack
 
@@ -16,6 +16,7 @@ BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance B
 - python-telegram-bot v21+ (interactive bot with commands)
 - pydantic-settings (config from .env)
 - numpy (indicators), no pandas at runtime
+- py-clob-client (Polymarket CLOB API for live trading — sync library, wrapped with asyncio.to_thread)
 
 ## Architecture
 
@@ -33,12 +34,13 @@ signals/        → Signal generation
 strategy/       → Trading logic
   edge.py       → Edge detection (compare P(up) vs fee-adjusted Polymarket implied odds, positive-edge only)
   paper_trader.py → Paper trading engine (Kelly/fixed sizing, fee-adjusted PnL, settlement, bankroll restoration)
+  live_trader.py  → Live trading engine (py-clob-client FOK market orders, 2% bankroll sizing, parallel with paper)
 
 alerts/
   telegram.py   → Telegram bot (edge alerts, trade notifications, settlements, interactive commands)
 
 storage/
-  db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots, historical price lookup)
+  db.py         → SQLite (candles, feature_snapshots, paper_trades, live_trades, market_snapshots, historical price lookup)
 
 deploy/         → Hetzner VPS deployment
   btc-edge.service → systemd service file (runs as btcedge user, auto-restart)
@@ -59,7 +61,7 @@ pip install -e .
 python main.py
 
 # Syntax check all files
-python -m py_compile main.py config.py data/models.py data/binance_ws.py data/polymarket.py signals/indicators.py signals/features.py signals/probability.py strategy/edge.py strategy/paper_trader.py alerts/telegram.py storage/db.py
+python -m py_compile main.py config.py data/models.py data/binance_ws.py data/polymarket.py signals/indicators.py signals/features.py signals/probability.py strategy/edge.py strategy/paper_trader.py strategy/live_trader.py alerts/telegram.py storage/db.py
 ```
 
 ### Hetzner VPS (46.225.27.241)
@@ -99,6 +101,9 @@ The bot (`@BTC5mBot`) supports interactive commands:
 | `/reset` | Two-step confirmation to clear all trade data and reset bankroll |
 | `/budget` | Show current bankroll and bet size |
 | `/budget 200` | Set bankroll to $200 (also resets initial_bankroll for ROI calculation) |
+| `/live` | Live trading status: state, bankroll, on-chain USDC balance, bet size, P&L, win rate |
+| `/live_pause` | Pause live trading only (paper trading continues) |
+| `/live_resume` | Resume live trading |
 | `/help` | List available commands |
 
 Commands are dispatched via long-polling (`get_updates`) in a dedicated asyncio task. Handlers accept an optional `args: str = ""` for commands like `/budget 200`.
@@ -128,6 +133,13 @@ Copy `.env.example` to `.env`. Key settings:
 - `POLYMARKET_FEE_RATE` — fee curve rate parameter (default 0.25 for crypto markets)
 - `POLYMARKET_FEE_EXPONENT` — fee curve exponent (default 2 for crypto markets)
 
+### Live Trading
+- `LIVE_TRADING_ENABLED` — master switch for live trading (default false, must be explicitly enabled)
+- `POLYGON_PRIVATE_KEY` — Polygon wallet private key (hex, 0x prefix) for signing CLOB orders
+- `POLYGON_WALLET_ADDRESS` — wallet address that holds USDC.e on Polygon
+- `LIVE_BET_PCT` — bet size as fraction of live bankroll (default 0.02 = 2%)
+- `LIVE_BANKROLL` — starting live bankroll in USDC (default 100)
+
 ### Data URLs
 - `BINANCE_WS_URL` — Binance WebSocket endpoint (default `wss://stream.binance.com:9443/ws`)
 - `POLYMARKET_GAMMA_URL` — Gamma API for market discovery (default `https://gamma-api.polymarket.com`)
@@ -151,7 +163,11 @@ Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
                               ↓ (if edge > threshold, positive only)
                         Safety Filters (time gate + hour blacklist + trend conflict)
                               ↓
-                        Paper Trader → simulate bet, log to SQLite
+                    ┌─────────┴─────────┐
+              Paper Trader         Live Trader (if enabled)
+              (simulate bet)       (FOK market buy via CLOB)
+              log to SQLite        log to SQLite + order_id
+                    └─────────┬─────────┘
                               ↓
                         Telegram Alert → notify user
 ```
@@ -208,6 +224,33 @@ Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's actual 
 - **Bankroll persistence**: `restore_bankroll()` loads cumulative P&L from DB on startup so bankroll survives restarts
 - **Stats**: Tracks total trades, settled, wins, losses, win rate, cumulative PnL, total fees paid, bankroll, ROI
 
+## Live Trading (py-clob-client)
+
+Live trading (`strategy/live_trader.py`) places real orders on Polymarket's CLOB in parallel with paper trading:
+
+- **Library**: py-clob-client (synchronous — all calls wrapped with `asyncio.to_thread()`)
+- **Order type**: FOK (Fill-Or-Kill) market buy orders — immediate full fill or cancel
+- **Sizing**: `LIVE_BET_PCT` * current bankroll (default 2% = $2 on $100 start)
+- **Minimum order**: $0.50 (below this, trade is skipped to avoid dust rejections)
+- **Token selection**: Orchestrator injects the correct `token_id` (UP or DOWN) into the signal dict based on the edge detector's chosen side
+- **Same safety filters**: Live trades pass through all 8 safety filters identically to paper trades
+- **Parallel operation**: Paper trading always runs; live trading runs alongside when enabled
+- **Independent pause**: `/live_pause` stops live orders without affecting paper trading
+- **Bankroll persistence**: `restore_bankroll()` loads cumulative P&L from `live_trades` table on restart
+- **Settlement**: Same window-boundary settlement as paper; both traders settle simultaneously using Chainlink RTDS prices
+- **Stale trade recovery**: On restart, unsettled live trades are recovered from DB and settled using historical candle data (same as paper)
+- **Graceful degradation**: If py-clob-client is not installed or CLOB API fails, live trades are silently skipped; paper trading and data collection continue unaffected
+
+### Prerequisites for live trading
+1. Polygon wallet with USDC.e balance
+2. Small amount of POL for gas (token approvals)
+3. One-time token allowance approval for Polymarket exchange contracts
+4. Builder Mode API credentials (derive via `client.create_or_derive_api_creds()`)
+5. Set `LIVE_TRADING_ENABLED=true` in `.env`
+
+### Database
+Live trades are stored in a separate `live_trades` table (same schema as `paper_trades` plus `order_id` column) for clean separation and independent statistics.
+
 ## Window Lifecycle & Settlement
 
 1. **Window detection**: Slugs are deterministic (`btc-updown-5m-{unix_ts}` where `unix_ts = now - (now % 300)`). The analysis loop detects transitions every 3-second cycle.
@@ -217,9 +260,10 @@ Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's actual 
 
 ## Startup Sequence
 
-1. Initialize DB (create tables if needed)
-2. Create PaperTrader, TelegramAlerter
-3. Start Polymarket aiohttp session
+1. Initialize DB (create tables if needed, including `live_trades`)
+2. Create PaperTrader; create LiveTrader if credentials present and `LIVE_TRADING_ENABLED=true`
+3. Restore bankrolls from DB (both paper and live)
+4. Create TelegramAlerter, start Polymarket aiohttp session
 4. Launch 5 concurrent asyncio tasks:
    - **Binance WS**: Streams kline_1m, depth20, aggTrade, futures funding
    - **Chainlink RTDS**: Streams BTC/USD from Polymarket's data service
@@ -234,6 +278,8 @@ The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
 - **Edge signals**: `>>> EDGE: DOWN btc-updown-5m-... | our=57.0% mkt=48.5% edge=+8.5% fee=1.56% | BTC=$68,562 | [obi=+0.123, taker=-0.045, momentum=+0.089]`
 - **Settlement**: `--- WINDOW SETTLED: btc-updown-5m-... | BTC $68544 -> $68562 (+18.00 = UP) [Chainlink Stream]`
 - **P&L summary**: `--- P&L: $+3.04 | Win rate: 60% (3/5) | Bankroll: $103.04`
+- **Live P&L** (when live trading enabled): `--- LIVE P&L: $+1.22 | Win rate: 60% (3/5) | Bankroll: $101.22`
+- **Live trade placed**: `LIVE TRADE PLACED: UP btc-updown-5m-... | size=$2.00 entry=0.4800 edge=0.0650 | order=abc123...`
 - **Status heartbeat** (every 30s): `-- Status: BTC $68,679 | P(up)=55.1% | Mkt=50/50 | Trades: 5 (60% win) | P&L: $+3.04`
 
 ## Deployment (Hetzner VPS)
@@ -299,10 +345,13 @@ Analysis script: `python analyze_trades.py` (run on VPS).
 - Console output must be ASCII-safe (no emojis in logger.info — emojis only in Telegram HTML messages)
 - Windows compatibility — no signal handlers (add_signal_handler wrapped in try/except NotImplementedError)
 - Paper trades stored as dicts in `_pending_trades` (keyed by market slug), persisted to SQLite
+- Live trades stored identically in LiveTrader's `_pending_trades`, persisted to separate `live_trades` table
+- Synchronous third-party libraries (py-clob-client) wrapped with `asyncio.to_thread()` to avoid blocking
 
 ## Potential Next Steps
 
-- **Live trading**: User wants to integrate real Polymarket trading via py-clob-client with ~$20 trial capital. Builder Mode credentials and fee calculation are already configured — remaining work is the order placement layer via Polymarket CLOB API.
+- **Live trading validation**: Live trading is implemented — next step is to fund a Polygon wallet with ~$100 USDC.e, derive API credentials, approve token allowances, and enable with `LIVE_TRADING_ENABLED=true`. Run for 1-2 weeks alongside paper trading to compare results and validate that real fills match paper expectations.
+- **Edge threshold tuning for live**: Currently live uses the same thresholds as paper (5% UP, 8% DOWN). Collect more forward data with current filters before differentiating — high-conviction trades haven't necessarily been the most successful, so the meaning of "edge" may need revisiting.
 - **Weight rebalancing**: Data shows taker_ratio and volume_zscore are the strongest features; OBI and momentum have near-zero predictive delta. Consider increasing W_TAKER, adding volume_zscore as a weighted signal, and reducing W_OBI/W_MOMENTUM.
 - **Hour scheduling**: Consider expanding blacklist to other weak hours (11:00=42.5% WR, 19:00-21:00=44-46% WR) once more data confirms the pattern.
 - **Friday filter**: Only 1 Friday in sample (38.1% WR, -$98) — collect more data before adding a day-of-week filter.
