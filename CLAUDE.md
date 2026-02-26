@@ -296,6 +296,68 @@ The bot runs 24/7 on a Hetzner VPS at `46.225.27.241`:
 - **Setup**: `deploy/setup.sh` automates user creation, repo clone, venv setup, service install
 - **Branch**: Currently tracking `claude/read-claude-docs-jBeBH`
 
+### IMPORTANT — Post-Change Deployment Instructions (for AI assistants)
+
+**After every code change that is committed and pushed, you MUST provide the user with ready-to-paste deployment commands.** The user deploys by SSHing into the VPS and running commands manually. Do not assume they know which commands to run — always give them the full sequence.
+
+**Standard deployment (code-only changes — most common):**
+```bash
+ssh root@46.225.27.241
+cd /home/btcedge/BTC-tool
+sudo -u btcedge git pull origin claude/read-claude-docs-jBeBH
+sudo systemctl restart btc-edge
+# Verify it started cleanly:
+sleep 3 && journalctl -u btc-edge -n 30 --no-pager
+```
+
+**If `.env.example` was changed (new config keys added):**
+Tell the user which new keys were added and what they do. Then:
+```bash
+ssh root@46.225.27.241
+cd /home/btcedge/BTC-tool
+sudo -u btcedge git pull origin claude/read-claude-docs-jBeBH
+# Add new config keys to .env (show exact lines to add):
+sudo -u btcedge nano .env
+# ^^^ Tell the user exactly what to add, e.g.: "Add this line: W_REGIME=0.20"
+sudo systemctl restart btc-edge
+sleep 3 && journalctl -u btc-edge -n 30 --no-pager
+```
+
+**If dependencies changed (setup.py / requirements):**
+```bash
+ssh root@46.225.27.241
+cd /home/btcedge/BTC-tool
+sudo -u btcedge git pull origin claude/read-claude-docs-jBeBH
+sudo -u btcedge /home/btcedge/BTC-tool/.venv/bin/pip install -e .
+sudo systemctl restart btc-edge
+sleep 3 && journalctl -u btc-edge -n 30 --no-pager
+```
+
+**If the systemd service file changed (`deploy/btc-edge.service`):**
+```bash
+ssh root@46.225.27.241
+cd /home/btcedge/BTC-tool
+sudo -u btcedge git pull origin claude/read-claude-docs-jBeBH
+sudo cp deploy/btc-edge.service /etc/systemd/system/btc-edge.service
+sudo systemctl daemon-reload
+sudo systemctl restart btc-edge
+sleep 3 && journalctl -u btc-edge -n 30 --no-pager
+```
+
+**Post-deploy verification checklist (always mention relevant ones):**
+1. `journalctl -u btc-edge -n 30 --no-pager` — check for startup errors
+2. `tail -f /home/btcedge/BTC-tool/btc_edge.log` — watch live output for a minute
+3. Send `/status` in Telegram — confirm bot responds and shows data
+4. If model weights changed: send `/weights` to verify new weights are active
+5. If new commands added: test the new command in Telegram
+
+**What to include in your deployment message to the user:**
+1. A one-line summary of what changed and why
+2. Whether `.env` needs updating (and exact lines to add/change if so)
+3. The ready-to-paste SSH commands (pick the right template above)
+4. Which verification steps to run
+5. Any caveats (e.g., "existing trades will settle with the old model, new trades use updated weights")
+
 ## Trade Analysis Results (2,736 trades, 2026-02-16 to 2026-02-26)
 
 Analysis script: `python analyze_trades.py` (run on VPS).
