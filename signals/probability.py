@@ -11,12 +11,14 @@ class ProbabilityModel:
     """Combine normalised feature signals into a single P(up) probability."""
 
     DEFAULT_WEIGHTS: dict[str, float] = {
-        "obi": 0.25,
+        "obi": 0.10,
         "taker": 0.25,
-        "momentum": 0.15,
-        "rsi": 0.15,
+        "momentum": 0.05,
+        "rsi": 0.10,
         "vwap": 0.10,
         "funding": 0.10,
+        "volume_zscore": 0.15,
+        "regime": 0.15,
     }
 
     def __init__(
@@ -84,6 +86,32 @@ class ProbabilityModel:
         """
         return max(-0.5, min(0.5, -funding_zscore / 4.0 * 0.5))
 
+    @staticmethod
+    def _normalize_volume_zscore(volume_zscore: float) -> float:
+        """Volume z-score — high volume amplifies directional conviction.
+
+        Positive z-score (above-average volume) empirically correlates with
+        trend continuation.  Scale 4 standard-deviations to [-0.5, 0.5].
+        """
+        return max(-0.5, min(0.5, volume_zscore / 4.0 * 0.5))
+
+    @staticmethod
+    def _normalize_regime(ema_cross: float, bb_position: float) -> float:
+        """Trend regime from EMA cross and Bollinger Band position.
+
+        Provides multi-window trend memory that per-window signals lack.
+        EMA cross (EMA9 vs EMA21 gap) captures trend direction; BB position
+        (where price sits within Bollinger Bands) captures range context.
+
+        Returns [-0.5, 0.5]: negative = bearish regime, positive = bullish.
+        """
+        # EMA cross: (fast-slow)/slow * 100 — clip at +-1.0% separation
+        ema_signal = max(-0.5, min(0.5, ema_cross / 1.0 * 0.5))
+        # BB position: [0, 1] with 0.5 = middle band — shift to [-0.5, 0.5]
+        bb_signal = max(-0.5, min(0.5, bb_position - 0.5))
+        # 60% EMA cross (trend direction) + 40% BB position (range placement)
+        return 0.6 * ema_signal + 0.4 * bb_signal
+
     # ------------------------------------------------------------------
     # Prediction
     # ------------------------------------------------------------------
@@ -99,6 +127,8 @@ class ProbabilityModel:
             "rsi": self._normalize_rsi(features.rsi),
             "vwap": self._normalize_vwap(features.vwap_deviation),
             "funding": self._normalize_funding(features.funding_rate),
+            "volume_zscore": self._normalize_volume_zscore(features.volume_zscore),
+            "regime": self._normalize_regime(features.ema_cross, features.bb_position),
         }
 
         weighted_sum = sum(self.weights[k] * signals[k] for k in signals)
@@ -127,6 +157,8 @@ class ProbabilityModel:
             "rsi": self._normalize_rsi(features.rsi),
             "vwap": self._normalize_vwap(features.vwap_deviation),
             "funding": self._normalize_funding(features.funding_rate),
+            "volume_zscore": self._normalize_volume_zscore(features.volume_zscore),
+            "regime": self._normalize_regime(features.ema_cross, features.bb_position),
         }
         logger.debug("signal_breakdown: %s", breakdown)
         return breakdown

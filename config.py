@@ -40,13 +40,17 @@ class Settings(BaseSettings):
     # Hour blacklist (UTC hours where model underperforms; skip trading)
     blacklist_hours: str = "2"  # comma-separated UTC hours, e.g. "2,11,19"
 
-    # Feature weights
-    w_obi: float = 0.25
+    # Feature weights (v2 — rebalanced from 2,736-trade analysis)
+    # Reduced OBI/momentum (near-zero predictive delta), added volume_zscore
+    # (validated strongest feature) and regime (multi-window trend memory).
+    w_obi: float = 0.10
     w_taker: float = 0.25
-    w_momentum: float = 0.15
-    w_rsi: float = 0.15
+    w_momentum: float = 0.05
+    w_rsi: float = 0.10
     w_vwap: float = 0.10
     w_funding: float = 0.10
+    w_volume_zscore: float = 0.15
+    w_regime: float = 0.15
 
     class Config:
         env_file = ".env"
