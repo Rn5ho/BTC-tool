@@ -103,8 +103,6 @@ class Orchestrator:
         self._TREND_CONFLICT_PCT: float = 0.15  # 0.15%
 
         # Quality filters — keep only high-quality trades.
-        # DOWN trades require a higher edge (data shows worse win rate).
-        self._MIN_EDGE_DOWN: float = settings.min_edge_down
         # Edges above this cap are likely model error, not real mispricing.
         self._MAX_EDGE: float = settings.max_edge_threshold
         # Skip when any single signal is near the +-0.5 saturation limits.
@@ -797,18 +795,7 @@ class Orchestrator:
             )
             return
 
-        # 6g. DOWN side higher threshold — require stronger edge for DOWN
-        #     trades.  Historical data shows DOWN has much lower win rate
-        #     than UP at the default threshold.
-        if signal["side"] == "DOWN" and signal["edge"] < self._MIN_EDGE_DOWN:
-            logger.info(
-                "Skipping DOWN edge — below DOWN threshold (%.1f%% < %.1f%%)",
-                signal["edge"] * 100,
-                self._MIN_EDGE_DOWN * 100,
-            )
-            return
-
-        # 6h. Signal saturation filter — when any single signal is near
+        # 6g. Signal saturation filter — when any single signal is near
         #     the +-0.5 limits, the model is likely overreacting to a
         #     single noisy input rather than seeing a real pattern.
         signals_data = signal.get("signals", {})
