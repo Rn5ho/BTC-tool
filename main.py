@@ -69,6 +69,8 @@ class Orchestrator:
                 "rsi": settings.w_rsi,
                 "vwap": settings.w_vwap,
                 "funding": settings.w_funding,
+                "volume_zscore": settings.w_volume_zscore,
+                "regime": settings.w_regime,
             },
             confidence_dampen=settings.confidence_dampen,
         )
@@ -101,8 +103,6 @@ class Orchestrator:
         self._TREND_CONFLICT_PCT: float = 0.15  # 0.15%
 
         # Quality filters — keep only high-quality trades.
-        # DOWN trades require a higher edge (data shows worse win rate).
-        self._MIN_EDGE_DOWN: float = settings.min_edge_down
         # Edges above this cap are likely model error, not real mispricing.
         self._MAX_EDGE: float = settings.max_edge_threshold
         # Skip when any single signal is near the +-0.5 saturation limits.
@@ -230,6 +230,7 @@ class Orchestrator:
         self.alerter.register_command("pause", self._cmd_pause)
         self.alerter.register_command("resume", self._cmd_resume)
         self.alerter.register_command("weights", self._cmd_weights)
+        self.alerter.register_command("regime", self._cmd_regime)
         self.alerter.register_command("analyze", self._cmd_analyze)
 
     async def _cmd_status(self, args: str = "") -> str:
@@ -427,6 +428,48 @@ class Orchestrator:
         total = sum(w.values())
         lines.append(f"\n  Total: {total:.2f}")
         return "\n".join(lines)
+
+    async def _cmd_regime(self, args: str = "") -> str:
+        """Handle /regime — show current market regime from EMA cross + BB position."""
+        candles = self.binance.get_candles(n=50)
+        if len(candles) < 21:
+            return "\u26a0 Need at least 21 candles for regime calculation."
+
+        from signals.indicators import TechnicalIndicators
+
+        ema_cross = TechnicalIndicators.ema_cross_signal(candles)
+        bb_pos = TechnicalIndicators.bb_position(candles)
+        regime = self.model._normalize_regime(ema_cross, bb_pos)
+
+        # Visual bar
+        bar_pos = int((regime + 0.5) * 20)  # 0-20 scale
+        bar_pos = max(0, min(20, bar_pos))
+        bar = "\u2591" * bar_pos + "\u2588" + "\u2591" * (20 - bar_pos)
+
+        if regime < -0.15:
+            label = "BEARISH"
+        elif regime > 0.15:
+            label = "BULLISH"
+        else:
+            label = "NEUTRAL"
+
+        btc = self.binance.get_latest_price()
+        closes = [c.close for c in candles]
+        ema9 = TechnicalIndicators.ema(closes, 9)
+        ema21 = TechnicalIndicators.ema(closes, 21)
+        lower, middle, upper = TechnicalIndicators.bollinger_bands(candles)
+
+        return (
+            f"\U0001f30d <b>MARKET REGIME</b>\n\n"
+            f"Regime: <b>{label}</b> ({regime:+.3f})\n"
+            f"[{bar}]\n"
+            f"  BEAR {'<' * 10} {'>' * 10} BULL\n\n"
+            f"<b>Components:</b>\n"
+            f"  EMA cross: {ema_cross:+.4f} (EMA9=${ema9:,.0f} vs EMA21=${ema21:,.0f})\n"
+            f"  BB position: {bb_pos:.3f} (0=lower, 1=upper)\n"
+            f"  BB range: ${lower:,.0f} - ${upper:,.0f}\n\n"
+            f"BTC: ${btc:,.2f}"
+        )
 
     async def _cmd_analyze(self, args: str = "") -> str:
         """Handle /analyze — run trade analysis on the DB."""
@@ -752,18 +795,7 @@ class Orchestrator:
             )
             return
 
-        # 6g. DOWN side higher threshold — require stronger edge for DOWN
-        #     trades.  Historical data shows DOWN has much lower win rate
-        #     than UP at the default threshold.
-        if signal["side"] == "DOWN" and signal["edge"] < self._MIN_EDGE_DOWN:
-            logger.info(
-                "Skipping DOWN edge — below DOWN threshold (%.1f%% < %.1f%%)",
-                signal["edge"] * 100,
-                self._MIN_EDGE_DOWN * 100,
-            )
-            return
-
-        # 6h. Signal saturation filter — when any single signal is near
+        # 6g. Signal saturation filter — when any single signal is near
         #     the +-0.5 limits, the model is likely overreacting to a
         #     single noisy input rather than seeing a real pattern.
         signals_data = signal.get("signals", {})
