@@ -76,7 +76,7 @@ tail -f /home/btcedge/BTC-tool/btc_edge.log
 
 # Deploy latest code
 cd /home/btcedge/BTC-tool
-sudo -u btcedge git pull origin claude/read-claude-docs-jBeBH
+sudo -u btcedge git pull origin claude/continue-5m-btc-tool-nx4a9
 sudo systemctl restart btc-edge
 
 # Reset paper trading data
@@ -110,7 +110,8 @@ Copy `.env.example` to `.env`. Key settings:
 - `USE_KELLY` — use half-Kelly sizing instead of fixed (default false)
 - `CONFIDENCE_DAMPEN` — shrink P(up) toward 50% to counter overconfidence (default 0.6; 1.0 = no dampening)
 - `BLACKLIST_HOURS` — comma-separated UTC hours to skip trading (default "2" — 02:00 UTC has 37% WR)
-- `W_OBI`, `W_TAKER`, `W_MOMENTUM`, `W_RSI`, `W_VWAP`, `W_FUNDING` — probability model weights (must sum to 1.0)
+- `MAX_SIGNAL_VALUE` — skip trades when any single signal exceeds this (default 0.45 = near ±0.5 saturation)
+- `W_OBI`, `W_TAKER`, `W_MOMENTUM`, `W_RSI`, `W_VWAP`, `W_FUNDING`, `W_VOLUME_ZSCORE`, `W_REGIME` — probability model weights (must sum to 1.0)
 
 ## Data Flow
 
@@ -125,31 +126,49 @@ Binance WS (spot+futures) → Rolling State (candles, orderbook, trades, funding
                               ↓
 Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
                               ↓ (if edge > threshold, positive only)
-                        Safety Filters (time gate + hour blacklist + trend conflict)
+                        Safety Filters (time gate + hour blacklist + trend conflict + saturation)
                               ↓
                         Paper Trader → simulate bet, log to SQLite
                               ↓
                         Telegram Alert → notify user
 ```
 
-## Probability Model (v1 — Rule-Based Weighted Ensemble)
+## Probability Model (v3 — Regime-Adaptive Weighted Ensemble)
 
 ```
-P_raw = 0.5 + w_obi*OBI + w_taker*taker + w_momentum*momentum + w_rsi*rsi + w_vwap*vwap + w_funding*funding
+signals = normalize(OBI, taker, momentum, RSI, VWAP, funding, volume_direction, regime)
+weights = regime_adaptive_reweight(base_weights, regime_strength)
+P_raw = 0.5 + sum(weights[i] * signals[i])
 P(up) = 0.5 + CONFIDENCE_DAMPEN * (P_raw - 0.5)
 ```
 
-Confidence dampening (default 0.6) shrinks predictions toward 50% to counter the model's systematic overconfidence (calibration analysis on 2,736 trades showed 10-20% overestimation at every probability bucket).
+### Regime-Adaptive Weighting
+
+Signals are categorized as **trend-following** (taker, momentum, regime, RSI) or **mean-reverting** (OBI, VWAP, funding). When the regime signal indicates a clear trend (|regime| > 0.15), the model dynamically adjusts weights:
+
+- **Trend-following signals**: boosted up to **1.5x** their base weight
+- **Mean-reverting signals**: reduced down to **0.4x** their base weight
+- **Neutral signals** (volume_direction): unchanged
+
+The scaling is linear with regime strength (0.15→0.5 maps to 0→1.0 adaptation factor). Weights are re-normalized to sum to 1.0 after adjustment.
+
+**Rationale**: In trending markets, mean-reverting signals produce contrarian traps — e.g., OBI shows dip-buying during a sell-off, VWAP says "oversold." These push the model toward UP when DOWN is correct. Instead of filtering out these bad trades (trade less), the adaptive weights fix the model's direction (trade smarter). Every wrong UP bet becomes a correct DOWN bet.
+
+### Signal Normalization
 
 Each signal is normalized to [-0.5, 0.5]:
 - **OBI** (order book imbalance): bid/ask volume ratio → [-0.5, 0.5]
 - **Taker ratio**: net taker buy/sell ratio → [-0.5, 0.5]
 - **Momentum**: 60% of 1m + 40% of 5m momentum, clipped at ±2% → [-0.5, 0.5]
-- **RSI(9)**: (rsi - 50) / 100 → [-0.5, 0.5]
+- **RSI(9)**: (rsi - 50) / 100 → [-0.5, 0.5] (trend-following: high RSI = bullish at 5-min scale)
 - **VWAP deviation**: price vs VWAP, clipped at ±1% → [-0.5, 0.5]
 - **Funding rate**: z-score inverted (high funding = bearish) → [-0.5, 0.5]
+- **Volume direction**: `vol_magnitude * taker_direction` — high volume amplifies taker pressure direction. Below-average volume → near-zero signal. Replaces old non-directional volume z-score which blindly pushed toward UP when volume was high.
+- **Regime**: 60% EMA cross (EMA9 vs EMA21) + 40% BB position — multi-window trend memory
 
-Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.25, taker=0.25, momentum=0.15, RSI=0.15, VWAP=0.10, funding=0.10.
+Confidence dampening (default 0.6) shrinks predictions toward 50% to counter the model's systematic overconfidence (calibration analysis on 2,736 trades showed 10-20% overestimation at every probability bucket).
+
+Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.05, taker=0.25, momentum=0.05, RSI=0.10, VWAP=0.10, funding=0.10, volume_direction=0.15, regime=0.20.
 
 ## Edge Detection & Safety Filters
 
@@ -162,7 +181,8 @@ The edge detector (`strategy/edge.py`) evaluates both sides and only considers *
 4. **Time gate** (`_MAX_ENTRY_SECONDS = 120`): Only enter trades in the first 2 minutes of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
 5. **Hour blacklist** (`BLACKLIST_HOURS`): Skip trading during configured UTC hours. Default: 02:00 UTC (37% win rate, -$114 P&L over 108 trades in analysis). Configurable via comma-separated env var.
 6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT = 0.15`): If BTC has already moved >0.15% in one direction within the current window and the model's signal is the opposite direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum.
-7. **One trade per window**: Only one pending trade per market slug (no duplicate bets on same 5-min window).
+7. **Signal saturation filter** (`MAX_SIGNAL_VALUE = 0.45`): If any single signal is near the ±0.5 limits, the trade is skipped. The model is likely overreacting to a single noisy input rather than seeing a real multi-signal pattern.
+8. **One trade per window**: Only one pending trade per market slug (no duplicate bets on same 5-min window).
 
 ## Paper Trading & Fee Model
 
@@ -213,7 +233,7 @@ The bot runs 24/7 on a Hetzner VPS at `46.225.27.241`:
 - **Logs**: `/home/btcedge/BTC-tool/btc_edge.log` (also via `journalctl -u btc-edge`)
 - **Hardening**: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths=/home/btcedge/BTC-tool`
 - **Setup**: `deploy/setup.sh` automates user creation, repo clone, venv setup, service install
-- **Branch**: Currently tracking `claude/read-claude-docs-jBeBH`
+- **Branch**: Currently tracking `claude/continue-5m-btc-tool-nx4a9`
 
 ## Trade Analysis Results (2,736 trades, 2026-02-16 to 2026-02-26)
 
@@ -250,6 +270,12 @@ Analysis script: `python analyze_trades.py` (run on VPS).
 
 8. **Console spam** (fixed): Edge signals logged every 3-second cycle. Fixed with duplicate trade detection and 30-second heartbeat interval.
 
+9. **Model fighting trends — wrong-direction bets** (fixed): In trending markets, mean-reverting signals (OBI dip-buying, VWAP "oversold") pushed the model toward UP during sell-offs. The model would bet UP and lose; the correct DOWN bet was missed. Fixed with regime-adaptive weighting: in strong trends, trend-following signals (taker, momentum, regime, RSI) are boosted up to 1.5x while mean-reverting signals (OBI, VWAP, funding) are reduced to 0.4x. Same trade volume, better directional accuracy.
+
+10. **Non-directional volume signal** (fixed): `volume_zscore` was 15% of the model weight but had no directional information — high volume blindly pushed toward UP regardless of whether buying or selling dominated. Replaced with `volume_direction = vol_magnitude * taker_direction`: high volume + sellers = bearish, high volume + buyers = bullish, low volume = near-zero.
+
+11. **DOWN side penalty removed** (fixed): `MIN_EDGE_DOWN = 0.08` required DOWN trades to have 8% edge (vs 5% for UP), blocking potentially profitable DOWN bets. Removed — with better directional accuracy from regime-adaptive weights, both sides are treated equally.
+
 ## Conventions
 
 - All async — use `async def` and `await` consistently
@@ -264,9 +290,9 @@ Analysis script: `python analyze_trades.py` (run on VPS).
 ## Potential Next Steps
 
 - **Live trading**: User wants to integrate real Polymarket trading via py-clob-client with ~$20 trial capital. Would require CLOB API integration with wallet signing.
-- **Weight rebalancing**: Data shows taker_ratio and volume_zscore are the strongest features; OBI and momentum have near-zero predictive delta. Consider increasing W_TAKER, adding volume_zscore as a weighted signal, and reducing W_OBI/W_MOMENTUM.
+- **Validate regime-adaptive weights**: Monitor win rate by side and regime strength after deploying the adaptive model. Compare UP/DOWN performance in trending vs ranging periods.
 - **Hour scheduling**: Consider expanding blacklist to other weak hours (11:00=42.5% WR, 19:00-21:00=44-46% WR) once more data confirms the pattern.
 - **Friday filter**: Only 1 Friday in sample (38.1% WR, -$98) — collect more data before adding a day-of-week filter.
 - **Model improvements**: ML-based probability model, more features (liquidation data, funding rate momentum, cross-exchange flows)
-- **Backtesting**: Replay historical data to validate signal weights and dampening factor
+- **Backtesting**: Replay historical data to validate signal weights, dampening factor, and regime-adaptive multipliers
 - **Bankroll persistence**: On restart, restore bankroll from DB (initial + cumulative PnL) rather than resetting to config value
