@@ -22,9 +22,9 @@ BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance B
 
 ```
 data/           → Data collection layer
-  models.py     → Shared dataclasses (Candle, OrderBook, AggTrade, FundingInfo, FeatureVector, PaperTrade, PolymarketMarket)
+  models.py     → Shared dataclasses (Candle, OrderBook, AggTrade, FundingInfo, FeatureVector, PaperTrade, PolymarketMarket, PolymarketOrderBook)
   binance_ws.py → Binance WebSocket client (kline_1m, depth20@100ms, aggTrade streams, futures funding)
-  polymarket.py → Polymarket Gamma/CLOB client (slug discovery, live prices, Chainlink RTDS stream)
+  polymarket.py → Polymarket Gamma/CLOB client (slug discovery, live prices + order books, Chainlink RTDS stream)
 
 signals/        → Signal generation
   indicators.py → Technical indicators (RSI-9/14, VWAP, BB-20, EMA 5/9/13/21, ATR-14, momentum, vol z-score)
@@ -33,14 +33,14 @@ signals/        → Signal generation
   ml_probability.py → ML model wrapper → P(up) in [0.05, 0.95] using trained RandomForestClassifier with 44 features (ACTIVE)
 
 strategy/       → Trading logic
-  edge.py       → Edge detection (compare P(up) vs Polymarket implied odds; supports always-trade mode)
+  edge.py       → Edge detection (compare P(up) vs Polymarket implied odds; uses ask price for entry; supports always-trade mode)
   paper_trader.py → Paper trading engine (fixed/Kelly/adaptive sizing, PnL with Polymarket fees, settlement)
 
 alerts/
   telegram.py   → Telegram bot (edge alerts, trade notifications, settlements, interactive commands)
 
 storage/
-  db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots, historical price lookup)
+  db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots with spread columns, historical price lookup)
 
 models/         → Trained ML model artifacts
   best_model.pkl  → Serialized RandomForestClassifier (RF_d3, trained 2026-02-28)
@@ -93,8 +93,11 @@ systemctl kill -s SIGKILL btc-edge; systemctl reset-failed btc-edge; systemctl s
 
 # Deploy files from local machine (from BTC-tool directory)
 scp config.py main.py root@46.225.27.241:/home/btcedge/BTC-tool/
+scp data/models.py data/polymarket.py root@46.225.27.241:/home/btcedge/BTC-tool/data/
 scp strategy/edge.py strategy/paper_trader.py root@46.225.27.241:/home/btcedge/BTC-tool/strategy/
 scp signals/ml_probability.py root@46.225.27.241:/home/btcedge/BTC-tool/signals/
+scp alerts/telegram.py root@46.225.27.241:/home/btcedge/BTC-tool/alerts/
+scp storage/db.py root@46.225.27.241:/home/btcedge/BTC-tool/storage/
 scp models/best_model.pkl models/scaler.pkl root@46.225.27.241:/home/btcedge/BTC-tool/models/
 scp .env root@46.225.27.241:/home/btcedge/BTC-tool/
 
@@ -122,6 +125,7 @@ The bot (`@BTC5mBot`) supports interactive commands:
 | `/weights` | Show model info (ML type + settings, or rule-based weights) |
 | `/regime` | Show market regime (EMA cross + BB position analysis) |
 | `/analyze` | Run trade analysis: breakdown by edge bucket, side, and hour |
+| `/spread` | Show live order book spreads (bid/ask/spread/sizes) for current market |
 
 ## Configuration
 
@@ -168,6 +172,7 @@ Binance WS (spot+futures) → Rolling State (candles, orderbook, trades, funding
                         Edge Detection          SQLite (log features)
                               ↓
 Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
+    (4 parallel: 2 midpoints + 2 order books per cycle)
                               ↓
               ┌─── Always-Trade: trade every window ───┐
               │         OR                              │
@@ -298,11 +303,14 @@ All strategies showed **0% bust rate** across 1000 simulated runs:
 
 Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's taker fee structure:
 
+- **Entry price**: Uses best ask (taker price) from order book, not midpoint. More realistic PnL that matches what real takers pay. Falls back to midpoint if book unavailable.
+- **Spread tracking**: Every trade records `entry_spread` (bid-ask spread) and `midpoint_price` for post-hoc analysis of spread impact.
 - **Fee formula**: `fee_factor = fee_rate * (price * (1 - price))^fee_exponent`
 - **Default**: fee_rate=0.25, exponent=2 → ~1.56% effective fee at midprice
 - **Shares**: `(size_usdc / price) * (1 - fee_factor)`
 - **PnL**: WIN = `shares - size_usdc`, LOSS = `-size_usdc`
 - **Bankroll persistence**: On restart, bankroll = initial + cumulative historical PnL from DB
+- **Analysis query**: `SELECT AVG(entry_price - midpoint_price), AVG(entry_spread) FROM paper_trades` to measure spread impact
 
 ## Window Lifecycle & Settlement
 
@@ -329,11 +337,11 @@ Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's taker f
 
 Clean ASCII output (Windows cp1252 safe):
 - **Buffering**: `Buffering: 0/5 candles | BTC: $63,999 | trades: 238 | orderbook: yes`
-- **ML trade signals**: `>>> ML UP btc-updown-5m-... | our=53.5% mkt=50.0% edge=+2.7% conf=3.5% fee=1.56%`
+- **ML trade signals**: `>>> ML UP btc-updown-5m-... | our=53.5% mkt=50.0% edge=+2.7% conf=3.5% fee=1.56% spread=0.0200 mid=0.500`
 - **Rule-based signals**: `>>> RB DOWN btc-updown-5m-... | our=57.0% mkt=48.5% edge=+8.5%`
 - **Settlement**: `--- WINDOW SETTLED: btc-updown-5m-... | BTC $63982 -> $64001 (+19.00 = UP) [Chainlink Stream]`
 - **P&L**: `--- P&L: $+3.04 | Win rate: 60% (3/5) | Bankroll: $23.04`
-- **Heartbeat** (30s): `-- Status [ML]: BTC $63,999 | P(up)=53.5% | Mkt=50/50 | Trades: 5 (60% win)`
+- **Heartbeat** (30s): `-- Status [ML]: BTC $63,999 | P(up)=53.5% | Mkt=50/50 | spread=0.0200 | Trades: 5 (60% win)`
 
 ## Deployment (Hetzner VPS)
 
@@ -383,7 +391,6 @@ Runs 24/7 on Hetzner VPS at `46.225.27.241`:
 
 - **Live trading**: User wants real Polymarket trading with ~$20 trial capital. Requires py-clob-client or direct CLOB API integration with wallet signing.
 - **Early exits**: User noted that trades can be exited early (sell token before window ends). Could capture profit on strong moves without waiting for settlement. Not implemented yet.
-- **Entry price optimization**: When BTC temporarily dips during a window, the UP token price drops — creating a better entry. Could monitor intra-window price changes to time entries.
 - **Model retraining**: Retrain periodically as market dynamics shift. Pipeline is ready (`ml_pipeline.py`), takes ~25 min.
 - **Feature expansion**: Liquidation data, funding rate momentum, cross-exchange flows, order book depth imbalance at multiple levels.
 - **Hour-based sizing**: Instead of blacklisting hours, adjust bet size — bigger bets during best hours (14:00=62.5%), smaller during worst (03:00=47.9%).
