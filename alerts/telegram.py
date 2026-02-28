@@ -126,7 +126,10 @@ class TelegramAlerter:
             f"\U0001f4ca <b>Signals:</b>\n"
         )
         for name, value in features_breakdown.items():
-            text += f"  {name}: {value:+.4f}\n"
+            if isinstance(value, (int, float)):
+                text += f"  {name}: {value:+.4f}\n"
+            else:
+                text += f"  {name}: {value}\n"
 
         await self._send(text)
 
