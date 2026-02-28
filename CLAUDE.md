@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), computes directional probability estimates for 5-minute price movements, compares them against Polymarket's implied odds, and paper trades when mispricing is detected. Telegram bot for alerts and interactive commands.
+BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), uses a trained ML model to predict 5-minute BTC direction, and paper trades on Polymarket's binary UP/DOWN markets every 5-minute window. Telegram bot for alerts and interactive commands.
 
-**Status:** Fully functional and deployed on Hetzner VPS (46.225.27.241) running 24/7 as a systemd service. Paper trading works end-to-end with Polymarket fee model. Interactive Telegram bot with commands for monitoring and management. No real-money trading yet — user has expressed interest in adding live trading via py-clob-client with small trial capital (~$20).
+**Status:** Deployed on Hetzner VPS (46.225.27.241) running 24/7 as a systemd service. ML model (RandomForestClassifier, 53.9% test accuracy on 34,100 samples) replaced the original rule-based model. Running in "always-trade" mode with $20 paper bankroll and hybrid adaptive bet sizing. User intends to move to real trading with ~$20 capital once the ML model proves itself on live data.
 
 ## Tech Stack
 
@@ -12,10 +12,11 @@ BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance B
 - Binance WebSocket (spot klines + depth + aggTrades, futures funding rate)
 - Polymarket Gamma/CLOB API (market discovery, live prices, no auth needed)
 - Polymarket RTDS WebSocket for Chainlink BTC/USD stream (settlement price — matches Polymarket's resolution source)
+- scikit-learn (ML model inference — RandomForestClassifier loaded from pickle)
 - SQLite via aiosqlite (persistence)
 - python-telegram-bot v21+ (interactive bot with commands)
 - pydantic-settings (config from .env)
-- numpy (indicators), no pandas at runtime
+- numpy (indicators + ML feature extraction), no pandas at runtime
 
 ## Architecture
 
@@ -26,13 +27,14 @@ data/           → Data collection layer
   polymarket.py → Polymarket Gamma/CLOB client (slug discovery, live prices, Chainlink RTDS stream)
 
 signals/        → Signal generation
-  indicators.py → Technical indicators (RSI-9, VWAP, BB-20, EMA 9/21, ATR-14, momentum, vol z-score)
-  features.py   → Feature engineering (OBI, taker ratio, funding z-score → FeatureVector)
-  probability.py→ Weighted ensemble model → P(up) in [0.05, 0.95]
+  indicators.py → Technical indicators (RSI-9/14, VWAP, BB-20, EMA 5/9/13/21, ATR-14, momentum, vol z-score)
+  features.py   → Feature engineering (OBI, taker ratio, funding z-score → FeatureVector with 12 fields)
+  probability.py→ Rule-based weighted ensemble model → P(up) in [0.05, 0.95] (LEGACY — still available as fallback)
+  ml_probability.py → ML model wrapper → P(up) in [0.05, 0.95] using trained RandomForestClassifier with 44 features (ACTIVE)
 
 strategy/       → Trading logic
-  edge.py       → Edge detection (compare P(up) vs Polymarket implied odds, positive-edge only)
-  paper_trader.py → Paper trading engine (Kelly/fixed sizing, PnL with Polymarket fees, settlement)
+  edge.py       → Edge detection (compare P(up) vs Polymarket implied odds; supports always-trade mode)
+  paper_trader.py → Paper trading engine (fixed/Kelly/adaptive sizing, PnL with Polymarket fees, settlement)
 
 alerts/
   telegram.py   → Telegram bot (edge alerts, trade notifications, settlements, interactive commands)
@@ -40,13 +42,19 @@ alerts/
 storage/
   db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots, historical price lookup)
 
+models/         → Trained ML model artifacts
+  best_model.pkl  → Serialized RandomForestClassifier (RF_d3, trained 2026-02-28)
+  scaler.pkl      → StandardScaler fitted on training data
+  dataset.npz     → Training dataset (34,100 samples x 44 features)
+
 deploy/         → Hetzner VPS deployment
   btc-edge.service → systemd service file (runs as btcedge user, auto-restart)
   setup.sh      → Automated server setup script (Ubuntu/Debian)
 
+ml_pipeline.py       → ML training pipeline (downloads Binance history, builds dataset, trains models)
+simulate_compounding.py → Monte Carlo simulation for bet sizing strategies
 config.py            → Pydantic Settings loaded from .env
 main.py              → Async orchestrator wiring all components, Telegram command handlers, console output
-analyze_trades.py    → Standalone trade analysis script (run on VPS: python analyze_trades.py)
 ```
 
 ## Key Commands
@@ -58,29 +66,43 @@ pip install -e .
 # Run the tool
 python main.py
 
+# Retrain ML model (downloads ~120 days of Binance klines, takes ~25 min)
+python ml_pipeline.py
+
+# Run Monte Carlo simulations for bet sizing strategies
+python simulate_compounding.py
+
 # Syntax check all files
-python -m py_compile main.py config.py data/models.py data/binance_ws.py data/polymarket.py signals/indicators.py signals/features.py signals/probability.py strategy/edge.py strategy/paper_trader.py alerts/telegram.py storage/db.py
+python -m py_compile main.py config.py data/models.py data/binance_ws.py data/polymarket.py signals/indicators.py signals/features.py signals/probability.py signals/ml_probability.py strategy/edge.py strategy/paper_trader.py alerts/telegram.py storage/db.py
 ```
 
 ### Hetzner VPS (46.225.27.241)
 
 ```bash
-# SSH into server
+# SSH into server (key at ~/.ssh/id_ed25519)
 ssh root@46.225.27.241
 
 # Check service status
 systemctl status btc-edge
 
-# View logs
+# View logs (live)
 tail -f /home/btcedge/BTC-tool/btc_edge.log
 
-# Deploy latest code
-cd /home/btcedge/BTC-tool
-sudo -u btcedge git pull origin claude/read-claude-docs-jBeBH
-sudo systemctl restart btc-edge
+# Force restart (service has 90s stop timeout — use kill for fast restart)
+systemctl kill -s SIGKILL btc-edge; systemctl reset-failed btc-edge; systemctl start btc-edge
+
+# Deploy files from local machine (from BTC-tool directory)
+scp config.py main.py root@46.225.27.241:/home/btcedge/BTC-tool/
+scp strategy/edge.py strategy/paper_trader.py root@46.225.27.241:/home/btcedge/BTC-tool/strategy/
+scp signals/ml_probability.py root@46.225.27.241:/home/btcedge/BTC-tool/signals/
+scp models/best_model.pkl models/scaler.pkl root@46.225.27.241:/home/btcedge/BTC-tool/models/
+scp .env root@46.225.27.241:/home/btcedge/BTC-tool/
+
+# Download DB for analysis
+scp root@46.225.27.241:/home/btcedge/BTC-tool/btc_edge.db .
 
 # Reset paper trading data
-sudo -u btcedge sqlite3 /home/btcedge/BTC-tool/btc_edge.db "DELETE FROM paper_trades;"
+ssh root@46.225.27.241 "cd /home/btcedge/BTC-tool && source venv/bin/activate && python -c \"import sqlite3; c=sqlite3.connect('btc_edge.db'); c.execute('DELETE FROM paper_trades'); c.commit(); print('Cleared', c.total_changes)\""
 ```
 
 ## Telegram Bot Commands
@@ -89,105 +111,214 @@ The bot (`@BTC5mBot`) supports interactive commands:
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Current BTC price (Binance + Chainlink), model P(up), market odds, window info |
+| `/status` | Current BTC price (Binance + Chainlink), model type (ML/RB), P(up), market odds, window info |
 | `/stats` | Trading performance: total trades, win rate, P&L, bankroll, ROI |
 | `/trades` | List pending (unsettled) paper trades |
-| `/reset` | Clear all paper trades from DB and reset bankroll to initial value |
+| `/reset` | Clear all paper trades from DB and reset bankroll (requires double-tap within 30s) |
 | `/budget` | Show current bankroll and bet size |
-| `/budget 200` | Set bankroll to $200 (also resets initial_bankroll for ROI calculation) |
-| `/help` | List available commands |
-
-Commands are dispatched via long-polling (`get_updates`) in a dedicated asyncio task. Handlers accept an optional args string for commands like `/budget 200`.
+| `/budget 200` | Set bankroll to $200 |
+| `/pause` | Stop placing new trades (data collection continues, pending trades still settle) |
+| `/resume` | Resume placing trades |
+| `/weights` | Show model info (ML type + settings, or rule-based weights) |
+| `/regime` | Show market regime (EMA cross + BB position analysis) |
+| `/analyze` | Run trade analysis: breakdown by edge bucket, side, and hour |
 
 ## Configuration
 
 Copy `.env.example` to `.env`. Key settings:
-- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — optional, alerts disabled if missing
-- `MIN_EDGE_THRESHOLD` — minimum positive edge to trigger paper trade (default 0.05 = 5%)
-- `MAX_EDGE_THRESHOLD` — maximum edge cap; edges above this are rejected as model overconfidence (default 0.18 = 18%)
-- `BET_SIZE_USDC` — fixed bet size per trade (default 5)
-- `VIRTUAL_BANKROLL` — starting paper bankroll (default 100)
-- `USE_KELLY` — use half-Kelly sizing instead of fixed (default false)
-- `CONFIDENCE_DAMPEN` — shrink P(up) toward 50% to counter overconfidence (default 0.6; 1.0 = no dampening)
-- `BLACKLIST_HOURS` — comma-separated UTC hours to skip trading (default "2" — 02:00 UTC has 37% WR)
-- `W_OBI`, `W_TAKER`, `W_MOMENTUM`, `W_RSI`, `W_VWAP`, `W_FUNDING` — probability model weights (must sum to 1.0)
+
+```env
+# Telegram
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+
+# Strategy
+MIN_EDGE_THRESHOLD=0.05        # min positive edge for classic mode (ignored in always-trade)
+MAX_EDGE_THRESHOLD=0.18        # cap — edges above this are rejected as model error
+BET_SIZE_USDC=5                # fixed bet size (used when SIZING_STRATEGY=fixed)
+VIRTUAL_BANKROLL=20            # starting paper bankroll
+USE_KELLY=false                # half-Kelly sizing (legacy, use SIZING_STRATEGY instead)
+
+# ML Model
+USE_ML_MODEL=true              # true=ML model, false=rule-based ensemble
+ALWAYS_TRADE=true              # true=trade every window, false=only trade when edge > threshold
+SIZING_STRATEGY=adaptive       # fixed | kelly | adaptive
+
+# Polymarket fees
+POLYMARKET_FEE_RATE=0.25
+POLYMARKET_FEE_EXPONENT=2
+
+# Hour blacklist (UTC hours to skip trading)
+BLACKLIST_HOURS=2              # comma-separated, e.g. "2,3,4"
+```
 
 ## Data Flow
 
 ```
 Binance WS (spot+futures) → Rolling State (candles, orderbook, trades, funding)
                               ↓
-                        Feature Engineering → FeatureVector
+                        Feature Engineering → FeatureVector (12 fields)
                               ↓
-                        Probability Model → P(up)
+                   ┌─── ML Model (44 features from candles) ──┐
+                   │         OR                                │
+                   └─── Rule-Based Ensemble (12 features) ─────┘
+                              ↓
+                         P(up) prediction
                               ↓                          ↓
                         Edge Detection          SQLite (log features)
                               ↓
 Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
-                              ↓ (if edge > threshold, positive only)
-                        Safety Filters (time gate + hour blacklist + trend conflict)
+                              ↓
+              ┌─── Always-Trade: trade every window ───┐
+              │         OR                              │
+              └─── Classic: only if edge > threshold ──┘
+                              ↓
+                   Safety Filters (time gate + hour blacklist + trend conflict)
+                              ↓
+                   Adaptive Sizing (confidence × streak × drawdown × rolling WR)
                               ↓
                         Paper Trader → simulate bet, log to SQLite
                               ↓
                         Telegram Alert → notify user
 ```
 
-## Probability Model (v1 — Rule-Based Weighted Ensemble)
+## ML Probability Model (v2 — Trained RandomForestClassifier)
+
+**Active model** — controlled by `USE_ML_MODEL=true` in .env.
+
+### Training (ml_pipeline.py)
+- **Dataset**: 34,100 labeled 5-minute windows from 170,947 candles (119 days: Nov 2025 - Feb 2026)
+- **Source**: Binance historical klines (monthly ZIP archives from data.binance.vision + recent daily klines)
+- **Labels**: Binary (UP=49.9%, DOWN=50.1%) — balanced, no class weighting needed
+- **Split**: Time-series 80/20 (no future leakage)
+- **Cross-validation**: 5-fold time-series CV
+
+### 44 Features
+1. **Momentum** (5): 1m, 3m, 5m, 10m, 20m price returns
+2. **RSI** (2): RSI-9, RSI-14
+3. **Price vs averages** (6): VWAP deviation, BB position, BB width, EMA crosses (9/21, 5/13), price vs EMA9, price vs EMA21
+4. **Volatility** (4): ATR-14, ATR%, recent 5-bar volatility, volatility ratio (5-bar/20-bar)
+5. **Volume** (5): volume z-score, volume trend, taker ratio (1m, 3m, 5m)
+6. **Candle patterns** (5): upper/lower wick ratio, body ratio, close vs open, avg body ratio (5-bar)
+7. **Lag features** (6): previous direction (5m, 10m, 15m, 20m), streak length, mean reversion
+8. **Time** (8): cyclical hour (sin/cos), minute, session flags (Asia/Europe/US), cyclical day-of-week (sin/cos)
+9. **Microstructure** (2): high-low range %, close position in range
+
+### Results — ALL MODELS STATISTICALLY SIGNIFICANT (p < 0.001)
+
+| Model | CV (5-fold) | Test (6,820) | Simulated P&L ($5 flat) |
+|-------|------------|-------------|------------------------|
+| RF_d3 | 52.5% | **53.9%** | **+$2,066 ($87/day)** |
+| RF_d5 | **52.6%** | 53.6% | +$1,889 ($80/day) |
+| HistGBT | 52.3% | 53.5% | +$1,790 ($76/day) |
+| GBT_v3 | 52.6% | 52.9% | +$1,446 ($61/day) |
+| LogReg | 52.2% | 52.8% | +$1,357 ($57/day) |
+
+**Deployed model**: RF_d3 (best test accuracy 53.9%, lowest overfitting gap)
+
+### Top Features (by importance)
+rsi_14 (6.9%), vwap_deviation (6.8%), bb_position (6.4%), ema_cross_9_21 (5.4%), rsi_9 (5.4%), momentum_20m (4.0%), taker_ratio_3m (3.6%)
+
+### Best/Worst Hours (UTC)
+- **Best**: 14:00 (62.5%), 19:00 (57.2%), 09:00 (56.9%), 08:00 (56.6%)
+- **Worst**: 03:00 (47.9%), 04:00 (48.6%)
+
+### Confidence Thresholding
+- threshold=0.02: 43% of windows traded, **56.8% WR**, $73/day
+- threshold=0.05: 13% of windows traded, **57.4% WR**, $24/day
+
+### Live Integration (signals/ml_probability.py)
+- `MLProbabilityModel` class — drop-in replacement for `ProbabilityModel`
+- `predict(features)` — fallback using 12 FeatureVector fields (zero-pads missing 32 features)
+- `predict_from_candles(candles, window_start_ts)` — **preferred**: computes all 44 features from candle history
+- main.py uses `predict_from_candles()` when ML model is active
+- Falls back to rule-based model if model files not found or scikit-learn not installed
+
+## Rule-Based Probability Model (v1 — Legacy Fallback)
+
+Available when `USE_ML_MODEL=false`. Original model from before ML training.
 
 ```
 P_raw = 0.5 + w_obi*OBI + w_taker*taker + w_momentum*momentum + w_rsi*rsi + w_vwap*vwap + w_funding*funding
 P(up) = 0.5 + CONFIDENCE_DAMPEN * (P_raw - 0.5)
 ```
 
-Confidence dampening (default 0.6) shrinks predictions toward 50% to counter the model's systematic overconfidence (calibration analysis on 2,736 trades showed 10-20% overestimation at every probability bucket).
+Each signal normalized to [-0.5, 0.5]. Default weights: OBI=0.05, taker=0.25, momentum=0.05, RSI=0.10, VWAP=0.10, funding=0.10, volume_zscore=0.15, regime=0.20. Confidence dampening=0.6 (shrinks toward 50%). Performance: 49.7% WR over 2,736 trades — essentially a coin flip.
 
-Each signal is normalized to [-0.5, 0.5]:
-- **OBI** (order book imbalance): bid/ask volume ratio → [-0.5, 0.5]
-- **Taker ratio**: net taker buy/sell ratio → [-0.5, 0.5]
-- **Momentum**: 60% of 1m + 40% of 5m momentum, clipped at ±2% → [-0.5, 0.5]
-- **RSI(9)**: (rsi - 50) / 100 → [-0.5, 0.5]
-- **VWAP deviation**: price vs VWAP, clipped at ±1% → [-0.5, 0.5]
-- **Funding rate**: z-score inverted (high funding = bearish) → [-0.5, 0.5]
+## Edge Detection & Always-Trade Mode
 
-Final P(up) clamped to [0.05, 0.95]. Default weights: OBI=0.25, taker=0.25, momentum=0.15, RSI=0.15, VWAP=0.10, funding=0.10.
+The edge detector (`strategy/edge.py`) supports two modes:
 
-## Edge Detection & Safety Filters
+### Always-Trade Mode (`ALWAYS_TRADE=true` — ACTIVE)
+- ML model predicts P(up) every 5-minute window
+- Direction chosen by model: P(up) > 0.5 → UP, else → DOWN
+- Edge vs market is computed for sizing (higher confidence = bigger bet) but no minimum edge required
+- Every window gets a trade — the "always trade" paradigm
 
-The edge detector (`strategy/edge.py`) evaluates both sides and only considers **positive** edges:
+### Classic Mode (`ALWAYS_TRADE=false`)
+- Only trades when positive edge exceeds `MIN_EDGE_THRESHOLD` (default 5%)
+- Picks side with largest positive edge
+- Many windows are skipped (no trade)
 
-1. **Edge calculation**: For each side, `edge = our_P(side) - market_P(side)`. Only sides where we think the market underprices (positive edge) are candidates.
-2. **Side selection**: Pick the side with the larger positive edge. If neither side has positive edge, no trade.
-3. **Threshold**: Only trade if `edge > MIN_EDGE_THRESHOLD` (default 5%).
-3b. **Max edge cap** (`MAX_EDGE_THRESHOLD = 0.18`): Edges above 18% are rejected. Analysis of 2,736 trades showed 18-20% edge trades are net negative, and 20%+ trades win only 31%. Lowered from 0.20 to 0.18 based on data showing $501 P&L at 18% cap vs $445 at 20%.
-4. **Time gate** (`_MAX_ENTRY_SECONDS = 120`): Only enter trades in the first 2 minutes of a 5-minute window. After that, the market has already priced in the move and any remaining "edge" is likely stale.
-5. **Hour blacklist** (`BLACKLIST_HOURS`): Skip trading during configured UTC hours. Default: 02:00 UTC (37% win rate, -$114 P&L over 108 trades in analysis). Configurable via comma-separated env var.
-6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT = 0.15`): If BTC has already moved >0.15% in one direction within the current window and the model's signal is the opposite direction, the trade is skipped. Prevents contrarian bets against strong intra-window momentum.
-7. **One trade per window**: Only one pending trade per market slug (no duplicate bets on same 5-min window).
+### Safety Filters (both modes)
+1. **Max edge cap** (`MAX_EDGE_THRESHOLD=0.18`): Edges above 18% are rejected as model error
+2. **Time gate** (`_MAX_ENTRY_SECONDS=120`): Only enter in first 2 minutes of 5-min window
+3. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
+4. **Trend-conflict filter** (`_TREND_CONFLICT_PCT=0.15`): Skip if BTC moved >0.15% against our signal direction within current window
+5. **Signal saturation** (rule-based only): Skip when any signal near +-0.5 limits
+6. **One trade per window**: No duplicate bets on same market slug
+7. **Pause**: `/pause` command stops new trades while data collection continues
+
+## Bet Sizing Strategies
+
+Controlled by `SIZING_STRATEGY` in .env:
+
+### Fixed (`sizing_strategy=fixed`)
+Flat `BET_SIZE_USDC` every trade.
+
+### Kelly (`sizing_strategy=kelly`)
+Half-Kelly criterion: `f* = (p*b - q) / b`, capped at 5% of bankroll.
+
+### Hybrid Adaptive (`sizing_strategy=adaptive` — ACTIVE)
+Dynamic sizing based on multiple factors:
+- **Base**: 2% of bankroll
+- **Confidence multiplier** (0.5x-2.0x): Scales with `|P(up) - 0.5|`
+- **Streak multiplier**: 0.75x after 3 consecutive losses, 0.5x after 5
+- **Drawdown multiplier**: 0.75x if drawdown >15%, 0.5x if >25%
+- **Rolling WR multiplier**: 1.3x if last 20 trades >55% WR, 0.7x if <45%
+- **Final size**: Clamped to [0.5%, 8%] of bankroll
+
+### Monte Carlo Validation (1000 runs, $20 start)
+All strategies showed **0% bust rate** across 1000 simulated runs:
+- **Quarter Kelly**: median min $18.99, worst-case min $11.96
+- **Hybrid Adaptive**: median min $18.73, worst-case min $12.66
+- **Fixed 2%**: median min $17.66, worst-case min $5.04
 
 ## Paper Trading & Fee Model
 
-Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's actual fee structure:
+Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's taker fee structure:
 
-- **Polymarket fee**: 2% on net profit for winning trades (`PROFIT_FEE_RATE = 0.02`)
-- **No fee on losses**: Full stake is lost on losing trades
-- **PnL**: WIN = `size * (1 - entry_price) / entry_price - fee`, LOSS = `-size`
-- **Sizing**: Fixed ($5/trade default) or half-Kelly criterion, never exceeding bankroll
-- **Kelly formula**: `f* = (p*b - q) / b`, half-Kelly with 5% of bankroll cap
-- **Default config**: $100 bankroll, $5 bet size
+- **Fee formula**: `fee_factor = fee_rate * (price * (1 - price))^fee_exponent`
+- **Default**: fee_rate=0.25, exponent=2 → ~1.56% effective fee at midprice
+- **Shares**: `(size_usdc / price) * (1 - fee_factor)`
+- **PnL**: WIN = `shares - size_usdc`, LOSS = `-size_usdc`
+- **Bankroll persistence**: On restart, bankroll = initial + cumulative historical PnL from DB
 
 ## Window Lifecycle & Settlement
 
-1. **Window detection**: Slugs are deterministic (`btc-updown-5m-{unix_ts}` where `unix_ts = now - (now % 300)`). The analysis loop detects transitions every 3-second cycle.
+1. **Window detection**: Slugs are deterministic (`btc-updown-5m-{unix_ts}` where `unix_ts = now - (now % 300)`). Analysis loop detects transitions every 3-second cycle.
 2. **Settlement source**: Chainlink BTC/USD via Polymarket RTDS WebSocket (the actual resolution source). Binance spot as fallback.
-3. **Settlement is decoupled from market discovery**: Window transitions are detected via `get_current_slug()` BEFORE the Gamma API call. This ensures settlement fires even if the Gamma API is slow/fails.
-4. **Startup recovery**: On restart, after the 5-minute buffering phase, window tracking is initialized and any stale unsettled trades from previous sessions are settled using historical candle data from the DB (`get_btc_price_at()`). Trades with no matching candle data are voided (0 PnL).
+3. **Settlement decoupled from market discovery**: Window transitions detected via `get_current_slug()` BEFORE the Gamma API call.
+4. **Startup recovery**: After 5-minute buffering, stale unsettled trades from previous sessions are settled using historical candle data.
 
 ## Startup Sequence
 
-1. Initialize DB (create tables if needed)
-2. Create PaperTrader, TelegramAlerter
-3. Start Polymarket aiohttp session
-4. Launch 5 concurrent asyncio tasks:
+1. Load config, check for ML model availability
+2. Initialize ML model (or fall back to rule-based)
+3. Initialize EdgeDetector with always_trade setting
+4. Initialize DB, PaperTrader (with sizing_strategy), TelegramAlerter
+5. Start Polymarket aiohttp session
+6. Launch 5 concurrent asyncio tasks:
    - **Binance WS**: Streams kline_1m, depth20, aggTrade, futures funding
    - **Chainlink RTDS**: Streams BTC/USD from Polymarket's data service
    - **Analysis loop**: Buffers 5 candles (~5 min), initializes window tracking, settles stale trades, then runs 3-second poll cycle
@@ -196,59 +327,46 @@ Paper trading engine (`strategy/paper_trader.py`) simulates Polymarket's actual 
 
 ## Console Output Format
 
-The tool prints clean ASCII to the console (no emojis — Windows cp1252 safe):
-- **Buffering phase**: `Buffering: 0/5 candles | BTC: $68,562 | trades: 158 | orderbook: yes`
-- **Edge signals**: `>>> EDGE: DOWN btc-updown-5m-... | our=57.0% mkt=48.5% edge=+8.5%`
-- **Settlement**: `--- WINDOW SETTLED: btc-updown-5m-... | BTC $68544 -> $68562 (+18.00 = UP) [Chainlink Stream]`
-- **P&L summary**: `--- P&L: $+3.04 | Win rate: 60% (3/5) | Bankroll: $103.04`
-- **Status heartbeat** (every 30s): `-- Status: BTC $68,679 | P(up)=55.1% | Mkt=50/50 | Trades: 5 (60% win)`
+Clean ASCII output (Windows cp1252 safe):
+- **Buffering**: `Buffering: 0/5 candles | BTC: $63,999 | trades: 238 | orderbook: yes`
+- **ML trade signals**: `>>> ML UP btc-updown-5m-... | our=53.5% mkt=50.0% edge=+2.7% conf=3.5% fee=1.56%`
+- **Rule-based signals**: `>>> RB DOWN btc-updown-5m-... | our=57.0% mkt=48.5% edge=+8.5%`
+- **Settlement**: `--- WINDOW SETTLED: btc-updown-5m-... | BTC $63982 -> $64001 (+19.00 = UP) [Chainlink Stream]`
+- **P&L**: `--- P&L: $+3.04 | Win rate: 60% (3/5) | Bankroll: $23.04`
+- **Heartbeat** (30s): `-- Status [ML]: BTC $63,999 | P(up)=53.5% | Mkt=50/50 | Trades: 5 (60% win)`
 
 ## Deployment (Hetzner VPS)
 
-The bot runs 24/7 on a Hetzner VPS at `46.225.27.241`:
+Runs 24/7 on Hetzner VPS at `46.225.27.241`:
 
 - **User**: `btcedge` (dedicated, non-root)
 - **Directory**: `/home/btcedge/BTC-tool`
 - **Service**: `btc-edge.service` via systemd (`Restart=always`, `RestartSec=10`)
 - **Logs**: `/home/btcedge/BTC-tool/btc_edge.log` (also via `journalctl -u btc-edge`)
+- **SSH key**: `~/.ssh/id_ed25519` (ed25519, comment "btc-tool-deploy")
+- **Branch**: `claude/add-polymarket-btc-markets-kZRWJ`
+- **Python venv**: `/home/btcedge/BTC-tool/venv` (includes scikit-learn, numpy, aiohttp, etc.)
 - **Hardening**: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths=/home/btcedge/BTC-tool`
-- **Setup**: `deploy/setup.sh` automates user creation, repo clone, venv setup, service install
-- **Branch**: Currently tracking `claude/read-claude-docs-jBeBH`
-
-## Trade Analysis Results (2,736 trades, 2026-02-16 to 2026-02-26)
-
-Analysis script: `python analyze_trades.py` (run on VPS).
-
-**Overall**: 2,736 trades over 10.5 days, 49.7% win rate, +$416 P&L ($40/day), 3% ROI on stakes. Model is profitable due to asymmetric payouts (avg entry 0.479 = better-than-even payout on wins).
-
-**Key findings that drove code changes:**
-- **Model overconfidence**: Every calibration bucket showed OVER by 7-20%. Model predicts 60-65% but actual WR is 49.8%. Fixed with `CONFIDENCE_DAMPEN=0.6`.
-- **MAX_EDGE 18% > 20%**: P&L at 18% cap = $501 vs $445 at 20% cap. Trades in 18-20% range are net losers.
-- **02:00 UTC terrible**: 37% WR, -$114 over 108 trades — by far the worst hour. Added to `BLACKLIST_HOURS`.
-- **Best hours**: 05:00 (61% WR, +$144), 07:00-08:00 (55-56% WR, +$103 each).
-- **Best edge buckets**: 5-6% (52% WR, +$0.44/trade), 8-12% (51% WR, +$245 combined).
-- **Features**: taker_ratio and volume_zscore are the strongest win/loss differentiators. OBI and momentum show near-zero predictive delta.
-- **Streaks**: Max 10 win and 10 loss. Avg streak length 2.0 for both. No serial correlation (after-win WR = after-loss WR).
-- **Max drawdown**: $200 (43% of peak equity) over 657 trades (Feb 18-21).
-- **Friday**: 38.1% WR (-$98) but only 1 Friday in sample — needs more data.
 
 ## Known Issues & Fixes Applied
 
-1. **Edge detector betting wrong side** (CRITICAL — fixed): The edge detector picked the side with the largest *absolute* edge rather than the largest *positive* edge. If `up_edge = -17%` and `down_edge = +17%`, it chose UP because `abs(-17%) >= abs(+17%)`. This caused the bot to systematically bet the opposite direction of what the model predicted. Fixed in `strategy/edge.py` to only consider sides with positive edge (where our probability exceeds the market's).
+1. **Edge detector betting wrong side** (CRITICAL — fixed): Picked largest *absolute* edge instead of largest *positive* edge, causing systematic wrong-direction bets.
 
-2. **Trades never settling after restart** (fixed): On service restart, `_current_slug` starts as `None`. The first window transition check (`self._current_slug and ...`) evaluated to `False`, silently skipping settlement of all pre-restart trades. Fixed by: (a) initializing window tracking after the buffering phase, (b) adding `_settle_stale_trades()` that pulls unsettled trades from the DB and settles them using historical candle data on startup.
+2. **Trades never settling after restart** (fixed): `_current_slug` started as `None`, skipping settlement. Fixed with startup recovery + `_settle_stale_trades()`.
 
-3. **Settlement gated behind market discovery** (fixed): Settlement only happened inside `_run_one_cycle` after `discover_market()` succeeded. If the Gamma API was slow/failed for a new window, trades would never settle. Fixed by computing the slug via `get_current_slug()` and checking for window transitions BEFORE the Gamma API call.
+3. **Settlement gated behind market discovery** (fixed): Decoupled settlement from Gamma API by checking slug transitions first.
 
-4. **Late-window entries** (fixed): Trades could enter at any point during a 5-min window (e.g., 3 minutes in). By then the market has priced in the move and the "edge" is stale. Fixed with `_MAX_ENTRY_SECONDS = 120` time gate.
+4. **Late-window entries** (fixed): Time gate `_MAX_ENTRY_SECONDS=120` prevents stale-edge entries.
 
-5. **Contrarian bets against strong trends** (fixed): Mean-reverting signals (OBI from dip-buyers, VWAP "oversold") produced UP signals during BTC crashes while the market correctly priced DOWN high. Fixed with `_TREND_CONFLICT_PCT = 0.15` trend-conflict filter.
+5. **Contrarian bets against strong trends** (fixed): Trend-conflict filter `_TREND_CONFLICT_PCT=0.15`.
 
-6. **Chainlink stale settlement prices** (fixed): The on-chain Chainlink aggregator has a ~1h heartbeat, returning identical prices for window start and end. This always resolved as UP, inflating win rates to ~82%. Fixed by streaming via Polymarket RTDS WebSocket — the actual resolution source.
+6. **Chainlink stale settlement prices** (fixed): Switched from on-chain aggregator (1h heartbeat) to Polymarket RTDS WebSocket stream.
 
-7. **Windows cp1252 encoding** (fixed): Telegram emojis logged at INFO level caused `UnicodeEncodeError`. Fixed by logging at DEBUG level with ASCII-only stripping.
+7. **Windows cp1252 encoding** (fixed): Telegram emojis at DEBUG level only, ASCII-safe console.
 
-8. **Console spam** (fixed): Edge signals logged every 3-second cycle. Fixed with duplicate trade detection and 30-second heartbeat interval.
+8. **Binance historical data microsecond timestamps** (fixed in ml_pipeline.py): Binance CSV files use 16-digit microsecond timestamps. Fixed with `if ts > 1_000_000_000_000_000: ts = ts // 1000`.
+
+9. **systemctl restart hangs** (known): The service has a 90s SIGTERM timeout. Use `systemctl kill -s SIGKILL btc-edge` for fast restarts.
 
 ## Conventions
 
@@ -256,17 +374,17 @@ Analysis script: `python analyze_trades.py` (run on VPS).
 - Logging via `logging.getLogger(__name__)` in every module
 - Dataclasses for data transfer between components (not dicts)
 - Config via pydantic-settings, never hardcoded values
-- Graceful degradation — Telegram disabled silently if unconfigured
-- Console output must be ASCII-safe (no emojis in logger.info — emojis only in Telegram HTML messages)
+- Graceful degradation — ML model falls back to rule-based if unavailable; Telegram disabled silently if unconfigured
+- Console output must be ASCII-safe (no emojis in logger.info)
 - Windows compatibility — no signal handlers (add_signal_handler wrapped in try/except NotImplementedError)
 - Paper trades stored as dicts in `_pending_trades` (keyed by market slug), persisted to SQLite
 
 ## Potential Next Steps
 
-- **Live trading**: User wants to integrate real Polymarket trading via py-clob-client with ~$20 trial capital. Would require CLOB API integration with wallet signing.
-- **Weight rebalancing**: Data shows taker_ratio and volume_zscore are the strongest features; OBI and momentum have near-zero predictive delta. Consider increasing W_TAKER, adding volume_zscore as a weighted signal, and reducing W_OBI/W_MOMENTUM.
-- **Hour scheduling**: Consider expanding blacklist to other weak hours (11:00=42.5% WR, 19:00-21:00=44-46% WR) once more data confirms the pattern.
-- **Friday filter**: Only 1 Friday in sample (38.1% WR, -$98) — collect more data before adding a day-of-week filter.
-- **Model improvements**: ML-based probability model, more features (liquidation data, funding rate momentum, cross-exchange flows)
-- **Backtesting**: Replay historical data to validate signal weights and dampening factor
-- **Bankroll persistence**: On restart, restore bankroll from DB (initial + cumulative PnL) rather than resetting to config value
+- **Live trading**: User wants real Polymarket trading with ~$20 trial capital. Requires py-clob-client or direct CLOB API integration with wallet signing.
+- **Early exits**: User noted that trades can be exited early (sell token before window ends). Could capture profit on strong moves without waiting for settlement. Not implemented yet.
+- **Entry price optimization**: When BTC temporarily dips during a window, the UP token price drops — creating a better entry. Could monitor intra-window price changes to time entries.
+- **Model retraining**: Retrain periodically as market dynamics shift. Pipeline is ready (`ml_pipeline.py`), takes ~25 min.
+- **Feature expansion**: Liquidation data, funding rate momentum, cross-exchange flows, order book depth imbalance at multiple levels.
+- **Hour-based sizing**: Instead of blacklisting hours, adjust bet size — bigger bets during best hours (14:00=62.5%), smaller during worst (03:00=47.9%).
+- **Polymarket API docs**: docs.polymarket.com has detailed API reference for fee formulas and CLOB integration.

@@ -34,6 +34,7 @@ class PaperTrader:
         use_kelly: bool = False,
         fee_rate: float = 0.0,
         fee_exponent: int = 2,
+        sizing_strategy: str = "fixed",
     ) -> None:
         self.db = db
         self.bankroll = bankroll
@@ -42,8 +43,14 @@ class PaperTrader:
         self.use_kelly = use_kelly
         self.fee_rate = fee_rate
         self.fee_exponent = fee_exponent
+        self.sizing_strategy = sizing_strategy
         self._pending_trades: dict[str, dict] = {}
         self._total_fees: float = 0.0  # cumulative fees paid
+
+        # Adaptive sizing state
+        self._recent_outcomes: list[bool] = []  # rolling window of win/loss
+        self._consecutive_losses: int = 0
+        self._max_bankroll: float = bankroll  # for drawdown tracking
 
     async def restore_bankroll(self) -> None:
         """Restore bankroll from historical trades in the database.
@@ -96,10 +103,72 @@ class PaperTrader:
 
         return actual_fraction * self.bankroll
 
-    def compute_bet_size(self, our_prob: float, market_prob: float) -> float:
+    def adaptive_size(self, confidence: float) -> float:
+        """Hybrid adaptive sizing: adjusts bet based on multiple factors.
+
+        Base: 2% of bankroll
+        Multipliers:
+        - Confidence (|P-0.5|): 0.5x at low confidence, up to 2.0x at high
+        - Streak: halve after 5+ consecutive losses
+        - Drawdown: halve if drawdown > 25%
+        - Rolling WR: 1.3x if last 20 trades >55% WR, 0.7x if <45%
+
+        Final size clamped to [0.5%, 8%] of bankroll.
+        """
+        base_pct = 0.02  # 2% of bankroll
+
+        # Confidence multiplier: scale 0.5x-2.0x based on |P(up) - 0.5|
+        # confidence ranges 0.0 (pure coin flip) to 0.45 (max model output)
+        conf_mult = 0.5 + (confidence / 0.45) * 1.5
+        conf_mult = max(0.5, min(conf_mult, 2.0))
+
+        # Streak multiplier: reduce after consecutive losses
+        streak_mult = 1.0
+        if self._consecutive_losses >= 5:
+            streak_mult = 0.5
+        elif self._consecutive_losses >= 3:
+            streak_mult = 0.75
+
+        # Drawdown multiplier
+        dd_mult = 1.0
+        if self._max_bankroll > 0:
+            drawdown = (self._max_bankroll - self.bankroll) / self._max_bankroll
+            if drawdown > 0.25:
+                dd_mult = 0.5
+            elif drawdown > 0.15:
+                dd_mult = 0.75
+
+        # Rolling WR multiplier (last 20 trades)
+        wr_mult = 1.0
+        if len(self._recent_outcomes) >= 10:
+            recent_wr = sum(self._recent_outcomes[-20:]) / len(self._recent_outcomes[-20:])
+            if recent_wr > 0.55:
+                wr_mult = 1.3
+            elif recent_wr < 0.45:
+                wr_mult = 0.7
+
+        final_pct = base_pct * conf_mult * streak_mult * dd_mult * wr_mult
+        final_pct = max(0.005, min(final_pct, 0.08))  # clamp 0.5%-8%
+
+        size = final_pct * self.bankroll
+
+        logger.debug(
+            "Adaptive size: base=2%% x conf=%.2f x streak=%.2f x dd=%.2f x wr=%.2f "
+            "= %.1f%% -> $%.2f",
+            conf_mult, streak_mult, dd_mult, wr_mult,
+            final_pct * 100, size,
+        )
+
+        return size
+
+    def compute_bet_size(
+        self, our_prob: float, market_prob: float, confidence: float = 0.0
+    ) -> float:
         """Return the bet size in USDC, never exceeding the current bankroll."""
-        if self.use_kelly:
+        if self.sizing_strategy == "kelly" or self.use_kelly:
             size = self.kelly_size(our_prob, market_prob)
+        elif self.sizing_strategy == "adaptive":
+            size = self.adaptive_size(confidence)
         else:
             size = self.bet_size
 
@@ -125,7 +194,11 @@ class PaperTrader:
             )
             return None
 
-        bet_size = self.compute_bet_size(signal["our_prob"], signal["market_prob"])
+        bet_size = self.compute_bet_size(
+            signal["our_prob"],
+            signal["market_prob"],
+            confidence=signal.get("confidence", abs(signal["our_prob"] - 0.5)),
+        )
 
         if bet_size <= 0:
             logger.info(
@@ -217,6 +290,17 @@ class PaperTrader:
 
         # Update bankroll
         self.bankroll += pnl
+
+        # Track adaptive sizing state
+        self._recent_outcomes.append(won)
+        if len(self._recent_outcomes) > 50:
+            self._recent_outcomes = self._recent_outcomes[-50:]
+        if won:
+            self._consecutive_losses = 0
+        else:
+            self._consecutive_losses += 1
+        if self.bankroll > self._max_bankroll:
+            self._max_bankroll = self.bankroll
 
         # Persist settlement
         settled_at = int(time.time() * 1000)

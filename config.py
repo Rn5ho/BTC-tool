@@ -14,6 +14,20 @@ class Settings(BaseSettings):
     virtual_bankroll: float = 100.0
     use_kelly: bool = False
 
+    # ML model — use trained ML model instead of rule-based probability model
+    use_ml_model: bool = True
+
+    # Always-trade mode — enter a position every 5-min window
+    # Instead of waiting for edge > min_edge, always trade the ML model's
+    # predicted direction.  Edge is still computed for bet sizing.
+    always_trade: bool = True
+
+    # Sizing strategy: "fixed", "kelly", "adaptive"
+    # - fixed: flat bet_size_usdc every trade
+    # - kelly: half-Kelly based on edge
+    # - adaptive: hybrid adaptive (confidence + streak + drawdown + rolling WR)
+    sizing_strategy: str = "adaptive"
+
     # Polymarket Builder Mode (for live trading — leave blank for paper-only)
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""

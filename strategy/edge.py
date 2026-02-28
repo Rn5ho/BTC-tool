@@ -30,18 +30,22 @@ class EdgeDetector:
         max_edge: float = 0.20,
         fee_rate: float = 0.0,
         fee_exponent: int = 2,
+        always_trade: bool = False,
     ) -> None:
         self.model = model
         self.min_edge = min_edge
         self.max_edge = max_edge
         self.fee_rate = fee_rate
         self.fee_exponent = fee_exponent
+        self.always_trade = always_trade
         logger.info(
-            "EdgeDetector initialised with min_edge=%.2f, max_edge=%.2f, fee_rate=%.3f, fee_exponent=%d",
+            "EdgeDetector initialised with min_edge=%.2f, max_edge=%.2f, fee_rate=%.3f, "
+            "fee_exponent=%d, always_trade=%s",
             self.min_edge,
             self.max_edge,
             self.fee_rate,
             self.fee_exponent,
+            self.always_trade,
         )
 
     def _fee_adjusted_prob(self, market_price: float) -> float:
@@ -61,14 +65,27 @@ class EdgeDetector:
         return market_price / (1.0 - ff)
 
     def evaluate(
-        self, features: FeatureVector, market: PolymarketMarket
+        self,
+        features: FeatureVector,
+        market: PolymarketMarket,
+        p_up_override: float | None = None,
     ) -> Optional[dict]:
         """Compare our probability estimate against Polymarket prices.
 
-        Returns an edge-report dict when the best positive edge exceeds
-        *min_edge* **after taker fees**, otherwise ``None``.
+        When *always_trade* is False (classic mode), returns an edge-report
+        dict only when the best positive edge exceeds *min_edge*.
+
+        When *always_trade* is True, always returns a signal — the ML model's
+        predicted direction — regardless of edge size. Edge is still computed
+        for bet sizing and logging.
+
+        Parameters
+        ----------
+        p_up_override : float, optional
+            If provided, use this P(up) instead of calling self.model.predict().
+            Allows main.py to pass the ML model's candle-based prediction.
         """
-        p_up = self.model.predict(features)
+        p_up = p_up_override if p_up_override is not None else self.model.predict(features)
 
         # Raw market prices
         raw_up = market.up_price
@@ -93,47 +110,73 @@ class EdgeDetector:
             down_edge,
         )
 
-        # Only consider sides where we have a POSITIVE edge
-        # (our probability exceeds the market's implied probability).
-        candidates = []
-        if up_edge > 0:
-            candidates.append(("UP", up_edge))
-        if down_edge > 0:
-            candidates.append(("DOWN", down_edge))
+        if self.always_trade:
+            # Always-trade mode: pick direction based on ML model, not edge.
+            # We always enter a position — the question is which side.
+            best_side = "UP" if p_up > 0.5 else "DOWN"
+            best_edge = up_edge if best_side == "UP" else down_edge
+            # Edge can be negative in always-trade mode (market disagrees
+            # with our model). We still trade, using abs(edge) for sizing.
+            confidence = abs(p_up - 0.5)
 
-        if not candidates:
-            logger.debug(
-                "No positive edge on either side (up=%.4f, down=%.4f)",
-                up_edge,
-                down_edge,
-            )
-            return None
+            # Still skip absurdly large edges (model error).
+            if best_edge > self.max_edge:
+                logger.info(
+                    "Skipping — edge too large (%.1f%% > %.1f%% cap) on %s %s",
+                    best_edge * 100,
+                    self.max_edge * 100,
+                    best_side,
+                    market.slug,
+                )
+                return None
+        else:
+            # Classic mode: only trade when we have a positive edge above threshold.
+            candidates = []
+            if up_edge > 0:
+                candidates.append(("UP", up_edge))
+            if down_edge > 0:
+                candidates.append(("DOWN", down_edge))
 
-        # Pick the side with the larger positive edge
-        best_side, best_edge = max(candidates, key=lambda x: x[1])
+            if not candidates:
+                logger.debug(
+                    "No positive edge on either side (up=%.4f, down=%.4f)",
+                    up_edge,
+                    down_edge,
+                )
+                return None
 
-        if best_edge < self.min_edge:
-            logger.debug(
-                "No actionable edge (best=%.4f, threshold=%.4f)",
-                best_edge,
-                self.min_edge,
-            )
-            return None
+            best_side, best_edge = max(candidates, key=lambda x: x[1])
 
-        if best_edge > self.max_edge:
-            logger.info(
-                "Skipping edge — too large (%.1f%% > %.1f%% cap) on %s %s — model likely overconfident",
-                best_edge * 100,
-                self.max_edge * 100,
-                best_side,
-                market.slug,
-            )
-            return None
+            if best_edge < self.min_edge:
+                logger.debug(
+                    "No actionable edge (best=%.4f, threshold=%.4f)",
+                    best_edge,
+                    self.min_edge,
+                )
+                return None
+
+            if best_edge > self.max_edge:
+                logger.info(
+                    "Skipping edge — too large (%.1f%% > %.1f%% cap) on %s %s",
+                    best_edge * 100,
+                    self.max_edge * 100,
+                    best_side,
+                    market.slug,
+                )
+                return None
+
+            confidence = abs(p_up - 0.5)
 
         entry_price = raw_up if best_side == "UP" else raw_down
         fee_factor = compute_fee_factor(
             entry_price, self.fee_rate, self.fee_exponent
         )
+
+        # Build signal breakdown — works with both model types
+        try:
+            signals = self.model.get_signal_breakdown(features)
+        except Exception:
+            signals = {"p_up": p_up, "confidence": confidence}
 
         result = {
             "side": best_side,
@@ -142,17 +185,19 @@ class EdgeDetector:
             "edge": best_edge,
             "entry_price": entry_price,
             "fee_factor": fee_factor,
-            "signals": self.model.get_signal_breakdown(features),
+            "confidence": confidence,
+            "signals": signals,
             "market_slug": market.slug,
         }
 
         logger.debug(
             "Edge detected on %s: our=%.4f  market=%.4f  edge=%.4f  "
-            "fee_factor=%.4f  slug=%s",
+            "confidence=%.4f  fee_factor=%.4f  slug=%s",
             result["side"],
             result["our_prob"],
             result["market_prob"],
             result["edge"],
+            confidence,
             fee_factor,
             result["market_slug"],
         )

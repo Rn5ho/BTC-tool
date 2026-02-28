@@ -20,6 +20,17 @@ from signals.probability import ProbabilityModel
 from strategy.edge import EdgeDetector
 from storage.db import Database
 
+# ML model — loaded when use_ml_model=True
+if settings.use_ml_model:
+    try:
+        from signals.ml_probability import MLProbabilityModel
+        _ml_available = True
+    except (ImportError, FileNotFoundError) as e:
+        _ml_available = False
+        logging.getLogger("btc_edge").warning("ML model unavailable: %s — falling back to rule-based", e)
+else:
+    _ml_available = False
+
 # Lazy imports for optional components (may not have their files yet at
 # import time, but will exist at runtime).
 
@@ -61,25 +72,39 @@ class Orchestrator:
         )
         self.db = Database()
         self.features = FeatureEngine()
-        self.model = ProbabilityModel(
-            weights={
-                "obi": settings.w_obi,
-                "taker": settings.w_taker,
-                "momentum": settings.w_momentum,
-                "rsi": settings.w_rsi,
-                "vwap": settings.w_vwap,
-                "funding": settings.w_funding,
-                "volume_zscore": settings.w_volume_zscore,
-                "regime": settings.w_regime,
-            },
-            confidence_dampen=settings.confidence_dampen,
-        )
+
+        # Choose probability model: ML (trained) or rule-based
+        self._use_ml = settings.use_ml_model and _ml_available
+        if self._use_ml:
+            try:
+                self.model = MLProbabilityModel()
+                logger.info("Using ML probability model (trained)")
+            except FileNotFoundError as e:
+                logger.warning("ML model not found: %s — falling back to rule-based", e)
+                self._use_ml = False
+
+        if not self._use_ml:
+            self.model = ProbabilityModel(
+                weights={
+                    "obi": settings.w_obi,
+                    "taker": settings.w_taker,
+                    "momentum": settings.w_momentum,
+                    "rsi": settings.w_rsi,
+                    "vwap": settings.w_vwap,
+                    "funding": settings.w_funding,
+                    "volume_zscore": settings.w_volume_zscore,
+                    "regime": settings.w_regime,
+                },
+                confidence_dampen=settings.confidence_dampen,
+            )
+
         self.edge_detector = EdgeDetector(
             model=self.model,
             min_edge=settings.min_edge_threshold,
             max_edge=settings.max_edge_threshold,
             fee_rate=settings.polymarket_fee_rate,
             fee_exponent=settings.polymarket_fee_exponent,
+            always_trade=settings.always_trade,
         )
         self.paper_trader = None  # initialized in start()
         self.alerter = None       # initialized in start()
@@ -157,6 +182,7 @@ class Orchestrator:
             use_kelly=settings.use_kelly,
             fee_rate=settings.polymarket_fee_rate,
             fee_exponent=settings.polymarket_fee_exponent,
+            sizing_strategy=settings.sizing_strategy,
         )
         await self.paper_trader.restore_bankroll()
 
@@ -264,10 +290,13 @@ class Orchestrator:
 
         slug = self._current_slug or "none"
         state = "\u23f8 PAUSED" if self._paused else "\u25b6 ACTIVE"
+        model_type = "ML" if self._use_ml else "Rule-based"
+        mode = "always-trade" if settings.always_trade else "edge-threshold"
 
         return (
             f"\U0001f4ca <b>STATUS</b>\n\n"
             f"State: <b>{state}</b>\n"
+            f"Model: {model_type} ({mode})\n"
             f"BTC (Binance): <b>${btc:,.2f}</b>\n"
             f"BTC (Chainlink): {f'<b>${chainlink:,.2f}</b>' if chainlink else 'N/A'}\n"
             f"Window: {slug}\n"
@@ -419,6 +448,14 @@ class Orchestrator:
 
     async def _cmd_weights(self, args: str = "") -> str:
         """Handle /weights — show current probability model weights."""
+        if self._use_ml:
+            return (
+                "\u2696 <b>ML MODEL</b>\n\n"
+                f"Type: {type(self.model._model).__name__}\n"
+                f"Features: 44\n"
+                f"Mode: {'always-trade' if settings.always_trade else 'edge-threshold'}\n"
+                f"Sizing: {settings.sizing_strategy}"
+            )
         w = self.model.weights
         lines = ["\u2696 <b>MODEL WEIGHTS</b>\n"]
         for name, value in sorted(w.items()):
@@ -439,7 +476,11 @@ class Orchestrator:
 
         ema_cross = TechnicalIndicators.ema_cross_signal(candles)
         bb_pos = TechnicalIndicators.bb_position(candles)
-        regime = self.model._normalize_regime(ema_cross, bb_pos)
+        if hasattr(self.model, '_normalize_regime'):
+            regime = self.model._normalize_regime(ema_cross, bb_pos)
+        else:
+            # ML model: compute regime as simple EMA cross signal
+            regime = max(-0.5, min(0.5, ema_cross * 100))
 
         # Visual bar
         bar_pos = int((regime + 0.5) * 20)  # 0-20 scale
@@ -695,7 +736,12 @@ class Orchestrator:
         )
 
         # 4. Generate probability estimate
-        p_up = self.model.predict(feature_vec)
+        if self._use_ml:
+            # ML model: use full candle history for all 44 features
+            window_ts = int(self._window_start_time)
+            p_up = self.model.predict_from_candles(candles, window_ts)
+        else:
+            p_up = self.model.predict(feature_vec)
 
         # Save feature snapshot
         await self.db.save_feature_snapshot(
@@ -704,9 +750,11 @@ class Orchestrator:
             market_slug=market.slug,
         )
 
-        # 5. Detect edge
+        # 5. Detect edge (pass p_up_override so edge detector uses ML prediction)
         self._cycle_count += 1
-        signal = self.edge_detector.evaluate(feature_vec, market)
+        signal = self.edge_detector.evaluate(
+            feature_vec, market, p_up_override=p_up
+        )
 
         if signal is None:
             # Quiet heartbeat — only log once every HEARTBEAT_INTERVAL
@@ -722,8 +770,10 @@ class Orchestrator:
                         f"({stats.get('win_rate', 0):.0%} win) "
                         f"| P&L: ${stats.get('total_pnl', 0):+.2f}"
                     )
+                model_tag = "[ML]" if self._use_ml else "[RB]"
                 logger.info(
-                    "-- Status: BTC $%s | P(up)=%.1f%% | Mkt=%.0f/%.0f%s",
+                    "-- Status %s: BTC $%s | P(up)=%.1f%% | Mkt=%.0f/%.0f%s",
+                    model_tag,
                     f"{btc_now:,.2f}" if btc_now else "N/A",
                     p_up * 100,
                     market.up_price * 100,
@@ -795,38 +845,44 @@ class Orchestrator:
             )
             return
 
-        # 6g. Signal saturation filter — when any single signal is near
-        #     the +-0.5 limits, the model is likely overreacting to a
-        #     single noisy input rather than seeing a real pattern.
-        signals_data = signal.get("signals", {})
-        saturated = {
-            k: v for k, v in signals_data.items()
-            if abs(v) > self._MAX_SIGNAL_VALUE
-        }
-        if saturated:
-            sat_str = ", ".join(f"{k}={v:+.3f}" for k, v in saturated.items())
-            logger.info(
-                "Skipping edge — saturated signals [%s] (limit=+-%.2f)",
-                sat_str,
-                self._MAX_SIGNAL_VALUE,
-            )
-            return
+        # 6g. Signal saturation filter — only applies to rule-based model.
+        #     ML model doesn't have the same +-0.5 signal structure.
+        if not self._use_ml:
+            signals_data = signal.get("signals", {})
+            saturated = {
+                k: v for k, v in signals_data.items()
+                if abs(v) > self._MAX_SIGNAL_VALUE
+            }
+            if saturated:
+                sat_str = ", ".join(f"{k}={v:+.3f}" for k, v in saturated.items())
+                logger.info(
+                    "Skipping edge — saturated signals [%s] (limit=+-%.2f)",
+                    sat_str,
+                    self._MAX_SIGNAL_VALUE,
+                )
+                return
 
         signals_brief = signal.get("signals", {})
+        # Filter to numeric values only (ML breakdown includes string 'ml_side')
+        numeric_signals = {k: v for k, v in signals_brief.items() if isinstance(v, (int, float))}
         top_signals = ", ".join(
             f"{k}={v:+.3f}" for k, v in sorted(
-                signals_brief.items(), key=lambda x: abs(x[1]), reverse=True
+                numeric_signals.items(), key=lambda x: abs(x[1]), reverse=True
             )[:3]
         )
         fee_pct = signal.get("fee_factor", 0.0) * 100
+        conf_pct = signal.get("confidence", 0.0) * 100
+        model_tag = "ML" if self._use_ml else "RB"
         logger.info(
-            ">>> EDGE: %s %s | our=%.1f%% mkt=%.1f%% edge=%+.1f%% "
-            "fee=%.2f%% | BTC=$%s | [%s]",
+            ">>> %s %s %s | our=%.1f%% mkt=%.1f%% edge=%+.1f%% "
+            "conf=%.1f%% fee=%.2f%% | BTC=$%s | [%s]",
+            model_tag,
             signal["side"],
             signal["market_slug"],
             signal["our_prob"] * 100,
             signal["market_prob"] * 100,
             signal["edge"] * 100,
+            conf_pct,
             fee_pct,
             f"{btc_now:,.2f}" if btc_now else "N/A",
             top_signals,
@@ -837,7 +893,9 @@ class Orchestrator:
             trade_id = await self.paper_trader.place_trade(signal)
             if trade_id is not None and self.alerter:
                 bet_size = self.paper_trader.compute_bet_size(
-                    signal["our_prob"], signal["market_prob"]
+                    signal["our_prob"],
+                    signal["market_prob"],
+                    confidence=signal.get("confidence", 0.0),
                 )
                 await self.alerter.send_trade_alert(
                     side=signal["side"],
