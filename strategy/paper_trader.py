@@ -217,6 +217,8 @@ class PaperTrader:
             edge=signal["edge"],
             size_usdc=bet_size,
             entry_price=signal["entry_price"],
+            entry_spread=signal.get("spread"),
+            midpoint_price=signal.get("midpoint_price"),
         )
 
         await self.db.save_paper_trade(trade)
@@ -239,6 +241,8 @@ class PaperTrader:
             "market_prob": signal["market_prob"],
             "edge": signal["edge"],
             "fee_factor": signal.get("fee_factor", 0.0),
+            "spread": signal.get("spread"),
+            "midpoint_price": signal.get("midpoint_price"),
         }
 
         logger.info(

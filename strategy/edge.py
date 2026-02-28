@@ -167,7 +167,15 @@ class EdgeDetector:
 
             confidence = abs(p_up - 0.5)
 
-        entry_price = raw_up if best_side == "UP" else raw_down
+        # Entry price: use best ask (taker price) if available, midpoint fallback
+        midpoint_price = raw_up if best_side == "UP" else raw_down
+        if best_side == "UP":
+            entry_price = market.up_best_ask if market.up_best_ask else raw_up
+            spread = market.up_spread
+        else:
+            entry_price = market.down_best_ask if market.down_best_ask else raw_down
+            spread = market.down_spread
+
         fee_factor = compute_fee_factor(
             entry_price, self.fee_rate, self.fee_exponent
         )
@@ -184,6 +192,8 @@ class EdgeDetector:
             "market_prob": raw_up if best_side == "UP" else raw_down,
             "edge": best_edge,
             "entry_price": entry_price,
+            "midpoint_price": midpoint_price,
+            "spread": spread,
             "fee_factor": fee_factor,
             "confidence": confidence,
             "signals": signals,

@@ -45,6 +45,17 @@ class FundingInfo:
 
 
 @dataclass
+class PolymarketOrderBook:
+    """Parsed top-of-book from the CLOB /book endpoint."""
+    best_bid: float
+    best_ask: float
+    spread: float
+    bid_size: float
+    ask_size: float
+    midpoint: float
+
+
+@dataclass
 class PolymarketMarket:
     slug: str
     question: str
@@ -55,6 +66,13 @@ class PolymarketMarket:
     down_price: float
     window_start: int  # unix timestamp of 5-min window start
     window_end: int
+    # Spread tracking (optional — populated when order book is available)
+    up_best_bid: Optional[float] = None
+    up_best_ask: Optional[float] = None
+    up_spread: Optional[float] = None
+    down_best_bid: Optional[float] = None
+    down_best_ask: Optional[float] = None
+    down_spread: Optional[float] = None
 
 
 @dataclass
@@ -86,3 +104,5 @@ class PaperTrade:
     outcome: Optional[str] = None  # "WIN" or "LOSS"
     pnl: Optional[float] = None
     settled_at: Optional[int] = None
+    entry_spread: Optional[float] = None  # bid-ask spread at entry
+    midpoint_price: Optional[float] = None  # midpoint at entry (for comparison)

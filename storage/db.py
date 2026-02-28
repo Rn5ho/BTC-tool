@@ -98,9 +98,35 @@ class Database:
             )
             await self._db.commit()
             logger.info("Database tables and indexes created successfully")
+
+            # Run migrations for spread tracking columns
+            await self._migrate_spread_columns()
         except Exception:
             logger.exception("Failed to initialize database")
             raise
+
+    async def _migrate_spread_columns(self) -> None:
+        """Add spread tracking columns to existing tables (safe to run repeatedly)."""
+        alter_statements = [
+            # market_snapshots spread columns
+            ("market_snapshots", "up_best_bid", "REAL"),
+            ("market_snapshots", "up_best_ask", "REAL"),
+            ("market_snapshots", "up_spread", "REAL"),
+            ("market_snapshots", "down_best_bid", "REAL"),
+            ("market_snapshots", "down_best_ask", "REAL"),
+            ("market_snapshots", "down_spread", "REAL"),
+            # paper_trades spread columns
+            ("paper_trades", "entry_spread", "REAL"),
+            ("paper_trades", "midpoint_price", "REAL"),
+        ]
+        for table, column, col_type in alter_statements:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+                )
+            except Exception:
+                pass  # Column already exists
+        await self._db.commit()
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -190,8 +216,9 @@ class Database:
                 """
                 INSERT INTO paper_trades
                     (timestamp, market_slug, side, our_prob, market_prob,
-                     edge, size_usdc, entry_price, outcome, pnl, settled_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     edge, size_usdc, entry_price, outcome, pnl, settled_at,
+                     entry_spread, midpoint_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.timestamp,
@@ -205,15 +232,18 @@ class Database:
                     trade.outcome,
                     trade.pnl,
                     trade.settled_at,
+                    trade.entry_spread,
+                    trade.midpoint_price,
                 ),
             )
             await self._db.commit()
             logger.info(
-                "Saved paper trade: %s %s edge=%.4f size=%.2f",
+                "Saved paper trade: %s %s edge=%.4f size=%.2f spread=%s",
                 trade.side,
                 trade.market_slug,
                 trade.edge,
                 trade.size_usdc,
+                f"{trade.entry_spread:.4f}" if trade.entry_spread else "N/A",
             )
         except Exception:
             logger.exception("Failed to save paper trade")
@@ -249,24 +279,36 @@ class Database:
         up_price: float,
         down_price: float,
         btc_price: Optional[float] = None,
+        up_best_bid: Optional[float] = None,
+        up_best_ask: Optional[float] = None,
+        up_spread: Optional[float] = None,
+        down_best_bid: Optional[float] = None,
+        down_best_ask: Optional[float] = None,
+        down_spread: Optional[float] = None,
     ) -> None:
         """Insert a market price snapshot."""
         try:
             ts = int(time.time())
             await self._db.execute(
                 """
-                INSERT INTO market_snapshots (timestamp, slug, up_price, down_price, btc_price)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO market_snapshots
+                    (timestamp, slug, up_price, down_price, btc_price,
+                     up_best_bid, up_best_ask, up_spread,
+                     down_best_bid, down_best_ask, down_spread)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (ts, slug, up_price, down_price, btc_price),
+                (ts, slug, up_price, down_price, btc_price,
+                 up_best_bid, up_best_ask, up_spread,
+                 down_best_bid, down_best_ask, down_spread),
             )
             await self._db.commit()
             logger.debug(
-                "Saved market snapshot for %s: up=%.4f down=%.4f btc=%s",
+                "Saved market snapshot for %s: up=%.4f down=%.4f btc=%s spread=%s",
                 slug,
                 up_price,
                 down_price,
                 btc_price,
+                f"{up_spread:.4f}/{down_spread:.4f}" if up_spread else "N/A",
             )
         except Exception:
             logger.exception("Failed to save market snapshot for %s", slug)

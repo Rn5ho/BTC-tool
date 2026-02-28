@@ -138,14 +138,23 @@ class TelegramAlerter:
         entry_price: float,
         our_prob: float,
         edge: float,
+        spread: float | None = None,
+        midpoint_price: float | None = None,
     ) -> None:
         """Send a paper-trade placement notification."""
+        spread_line = ""
+        if spread is not None and midpoint_price is not None:
+            spread_line = (
+                f"\nSpread: {spread:.4f} | "
+                f"Mid: {midpoint_price:.3f} | Ask: {entry_price:.3f}"
+            )
         text = (
             f"\U0001f4dd <b>PAPER TRADE PLACED</b>\n\n"
             f"Market: {slug}\n"
             f"Side: {side} @ {entry_price:.3f}\n"
             f"Size: ${size:.2f}\n"
             f"Our prob: {our_prob:.1%} | Edge: {edge:+.1%}"
+            f"{spread_line}"
         )
         await self._send(text)
 

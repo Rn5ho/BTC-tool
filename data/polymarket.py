@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 import aiohttp
 
-from data.models import PolymarketMarket
+from data.models import PolymarketMarket, PolymarketOrderBook
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +386,82 @@ class PolymarketClient:
         except (ValueError, TypeError, AttributeError) as exc:
             logger.error("Failed to parse midpoint prices: %s", exc)
             return None
+
+    @staticmethod
+    def _parse_orderbook(data: Optional[dict]) -> Optional[PolymarketOrderBook]:
+        """Parse a CLOB /book response into a PolymarketOrderBook.
+
+        Returns None if the book is empty or unparseable.
+        """
+        if data is None:
+            return None
+        try:
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if not bids or not asks:
+                return None
+            best_bid = float(bids[0]["price"])
+            best_ask = float(asks[0]["price"])
+            bid_size = float(bids[0]["size"])
+            ask_size = float(asks[0]["size"])
+            spread = best_ask - best_bid
+            midpoint = (best_bid + best_ask) / 2.0
+            return PolymarketOrderBook(
+                best_bid=best_bid,
+                best_ask=best_ask,
+                spread=spread,
+                bid_size=bid_size,
+                ask_size=ask_size,
+                midpoint=midpoint,
+            )
+        except (KeyError, IndexError, ValueError, TypeError) as exc:
+            logger.debug("Failed to parse orderbook: %s", exc)
+            return None
+
+    async def get_live_prices_with_book(
+        self, market: Optional[PolymarketMarket] = None
+    ) -> Optional[tuple[float, float, Optional[PolymarketOrderBook], Optional[PolymarketOrderBook]]]:
+        """Fetch live midpoint prices AND order books for Up and Down tokens.
+
+        Fires 4 parallel requests (2 midpoints + 2 books). If book requests
+        fail, midpoints are still returned with None for the books.
+
+        Returns:
+            (up_price, down_price, up_book, down_book) or None on total failure.
+        """
+        if market is None:
+            market = self._current_market
+        if market is None:
+            logger.error("No market available for live price fetch")
+            return None
+
+        up_mid_url = f"{self._clob_url}/midpoint?token_id={market.up_token_id}"
+        down_mid_url = f"{self._clob_url}/midpoint?token_id={market.down_token_id}"
+        up_book_url = f"{self._clob_url}/book?token_id={market.up_token_id}"
+        down_book_url = f"{self._clob_url}/book?token_id={market.down_token_id}"
+
+        up_mid_data, down_mid_data, up_book_data, down_book_data = await asyncio.gather(
+            self._get_json(up_mid_url),
+            self._get_json(down_mid_url),
+            self._get_json(up_book_url),
+            self._get_json(down_book_url),
+        )
+
+        if up_mid_data is None or down_mid_data is None:
+            logger.warning("Failed to fetch midpoint prices for %s", market.slug)
+            return None
+
+        try:
+            up_price = float(up_mid_data.get("mid", up_mid_data.get("price", 0)))
+            down_price = float(down_mid_data.get("mid", down_mid_data.get("price", 0)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            logger.error("Failed to parse midpoint prices: %s", exc)
+            return None
+
+        up_book = self._parse_orderbook(up_book_data)
+        down_book = self._parse_orderbook(down_book_data)
+
+        return (up_price, down_price, up_book, down_book)
 
     # ------------------------------------------------------------------
     # Orderbook

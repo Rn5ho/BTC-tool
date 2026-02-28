@@ -258,6 +258,7 @@ class Orchestrator:
         self.alerter.register_command("weights", self._cmd_weights)
         self.alerter.register_command("regime", self._cmd_regime)
         self.alerter.register_command("analyze", self._cmd_analyze)
+        self.alerter.register_command("spread", self._cmd_spread)
 
     async def _cmd_status(self, args: str = "") -> str:
         """Handle /status — current BTC price, model output, market odds."""
@@ -611,6 +612,35 @@ class Orchestrator:
             logger.exception("Error running /analyze")
             return f"\u26a0 Analysis error: {e}"
 
+    async def _cmd_spread(self, args: str = "") -> str:
+        """Handle /spread — show live order book spreads for current market."""
+        market = self.polymarket._current_market
+        if market is None:
+            return "\u26a0 No active market."
+
+        result = await self.polymarket.get_live_prices_with_book(market)
+        if result is None:
+            return "\u26a0 Failed to fetch order book."
+
+        up_price, down_price, up_book, down_book = result
+
+        def _fmt_book(label: str, book, midpoint: float) -> str:
+            if book is None:
+                return f"  {label}: no book data (mid={midpoint:.3f})"
+            return (
+                f"  {label}: bid={book.best_bid:.3f} ask={book.best_ask:.3f} "
+                f"spread={book.spread:.4f}\n"
+                f"    mid={book.midpoint:.3f} | "
+                f"bid_sz={book.bid_size:.0f} ask_sz={book.ask_size:.0f}"
+            )
+
+        return (
+            f"\U0001f4d6 <b>ORDER BOOK</b>\n\n"
+            f"Market: {market.slug}\n\n"
+            f"<b>UP token:</b>\n{_fmt_book('UP', up_book, up_price)}\n\n"
+            f"<b>DOWN token:</b>\n{_fmt_book('DOWN', down_book, down_price)}"
+        )
+
     # ------------------------------------------------------------------
     # Main analysis loop
     # ------------------------------------------------------------------
@@ -698,10 +728,10 @@ class Orchestrator:
         if market is None:
             return
 
-        # 2. Refresh live Polymarket prices
-        prices = await self.polymarket.get_live_prices(market)
-        if prices:
-            up_price, down_price = prices
+        # 2. Refresh live Polymarket prices + order books
+        book_result = await self.polymarket.get_live_prices_with_book(market)
+        if book_result:
+            up_price, down_price, up_book, down_book = book_result
             market = type(market)(
                 slug=market.slug,
                 question=market.question,
@@ -712,6 +742,12 @@ class Orchestrator:
                 down_price=down_price,
                 window_start=market.window_start,
                 window_end=market.window_end,
+                up_best_bid=up_book.best_bid if up_book else None,
+                up_best_ask=up_book.best_ask if up_book else None,
+                up_spread=up_book.spread if up_book else None,
+                down_best_bid=down_book.best_bid if down_book else None,
+                down_best_ask=down_book.best_ask if down_book else None,
+                down_spread=down_book.spread if down_book else None,
             )
 
         # Save market snapshot
@@ -721,6 +757,12 @@ class Orchestrator:
             up_price=market.up_price,
             down_price=market.down_price,
             btc_price=btc_price,
+            up_best_bid=market.up_best_bid,
+            up_best_ask=market.up_best_ask,
+            up_spread=market.up_spread,
+            down_best_bid=market.down_best_bid,
+            down_best_ask=market.down_best_ask,
+            down_spread=market.down_spread,
         )
 
         # 3. Compute features
@@ -771,13 +813,17 @@ class Orchestrator:
                         f"| P&L: ${stats.get('total_pnl', 0):+.2f}"
                     )
                 model_tag = "[ML]" if self._use_ml else "[RB]"
+                spread_str = ""
+                if market.up_spread is not None:
+                    spread_str = f" | spread={market.up_spread:.4f}"
                 logger.info(
-                    "-- Status %s: BTC $%s | P(up)=%.1f%% | Mkt=%.0f/%.0f%s",
+                    "-- Status %s: BTC $%s | P(up)=%.1f%% | Mkt=%.0f/%.0f%s%s",
                     model_tag,
                     f"{btc_now:,.2f}" if btc_now else "N/A",
                     p_up * 100,
                     market.up_price * 100,
                     market.down_price * 100,
+                    spread_str,
                     stats_str,
                 )
             return
@@ -873,9 +919,14 @@ class Orchestrator:
         fee_pct = signal.get("fee_factor", 0.0) * 100
         conf_pct = signal.get("confidence", 0.0) * 100
         model_tag = "ML" if self._use_ml else "RB"
+        spread_val = signal.get("spread")
+        midpoint_val = signal.get("midpoint_price")
+        spread_info = ""
+        if spread_val is not None and midpoint_val is not None:
+            spread_info = f" spread={spread_val:.4f} mid={midpoint_val:.3f}"
         logger.info(
             ">>> %s %s %s | our=%.1f%% mkt=%.1f%% edge=%+.1f%% "
-            "conf=%.1f%% fee=%.2f%% | BTC=$%s | [%s]",
+            "conf=%.1f%% fee=%.2f%%%s | BTC=$%s | [%s]",
             model_tag,
             signal["side"],
             signal["market_slug"],
@@ -884,6 +935,7 @@ class Orchestrator:
             signal["edge"] * 100,
             conf_pct,
             fee_pct,
+            spread_info,
             f"{btc_now:,.2f}" if btc_now else "N/A",
             top_signals,
         )
@@ -904,6 +956,8 @@ class Orchestrator:
                     entry_price=signal["entry_price"],
                     our_prob=signal["our_prob"],
                     edge=signal["edge"],
+                    spread=signal.get("spread"),
+                    midpoint_price=signal.get("midpoint_price"),
                 )
 
         # Telegram edge alert (only fires once per market — when trade is placed)
