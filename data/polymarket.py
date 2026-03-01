@@ -49,7 +49,7 @@ ETH_RPC_URLS = [
 # This is the actual resolution source for Polymarket BTC Up/Down markets.
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 RTDS_PING_INTERVAL = 5.0  # seconds
-CHAINLINK_STREAM_STALE_SECONDS = 60.0  # consider price stale after this
+CHAINLINK_STREAM_STALE_SECONDS = 120.0  # consider price stale after this
 
 
 def compute_fee_factor(price: float, fee_rate: float = 0.25, fee_exponent: int = 2) -> float:
@@ -550,13 +550,19 @@ class PolymarketClient:
             logger.error("Session not started. Call start() before streaming.")
             return
 
+        # Subscribe to Chainlink crypto price feed — Polymarket's resolution
+        # source for BTC Up/Down markets. RTDS sends a batch of recent prices
+        # on connect (type="subscribe") then goes idle. We force reconnect
+        # every 30s to always have fresh data within the 120s stale window.
         subscribe_msg = {
             "action": "subscribe",
-            "subscriptions": [{
-                "topic": "crypto_prices_chainlink",
-                "type": "*",
-                "filters": json.dumps({"symbol": "btc/usd"}),
-            }],
+            "subscriptions": [
+                {
+                    "topic": "crypto_prices_chainlink",
+                    "type": "*",
+                    "filters": json.dumps({"symbol": "btc/usd"}),
+                },
+            ],
         }
 
         while True:
@@ -569,20 +575,41 @@ class PolymarketClient:
                         "Connected to Polymarket RTDS — streaming Chainlink BTC/USD"
                     )
 
-                    async for msg in ws:
+                    _msg_count = 0
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=30.0)
+                        except asyncio.TimeoutError:
+                            # No data for 30s — reconnect to get fresh batch
+                            logger.debug("RTDS idle 30s — reconnecting for fresh batch")
+                            break
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = json.loads(msg.data)
-                                if data.get("topic") == "crypto_prices_chainlink":
+                                _msg_count += 1
+                                topic = data.get("topic", "")
+                                # RTDS returns topic "crypto_prices" for both
+                                # Binance and Chainlink subscriptions.
+                                if topic in ("crypto_prices_chainlink", "crypto_prices"):
                                     payload = data.get("payload", {})
-                                    price = payload.get("value") or payload.get("price")
+                                    # Two formats: single {value} or batch {data: [{timestamp, value}, ...]}
+                                    price = None
+                                    if "data" in payload and isinstance(payload["data"], list):
+                                        # Batch: take the latest entry
+                                        entries = payload["data"]
+                                        if entries:
+                                            latest = entries[-1]
+                                            price = latest.get("value")
+                                    else:
+                                        price = payload.get("value") or payload.get("price")
                                     if price is not None:
                                         self._chainlink_stream_price = float(price)
                                         self._chainlink_stream_ts = time.time()
-                                        logger.debug(
-                                            "Chainlink stream: BTC/USD $%.2f",
-                                            self._chainlink_stream_price,
-                                        )
+                                        if _msg_count <= 3 or _msg_count % 500 == 0:
+                                            logger.info(
+                                                "Chainlink stream: BTC/USD $%.2f (msg #%d)",
+                                                self._chainlink_stream_price, _msg_count,
+                                            )
                             except (json.JSONDecodeError, ValueError, TypeError) as exc:
                                 logger.debug("Failed to parse RTDS message: %s", exc)
                         elif msg.type in (
