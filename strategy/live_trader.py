@@ -147,7 +147,7 @@ class LiveTrader:
                     raw_taker = round_down(amount / raw_price, 2)
                     raw_maker = raw_taker * raw_price
                     if decimal_places(raw_maker) > 4:
-                        raw_maker = round_up(raw_maker, 4)
+                        raw_maker = round_down(raw_maker, 4)
                     return (
                         UtilsBuy,
                         to_token_decimals(raw_maker),
