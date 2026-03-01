@@ -4,7 +4,7 @@
 
 BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), uses a trained ML model to predict 5-minute BTC direction, and paper trades on Polymarket's binary UP/DOWN markets every 5-minute window. Telegram bot for alerts and interactive commands.
 
-**Status:** Deployed on Hetzner VPS in Helsinki, Finland (65.21.178.90) running 24/7 as a systemd service. ML model (RandomForestClassifier, 53.9% test accuracy on 34,100 samples) replaced the original rule-based model. Running in "always-trade" mode with hybrid adaptive bet sizing. **Live trading enabled and profitable** via py-clob-client with $5 max bet cap, direct CLOB API access (no proxy needed from Finland). Live trading decoupled from paper trading — independent bankroll, adaptive sizing, and settlement tracking. **Early exit selling** active: sells tokens when bid >= $0.90 to lock in profit before settlement. ~$93 real capital deposited, ~60% WR across 160+ trades.
+**Status:** Deployed on Hetzner VPS in Helsinki, Finland (65.21.178.90) running 24/7 as a systemd service. ML model (RandomForestClassifier, 53.9% test accuracy on 34,100 samples) replaced the original rule-based model. Running in "always-trade" mode with hybrid adaptive bet sizing. **Live trading enabled and profitable** via py-clob-client with $5 max bet cap, direct CLOB API access (no proxy needed from Finland). Live trading decoupled from paper trading — independent bankroll, adaptive sizing, and settlement tracking. **Early exit selling** active on dedicated 1s loop: sells tokens when bid >= $0.90 to lock in profit before settlement. Bankroll synced from real CLOB balance. ~$73 real capital deposited, ~$120 portfolio (~64% ROI) across 100+ trades.
 
 ## Tech Stack
 
@@ -55,6 +55,7 @@ deploy/         → Hetzner VPS deployment
 
 ml_pipeline.py       → ML training pipeline (downloads Binance history, builds dataset, trains models)
 simulate_compounding.py → Monte Carlo simulation for bet sizing strategies
+analyze_clob.py      → CLOB API analysis utility (real trade data, P&L from wallet)
 config.py            → Pydantic Settings loaded from .env
 main.py              → Async orchestrator wiring all components, Telegram command handlers, console output
 ```
@@ -131,7 +132,7 @@ The bot (`@BTC5mBot`) supports interactive commands:
 | `/balance` | Show USDC balance, session stats, pending claims (live trading only) |
 | `/livetrades` | Show live trade stats (session + all-time from DB) |
 
-Periodic stats (every 30 min) include live trading info: USDC balance, session fills, all-time totals. Live trade WIN/LOSS/EARLY_EXIT settlement alerts are sent via Telegram. Paper trade notifications are excluded from Telegram (paper data is still collected in DB/logs).
+Periodic stats (every 30 min) include live trading info: USDC balance, session fills, all-time totals. Live trade WIN/LOSS/EARLY_EXIT settlement alerts are sent via Telegram. **Skip notifications** sent when a window is skipped (with reason: low confidence, trend conflict, entry price, etc.). Paper trade notifications are excluded from Telegram (paper data is still collected in DB/logs).
 
 ## Configuration
 
@@ -347,7 +348,8 @@ Live trading places real GTC market buy orders on Polymarket alongside paper tra
 - Candle prefetch from Binance REST API eliminates 30-min buffering delay on restart
 
 ### py-clob-client Quirks & Patches
-- **Rounding bug** (CRITICAL): `get_market_order_amounts` for BUY rounds taker_amount to `round_config.amount` (4-5 decimals) but CLOB requires max 2. The library has the rounding reversed for BUY market orders (maker and taker swapped). Fixed by monkey-patching `OrderBuilder.get_market_order_amounts` in `initialize()` to compute taker first (rounded to 2 dec), then derive maker (up to 4 dec). **Must use `round_down` for maker** — floating point (e.g. `4.36 * 0.63 = 2.7468000000000004`) causes `round_up` to overshoot by 0.0001, which CLOB rejects.
+- **Rounding bug** (CRITICAL): `get_market_order_amounts` for BUY rounds taker_amount to `round_config.amount` (4-5 decimals) but CLOB requires max 2. The library has the rounding reversed for BUY market orders (maker and taker swapped). Fixed by monkey-patching `OrderBuilder.get_market_order_amounts` in `initialize()` to compute taker first (rounded to 2 dec), then derive maker (up to 4 dec). **Must use `round_down` for maker** — floating point causes `round_up` to overshoot by 0.0001, which CLOB rejects.
+- **Maker float precision** (CRITICAL): Even with `round_down`, float multiplication is imprecise (e.g. `5.93 * 0.59 = 3.4986999...` but CLOB expects `3.4987`). Fixed by using `Decimal` for maker amount calculation in the monkey-patched `_patched` function: `d_maker = Decimal(str(taker)) * Decimal(str(price))`.
 - **5-token minimum**: ALL CLOB markets have `minimum_order_size: 5` (tokens, not USDC). At $0.50 per token = $2.50 minimum per trade. The Polymarket website uses a different mechanism for small orders. `place_order()` auto-bumps amount to `5 × entry_price`. `MAX_LIVE_BET_USDC=5.0` to accommodate.
 - **$1 minimum for marketable orders**: After the rounding patch, the effective maker amount can drop below $1. Explicit `$1.00` floor added in `place_order()`.
 - **FOK fails on thin books**: FOK orders require immediate full fill. 5-min binary markets are thin. Use GTC instead.
@@ -392,7 +394,8 @@ CREATE TABLE live_trades (
 
 ### Independent Live Trading
 - Live trader has its own bankroll, adaptive sizing, and settlement tracking (decoupled from paper trader)
-- On startup: `bankroll = VIRTUAL_BANKROLL + SUM(pnl) from live_trades`
+- On startup: bankroll synced from **real CLOB USDC balance** via `get_balance()` (source of truth)
+- Periodic bankroll sync every 30 min in `_stats_loop()` to stay in sync with on-chain state
 - `compute_bet_size(confidence)`: independent adaptive sizing (same algorithm as paper trader)
 - `record_settlement(won, pnl)`: updates bankroll, streak, drawdown state
 - Live trades settled in `_settle_live_trades_for_window()` alongside paper trades
@@ -411,8 +414,9 @@ ssh root@65.21.178.90 "tail -c 20000 /home/btcedge/BTC-tool/btc_edge.log | strin
 
 1. **Window detection**: Slugs are deterministic (`btc-updown-5m-{unix_ts}` where `unix_ts = now - (now % 300)`). Analysis loop detects transitions every 3-second cycle.
 2. **Settlement source**: Chainlink BTC/USD via Polymarket RTDS WebSocket (the actual resolution source). Binance spot as fallback.
-3. **Settlement decoupled from market discovery**: Window transitions detected via `get_current_slug()` BEFORE the Gamma API call.
-4. **Startup recovery**: After 5-minute buffering, stale unsettled trades from previous sessions are settled using historical candle data.
+3. **Flat close = DOWN**: Polymarket resolves flat closes (close == open) as DOWN — price didn't go UP. Uses strict `>` comparison (not `>=`).
+4. **Settlement decoupled from market discovery**: Window transitions detected via `get_current_slug()` BEFORE the Gamma API call.
+5. **Startup recovery**: After 5-minute buffering, stale unsettled trades from previous sessions are settled using historical candle data.
 
 ## Startup Sequence
 
@@ -421,13 +425,14 @@ ssh root@65.21.178.90 "tail -c 20000 /home/btcedge/BTC-tool/btc_edge.log | strin
 3. Initialize EdgeDetector with always_trade setting
 4. Initialize DB, PaperTrader (with sizing_strategy), TelegramAlerter
 5. Start Polymarket aiohttp session
-6. Initialize LiveTrader (if LIVE_TRADING=true): derive API creds, patch rounding config, restore bankroll from DB
+6. Initialize LiveTrader (if LIVE_TRADING=true): derive API creds, patch rounding config (with Decimal), sync bankroll from real CLOB balance
 7. Prefetch 35 candles from Binance REST API (skip 30-min buffering wait)
-8. Launch 5 concurrent asyncio tasks:
+8. Launch 6 concurrent asyncio tasks:
    - **Binance WS**: Streams kline_1m, depth20, aggTrade, futures funding
    - **Chainlink RTDS**: Streams BTC/USD from Polymarket's data service
-   - **Analysis loop**: Initializes window tracking, settles stale trades (paper + live), then runs 3-second poll cycle with early exit selling (sells tokens when bid >= $0.90)
-   - **Stats loop**: Periodic stats report every 30 minutes
+   - **Analysis loop**: Initializes window tracking, settles stale trades (paper + live), runs 3-second poll cycle, sends skip notifications via Telegram
+   - **Early exit loop**: Dedicated 1-second poll cycle monitoring bid prices for early exit selling (bid >= $0.90)
+   - **Stats loop**: Periodic stats report + CLOB bankroll sync every 30 minutes
    - **Telegram command listener**: Long-polls for incoming /commands
 
 ## Console Output Format
@@ -486,6 +491,18 @@ Runs 24/7 on Hetzner VPS in Helsinki, Finland at `65.21.178.90` (CX22 tier):
 
 15. **SELL MarketOrderArgs amount = token count, not USDC** (fixed): `MarketOrderArgs(amount, side=SELL)` expects token count. Early exit was passing `tokens × bid` (USDC value), causing the CLOB to sell fewer tokens and leave a residual position behind. Fixed to pass `round(tokens, 2)` directly.
 
+16. **Flat close settlement wrong direction** (fixed): `btc_went_up = btc_end >= btc_start` treated ties (flat closes) as UP. Polymarket resolves flat as DOWN (price didn't go UP). Fixed to strict `>` in 4 locations (main.py x3, paper_trader.py x1).
+
+17. **Maker amount Decimal precision** (fixed): Float `5.93 * 0.59 = 3.4986999...` but CLOB expects `3.4987`. Even `round_down` couldn't fix float imprecision. Fixed by using `Decimal(str(taker)) * Decimal(str(price))` for exact arithmetic.
+
+18. **Telegram HTML parse error on skip notifications** (fixed): `$67,093.37 -> $67,019.64` — the `->` was interpreted as HTML tag closer. Fixed with `parse_mode=None` (plain text) for skip notifications.
+
+19. **Signal breakdown showing wrong model output** (fixed): `get_signal_breakdown()` re-ran ML model with degraded 12-feature fallback, showing different (sometimes opposite) direction from actual trade. Fixed: edge detector `evaluate()` now embeds actual `p_up`, `confidence`, `best_side` directly in the signals dict.
+
+20. **Early exit retry spam on 1s loop** (fixed): After moving early exit to dedicated 1s loop, failed sell attempts retried every second. Fixed with `exit_failed` flag on the position dict.
+
+21. **DB PnL understates real profits** (known — mitigated): DB tracks simulated settlements while CLOB has real fills, maker trades (counterparty hitting our GTC orders), and manual redemptions. Gap was ~$30 after 14 hours. **Mitigated by syncing bankroll from real CLOB balance** on startup and every 30 min.
+
 ## Conventions
 
 - All async — use `async def` and `await` consistently
@@ -507,22 +524,26 @@ From actual Polymarket CSV export:
 - **Fill rate**: 54% initially → ~95%+ after fixes
 
 ### Phase 2 (2026-03-01 onwards — Helsinki VPS, decoupled)
-- **Capital**: ~$93 deposited total
-- **Paper trades**: 162 settled, 60% WR, +$19.77 P&L, bankroll $112.77
-- **Live trades**: Independently tracked with own bankroll ($115.87) and sizing
-- **Early exit selling**: Active — sells tokens when bid >= $0.90, no time restriction
-- **Live bankroll**: VIRTUAL_BANKROLL + cumulative_pnl restored on restart
+- **Capital**: ~$73 deposited total
+- **CLOB-verified P&L** (14.2 hours): USDC balance $119.90 → **+$46.90 profit (+64% ROI)**
+- **107 CLOB trades**: 88 taker (our bot), 21 maker (whales hitting our GTC orders — bonus P&L)
+- **Paper trades**: 173 settled, 60.5% WR, +$20.15 P&L
+- **7 early exits**: +$16.20 P&L (significant contributor)
+- **~35 failed orders** (~32% fail rate, mostly 5-token minimum edge cases)
+- **Early exit selling**: Active on dedicated 1s loop, bid >= $0.90, no time restriction
+- **Live bankroll**: Synced from real CLOB USDC balance (startup + 30-min periodic)
 
 ## Early Exit Selling
 
 Sells live tokens before settlement when the outcome is nearly certain, locking in ~90%+ of max profit and eliminating last-second reversal risk.
 
 ### How It Works
-- `_monitor_early_exit()` in main.py runs every 3s poll cycle in the last 2 minutes of each window
-- Checks best bid price and depth for the active position's token
+- **Dedicated 1s loop** (`_early_exit_loop()`) — separate asyncio task, faster than 3s analysis cycle
+- `_monitor_early_exit()` checks best bid price and depth for the active position's token
 - **Trigger**: `bid >= 0.90` AND `depth >= 20 tokens` — **no time restriction** (triggers as soon as conditions met)
 - `sell_early_exit()` in LiveTrader places a GTC SELL market order via `MarketOrderArgs(token_id, round(tokens, 2), side=SELL)`
 - Amount = full token count (SELL expects tokens, not USDC). Requires >= 5 tokens.
+- `exit_failed` flag prevents retry spam (1s loop would retry every second without it)
 - On success: DB updated with `outcome="EARLY_EXIT"`, PnL recorded, Telegram alert sent
 
 ### Token Tracking
