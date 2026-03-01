@@ -866,6 +866,10 @@ class Orchestrator:
         await self._settle_stale_trades()
         await self._settle_stale_live_trades()
 
+        # Sync maker fills from CLOB on startup
+        if self.live_trader and self.live_trader.is_active:
+            await self._sync_maker_fills()
+
         while self._running:
             try:
                 await self._run_one_cycle()
@@ -1587,6 +1591,206 @@ class Orchestrator:
                 "UP" if btc_went_up else "DOWN", pnl,
             )
 
+    async def _sync_maker_fills(self) -> None:
+        """Sync maker fills from CLOB API into the DB.
+
+        Our GTC buy orders can get filled by other traders hitting them (maker
+        fills). These are real P&L that the DB doesn't track because we only
+        record taker orders we initiate. This method fetches all CLOB trades,
+        identifies maker fills, and inserts them into live_trades.
+        """
+        if not self.live_trader or not self.live_trader.is_active:
+            return
+
+        try:
+            all_trades = await self.live_trader.fetch_clob_trades()
+            if not all_trades:
+                return
+
+            maker_trades = [t for t in all_trades if t.get("trader_side") == "MAKER"]
+            if not maker_trades:
+                logger.info("Maker fill sync: 0 maker trades found")
+                return
+
+            # Get existing order_ids from DB to avoid duplicates.
+            # Maker fills don't have order_ids we placed, but each CLOB trade
+            # has a unique 'id' field. We store it as order_id in the DB.
+            existing = await self.db._db.execute(
+                "SELECT order_id FROM live_trades WHERE trade_tag = 'maker_fill'"
+            )
+            existing_ids = {row[0] for row in await existing.fetchall()}
+
+            new_fills = []
+            # Cache condition_id -> slug lookups
+            slug_cache: dict[str, str | None] = {}
+
+            # Our funder address (case-insensitive match against maker_orders)
+            our_addr = self.live_trader._funder_address.lower()
+
+            for trade in maker_trades:
+                trade_id = trade.get("id", "")
+                if trade_id in existing_ids:
+                    continue
+
+                # For MAKER trades, the top-level size/price is the TAKER's
+                # order. Our actual fill is in maker_orders where maker_address
+                # matches our funder. Extract our specific matched_amount.
+                maker_orders = trade.get("maker_orders", [])
+                our_fill = None
+                for mo in maker_orders:
+                    if mo.get("maker_address", "").lower() == our_addr:
+                        our_fill = mo
+                        break
+                if our_fill is None:
+                    continue
+
+                # Our fill details from the maker_orders sub-object
+                our_tokens = float(our_fill.get("matched_amount", 0))
+                our_price = float(our_fill.get("price", 0))
+                our_side = our_fill.get("outcome", "").upper()  # "Up" -> "UP"
+                if our_side not in ("UP", "DOWN") or our_tokens <= 0 or our_price <= 0:
+                    continue
+
+                amount_usdc = round(our_tokens * our_price, 2)
+                asset_id = trade.get("asset_id", "")
+
+                # Resolve condition_id -> slug
+                condition_id = trade.get("market", "")
+                if condition_id not in slug_cache:
+                    slug_cache[condition_id] = await self.live_trader.get_market_slug(condition_id)
+                    await asyncio.sleep(0.2)  # rate limit
+                slug = slug_cache.get(condition_id)
+                if not slug:
+                    continue
+
+                match_time = trade.get("match_time")
+                ts = int(match_time) * 1000 if match_time else int(time.time() * 1000)
+
+                new_fills.append({
+                    "timestamp": ts,
+                    "market_slug": slug,
+                    "side": our_side,
+                    "token_id": asset_id,
+                    "amount_usdc": amount_usdc,
+                    "order_id": trade_id,
+                    "entry_price": our_price,
+                })
+
+            if not new_fills:
+                logger.info("Maker fill sync: %d maker trades, 0 new", len(maker_trades))
+                return
+
+            # Insert new maker fills into DB
+            for fill in new_fills:
+                await self.db.save_live_trade(
+                    timestamp=fill["timestamp"],
+                    market_slug=fill["market_slug"],
+                    side=fill["side"],
+                    token_id=fill["token_id"],
+                    amount_usdc=fill["amount_usdc"],
+                    order_id=fill["order_id"],
+                    status="filled",
+                    success=True,
+                    entry_price=fill["entry_price"],
+                    trade_tag="maker_fill",
+                )
+
+            logger.info(
+                "Maker fill sync: inserted %d new maker fills (of %d total maker trades)",
+                len(new_fills), len(maker_trades),
+            )
+
+            # Now settle any unsettled maker fills using Gamma API resolutions
+            await self._settle_maker_fills_from_gamma()
+
+        except Exception:
+            logger.exception("Error in maker fill sync")
+
+    async def _settle_maker_fills_from_gamma(self) -> None:
+        """Settle unsettled maker fills by querying Gamma API for resolutions."""
+        import aiohttp as _aiohttp
+
+        unsettled = await self.db.get_unsettled_live_trades()
+        maker_unsettled = [r for r in unsettled if r.get("trade_tag") == "maker_fill"]
+        if not maker_unsettled:
+            return
+
+        slugs_to_check = {r["market_slug"] for r in maker_unsettled}
+        resolutions: dict[str, str] = {}
+
+        async with _aiohttp.ClientSession(
+            timeout=_aiohttp.ClientTimeout(total=10)
+        ) as session:
+            for slug in slugs_to_check:
+                try:
+                    url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+
+                    events = data if isinstance(data, list) else [data]
+                    if not events:
+                        continue
+                    market = events[0].get("markets", [{}])[0]
+                    if not market.get("closed"):
+                        continue
+
+                    outcomes = market.get("outcomes", [])
+                    if isinstance(outcomes, str):
+                        import json as _json
+                        outcomes = _json.loads(outcomes)
+                    prices = market.get("outcomePrices", [])
+                    if isinstance(prices, str):
+                        import json as _json
+                        prices = _json.loads(prices)
+
+                    up_idx = outcomes.index("Up") if "Up" in outcomes else None
+                    if up_idx is not None:
+                        up_price = float(prices[up_idx])
+                        if up_price >= 0.99:
+                            resolutions[slug] = "UP"
+                        elif up_price <= 0.01:
+                            resolutions[slug] = "DOWN"
+
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    continue
+
+        settled_count = 0
+        for row in maker_unsettled:
+            slug = row["market_slug"]
+            if slug not in resolutions:
+                continue
+
+            winner = resolutions[slug]
+            side = row["side"]
+            amount = row["amount_usdc"]
+            entry_price = row.get("entry_price") or 0.0
+
+            won = side == winner
+            outcome = "WIN" if won else "LOSS"
+
+            if entry_price > 0:
+                from data.polymarket import compute_fee_factor
+                fee_factor = compute_fee_factor(
+                    entry_price,
+                    self.live_trader._fee_rate,
+                    self.live_trader._fee_exponent,
+                )
+                shares = (amount / entry_price) * (1.0 - fee_factor)
+                pnl = (shares - amount) if won else -amount
+            else:
+                pnl = -amount if not won else 0.0
+
+            await self.db.update_live_trade(
+                row["id"], outcome, round(pnl, 4), int(time.time() * 1000)
+            )
+            settled_count += 1
+
+        if settled_count:
+            logger.info("Settled %d maker fills from Gamma API", settled_count)
+
     async def _build_live_info(self) -> Optional[dict]:
         """Build live trading info dict for stats summaries."""
         if not self.live_trader or not self.live_trader.is_active:
@@ -1733,6 +1937,10 @@ class Orchestrator:
                                 "Bankroll synced from CLOB: $%.2f (was $%.2f)",
                                 real_bal, old_br,
                             )
+
+                    # Sync maker fills from CLOB API
+                    if self.live_trader and self.live_trader.is_active:
+                        await self._sync_maker_fills()
 
                     # Log live stats
                     if self.live_trader and self.live_trader.is_active:

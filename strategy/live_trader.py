@@ -683,3 +683,40 @@ class LiveTrader:
             f"  Orders: {s['total']} ({s['successful']} filled, {s['failed']} failed)\n"
             f"  Total amount: ${s['total_amount']:.2f}"
         )
+
+    # ------------------------------------------------------------------
+    # CLOB trade sync — discover maker fills not tracked in DB
+    # ------------------------------------------------------------------
+
+    async def fetch_clob_trades(self) -> list[dict]:
+        """Fetch all trades from the CLOB API for this wallet.
+
+        Returns a list of trade dicts with fields: id, market, asset_id,
+        side, size, price, trader_side, match_time, outcome, etc.
+        """
+        if not self._active or self._client is None:
+            return []
+        try:
+            from py_clob_client.clob_types import TradeParams
+            trades = await asyncio.to_thread(
+                self._client.get_trades, TradeParams()
+            )
+            return trades if isinstance(trades, list) else []
+        except Exception:
+            logger.exception("Failed to fetch CLOB trades")
+            return []
+
+    async def get_market_slug(self, condition_id: str) -> str | None:
+        """Resolve a CLOB condition_id to a market slug."""
+        if not self._active or self._client is None:
+            return None
+        try:
+            market = await asyncio.to_thread(
+                self._client.get_market, condition_id
+            )
+            if isinstance(market, dict):
+                return market.get("market_slug")
+            return None
+        except Exception:
+            logger.debug("Failed to resolve condition_id %s", condition_id[:16])
+            return None
