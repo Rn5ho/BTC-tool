@@ -355,7 +355,7 @@ class PaperTrader:
         self, btc_start_price: float, btc_end_price: float
     ) -> None:
         """Settle every unsettled trade using the BTC price movement."""
-        btc_went_up = btc_end_price >= btc_start_price
+        btc_went_up = btc_end_price > btc_start_price  # strict: flat = DOWN on Polymarket
 
         # Pull unsettled rows from DB so we also catch trades that may have
         # been recorded in a previous session but not yet settled.

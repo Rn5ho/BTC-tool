@@ -259,6 +259,7 @@ class Orchestrator:
                 self.polymarket.run_chainlink_stream(), name="chainlink_stream"
             ),
             asyncio.create_task(self._analysis_loop(), name="analysis"),
+            asyncio.create_task(self._early_exit_loop(), name="early_exit"),
             asyncio.create_task(self._stats_loop(), name="stats"),
             asyncio.create_task(
                 self.alerter.run_command_listener(), name="telegram_cmds"
@@ -853,6 +854,21 @@ class Orchestrator:
                 logger.exception("Error in analysis cycle")
             await asyncio.sleep(3)  # poll every 3 seconds
 
+    async def _early_exit_loop(self) -> None:
+        """Dedicated 1-second loop for early exit monitoring.
+
+        Runs independently of the main 3-second analysis loop so we can
+        react faster to fleeting bid spikes in the last 2 minutes.
+        """
+        while self._running:
+            try:
+                await self._monitor_early_exit()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error in early exit loop")
+            await asyncio.sleep(1)
+
     async def _run_one_cycle(self) -> None:
         """Single iteration of the analysis pipeline."""
 
@@ -877,10 +893,6 @@ class Orchestrator:
                 self._window_btc_start or 0,
                 price_source,
             )
-
-        # 0b. Early exit monitoring — log bid prices for active positions
-        #     in the last 2 minutes of the window (data collection only).
-        await self._monitor_early_exit()
 
         # 1. Discover current Polymarket market
         market = await self.polymarket.discover_market()
@@ -1349,7 +1361,7 @@ class Orchestrator:
             logger.warning("Cannot settle — no BTC end price available")
             return
 
-        btc_went_up = btc_end >= self._window_btc_start
+        btc_went_up = btc_end > self._window_btc_start  # strict: flat = DOWN on Polymarket
         direction = "UP" if btc_went_up else "DOWN"
         delta = btc_end - self._window_btc_start
         logger.info(
@@ -1493,7 +1505,7 @@ class Orchestrator:
                 )
                 continue
 
-            btc_went_up = btc_end >= btc_start
+            btc_went_up = btc_end > btc_start  # strict: flat = DOWN on Polymarket
             side = row["side"]
             amount = row["amount_usdc"]
             entry_price = row.get("entry_price") or 0.0
@@ -1621,7 +1633,7 @@ class Orchestrator:
                 )
                 continue
 
-            btc_went_up = btc_end >= btc_start
+            btc_went_up = btc_end > btc_start  # strict: flat = DOWN on Polymarket
 
             # Load into paper_trader and use its settlement logic
             self.paper_trader._pending_trades[slug] = {
