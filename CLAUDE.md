@@ -4,7 +4,7 @@
 
 BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), uses a trained ML model to predict 5-minute BTC direction, and paper trades on Polymarket's binary UP/DOWN markets every 5-minute window. Telegram bot for alerts and interactive commands.
 
-**Status:** Deployed on Hetzner VPS in Helsinki, Finland (65.21.178.90) running 24/7 as a systemd service. ML model (RandomForestClassifier, 53.9% test accuracy on 34,100 samples) replaced the original rule-based model. Running in "always-trade" mode with hybrid adaptive bet sizing. **Live trading enabled and profitable** via py-clob-client with $5 max bet cap, direct CLOB API access (no proxy needed from Finland). Live trading decoupled from paper trading — independent bankroll, adaptive sizing, and settlement tracking. **Early exit selling** active on dedicated 1s loop: sells tokens when bid >= $0.90 to lock in profit before settlement. Bankroll synced from real CLOB balance. ~$73 real capital deposited, ~$120 portfolio (~64% ROI) across 100+ trades.
+**Status:** Deployed on Hetzner VPS in Helsinki, Finland (65.21.178.90) running 24/7 as a systemd service. ML model (RandomForestClassifier, 53.9% test accuracy on 34,100 samples) replaced the original rule-based model. Running in "always-trade" mode with hybrid adaptive bet sizing. **Live trading enabled and profitable** via py-clob-client with $5 max bet cap, direct CLOB API access (no proxy needed from Finland). Live trading decoupled from paper trading — independent bankroll, adaptive sizing, and settlement tracking. **Early exit selling** active on dedicated 1s loop: sells tokens when bid >= $0.95 to lock in profit before settlement. Bankroll synced from real CLOB balance. ~$73 real capital deposited, ~$120 portfolio (~64% ROI) across 100+ trades.
 
 ## Tech Stack
 
@@ -201,7 +201,7 @@ Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
                               ↓
                         Live Trader → real CLOB order → Telegram Alert
                               ↓
-                  Early Exit Monitor → sell at bid >= $0.90 → Telegram Alert
+                  Early Exit Monitor → sell at bid >= $0.95 → Telegram Alert
 ```
 
 ## ML Probability Model (v2 — Trained RandomForestClassifier)
@@ -344,7 +344,7 @@ Live trading places real GTC market buy orders on Polymarket alongside paper tra
 - Order type: GTC market buy via `MarketOrderArgs`+`create_market_order`
 - CLOB 5-token minimum: amount auto-bumped to `5 × entry_price` (~$2.50 at typical prices)
 - Retry with exponential backoff on 425 "Too Early" errors (matching engine restarts)
-- **Early exit selling**: `sell_early_exit()` sells tokens *before* resolution when bid >= $0.90. Replaces disabled post-resolution auto-sell. Unsold tokens claimed manually on polymarket.com.
+- **Early exit selling**: `sell_early_exit()` sells tokens *before* resolution when bid >= $0.95. Replaces disabled post-resolution auto-sell. Unsold tokens claimed manually on polymarket.com.
 - Candle prefetch from Binance REST API eliminates 30-min buffering delay on restart
 
 ### py-clob-client Quirks & Patches
@@ -431,7 +431,7 @@ ssh root@65.21.178.90 "tail -c 20000 /home/btcedge/BTC-tool/btc_edge.log | strin
    - **Binance WS**: Streams kline_1m, depth20, aggTrade, futures funding
    - **Chainlink RTDS**: Streams BTC/USD from Polymarket's data service
    - **Analysis loop**: Initializes window tracking, settles stale trades (paper + live), runs 3-second poll cycle, sends skip notifications via Telegram
-   - **Early exit loop**: Dedicated 1-second poll cycle monitoring bid prices for early exit selling (bid >= $0.90)
+   - **Early exit loop**: Dedicated 1-second poll cycle monitoring bid prices for early exit selling (bid >= $0.95)
    - **Stats loop**: Periodic stats report + CLOB bankroll sync every 30 minutes
    - **Telegram command listener**: Long-polls for incoming /commands
 
@@ -483,7 +483,7 @@ Runs 24/7 on Hetzner VPS in Helsinki, Finland at `65.21.178.90` (CX22 tier):
 
 11. **425 "Too Early" on order placement** (fixed): Matching engine restarts cause transient 425 errors. Fixed with exponential backoff retry (3 attempts, 3s/6s/12s delays).
 
-12. **Auto-sell fails on resolved markets** (known — mitigated): CLOB order book closes when 5-min markets resolve. Selling via CLOB after resolution doesn't work. **Mitigated by early exit selling**: tokens are sold *before* resolution when bid >= $0.90. Remaining unsold tokens (losers, low-bid winners) are claimed manually on polymarket.com.
+12. **Auto-sell fails on resolved markets** (known — mitigated): CLOB order book closes when 5-min markets resolve. Selling via CLOB after resolution doesn't work. **Mitigated by early exit selling**: tokens are sold *before* resolution when bid >= $0.95. Remaining unsold tokens (losers, low-bid winners) are claimed manually on polymarket.com.
 
 13. **SCP to wrong path shadows packages** (fixed): `scp alerts/telegram.py root@host:/home/btcedge/BTC-tool/` creates `telegram.py` in project root, shadowing the `telegram` package. Always SCP to the full subdirectory path.
 
@@ -530,7 +530,7 @@ From actual Polymarket CSV export:
 - **Paper trades**: 173 settled, 60.5% WR, +$20.15 P&L
 - **7 early exits**: +$16.20 P&L (significant contributor)
 - **~35 failed orders** (~32% fail rate, mostly 5-token minimum edge cases)
-- **Early exit selling**: Active on dedicated 1s loop, bid >= $0.90, no time restriction
+- **Early exit selling**: Active on dedicated 1s loop, bid >= $0.95, no time restriction
 - **Live bankroll**: Synced from real CLOB USDC balance (startup + 30-min periodic)
 
 ## Early Exit Selling
@@ -540,7 +540,7 @@ Sells live tokens before settlement when the outcome is nearly certain, locking 
 ### How It Works
 - **Dedicated 1s loop** (`_early_exit_loop()`) — separate asyncio task, faster than 3s analysis cycle
 - `_monitor_early_exit()` checks best bid price and depth for the active position's token
-- **Trigger**: `bid >= 0.90` AND `depth >= 20 tokens` — **no time restriction** (triggers as soon as conditions met)
+- **Trigger**: `bid >= 0.95` AND `depth >= 20 tokens` — **no time restriction** (triggers as soon as conditions met)
 - `sell_early_exit()` in LiveTrader places a GTC SELL market order via `MarketOrderArgs(token_id, round(tokens, 2), side=SELL)`
 - Amount = full token count (SELL expects tokens, not USDC). Requires >= 5 tokens.
 - `exit_failed` flag prevents retry spam (1s loop would retry every second without it)
