@@ -285,7 +285,7 @@ The edge detector (`strategy/edge.py`) supports two modes:
 ### Safety Filters (both modes)
 1. **Min confidence** (`MIN_CONFIDENCE=0.015`): Skip when |P(up) - 0.5| below threshold (always-trade mode)
 2. **Max edge cap** (`MAX_EDGE_THRESHOLD=0.18`): Edges above 18% are rejected as model error (classic mode only; disabled in always-trade mode — edge size doesn't predict WR)
-3. **Entry price filter**: Reject entry prices outside 0.35-0.65 range (data shows 0.50-0.60 = 64% WR, above 0.65 drops to ~47%, below 0.35 = thin book/contrarian). **Note**: 0.35 floor may be too tight — causes long no-trade stretches when market trends. Revisit with WR data for the 0.30-0.35 bucket after collecting more samples.
+3. **Entry price filter**: Hard reject outside 0.25-0.65. Core range 0.35-0.65 uses normal sizing. **Exploration range 0.25-0.35**: traded at minimum size ($1 paper / $3.50 live) to collect WR data, tagged `trade_tag="exploration"` in DB.
 4. **Time gate** (`_MAX_ENTRY_SECONDS=120`): Only enter in first 2 minutes of 5-min window
 5. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
 6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT=0.15`): Skip if BTC moved >0.15% against our signal direction within current window
@@ -353,6 +353,7 @@ Live trading places real GTC market buy orders on Polymarket alongside paper tra
 - **FOK fails on thin books**: FOK orders require immediate full fill. 5-min binary markets are thin. Use GTC instead.
 - **Balance API**: `get_balance_allowance()` requires `BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)` — no default.
 - **pydantic-settings vs os.environ**: pydantic-settings reads .env but does NOT set OS env vars. Use `settings.clob_proxy` not `os.environ.get("CLOB_PROXY")`.
+- **SELL amount semantics**: `MarketOrderArgs(amount, side=SELL)` expects **token count**, not USDC. For BUY, amount = USDC to spend. For SELL, amount = tokens to sell. Passing USDC value for SELL causes partial fills.
 
 ### Geoblock — Not Applicable
 - VPS is in Helsinki, Finland — Polymarket CLOB API is accessible directly (no geoblock)
@@ -483,6 +484,8 @@ Runs 24/7 on Hetzner VPS in Helsinki, Finland at `65.21.178.90` (CX22 tier):
 
 14. **CLOB fill price shift causes <5 token failure** (fixed): Entry price signal was $0.385 but CLOB filled at ~$0.47, reducing token count below 5-token minimum. Fixed with `$3.50` hard floor: `min_usdc = max(round(5.5 * price, 2), 3.50)` guarantees 5 tokens at any fill price up to $0.70.
 
+15. **SELL MarketOrderArgs amount = token count, not USDC** (fixed): `MarketOrderArgs(amount, side=SELL)` expects token count. Early exit was passing `tokens × bid` (USDC value), causing the CLOB to sell fewer tokens and leave a residual position behind. Fixed to pass `round(tokens, 2)` directly.
+
 ## Conventions
 
 - All async — use `async def` and `await` consistently
@@ -518,8 +521,8 @@ Sells live tokens before settlement when the outcome is nearly certain, locking 
 - `_monitor_early_exit()` in main.py runs every 3s poll cycle in the last 2 minutes of each window
 - Checks best bid price and depth for the active position's token
 - **Trigger**: `bid >= 0.90` AND `depth >= 20 tokens` — **no time restriction** (triggers as soon as conditions met)
-- `sell_early_exit()` in LiveTrader places a GTC SELL market order via `MarketOrderArgs(token_id, sell_amount, side=SELL)`
-- Sell amount: `round(tokens × best_bid, 2)`, minimum $1.00, requires >= 5 tokens
+- `sell_early_exit()` in LiveTrader places a GTC SELL market order via `MarketOrderArgs(token_id, round(tokens, 2), side=SELL)`
+- Amount = full token count (SELL expects tokens, not USDC). Requires >= 5 tokens.
 - On success: DB updated with `outcome="EARLY_EXIT"`, PnL recorded, Telegram alert sent
 
 ### Token Tracking
@@ -541,7 +544,7 @@ Sells live tokens before settlement when the outcome is nearly certain, locking 
 
 ## Potential Next Steps
 
-- **Widen entry price filter**: 0.35 floor may be too aggressive — causes long no-trade stretches when market trends (entry prices stuck at 0.29-0.34). Consider widening to 0.30-0.65 after collecting WR data for 0.30-0.35 bucket.
+- **Analyze exploration trades**: After a few days, compare WR for `trade_tag='exploration'` (0.25-0.35) vs normal trades. If WR is viable, promote to full sizing. Query: `SELECT trade_tag, COUNT(*), AVG(CASE WHEN outcome='WIN' THEN 1.0 ELSE 0.0 END) as wr FROM paper_trades GROUP BY trade_tag`
 - **On-chain token redemption**: Implement `redeemPositions()` via web3.py on the CTF contract to auto-claim winning tokens. Needs conditionId from market data, MATIC for gas.
 - **Model retraining**: Retrain periodically as market dynamics shift. Pipeline is ready (`ml_pipeline.py`), takes ~25 min.
 - **Feature expansion**: Liquidation data, funding rate momentum, cross-exchange flows, order book depth imbalance at multiple levels.
