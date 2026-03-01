@@ -1400,15 +1400,16 @@ class Orchestrator:
         )
 
         # Notify on skipped windows
-        if not self._window_traded and self._window_skip_reason and self.alerter:
+        if not self._window_traded and self.alerter:
+            reason = self._window_skip_reason or "no signal from model"
             try:
                 await self.alerter._send(
                     f"<b>SKIPPED</b> {self._current_slug}\n"
-                    f"Reason: {self._window_skip_reason}\n"
+                    f"Reason: {reason}\n"
                     f"BTC: ${self._window_btc_start:,.2f} -> ${btc_end:,.2f} ({direction})"
                 )
             except Exception:
-                pass
+                logger.exception("Failed to send skip notification")
 
         if self.paper_trader:
             await self.paper_trader.settle_all_pending(
