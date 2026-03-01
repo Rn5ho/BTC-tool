@@ -180,16 +180,89 @@ class TelegramAlerter:
         )
         await self._send(text)
 
-    async def send_stats_summary(self, stats: dict) -> None:
-        """Send a periodic statistics summary."""
+    async def send_stats_summary(
+        self, stats: dict, live_info: Optional[dict] = None
+    ) -> None:
+        """Send a periodic statistics summary with optional live trading info."""
         text = (
             f"\U0001f4c8 <b>STATS UPDATE</b>\n\n"
+            f"<b>Paper Trading:</b>\n"
             f"Trades: {stats.get('total_trades', 0)} | Settled: {stats.get('settled_trades', 0)}\n"
             f"Win rate: {stats.get('win_rate', 0):.1%}\n"
-            f"Total P&amp;L: ${stats.get('total_pnl', 0):+.2f}\n"
+            f"P&amp;L: ${stats.get('total_pnl', 0):+.2f}\n"
             f"Bankroll: ${stats.get('bankroll', 0):.2f}\n"
             f"ROI: {stats.get('roi', 0):+.1%}"
         )
+
+        if live_info:
+            balance = live_info.get("balance")
+            db = live_info.get("db_stats", {})
+            session = live_info.get("session", {})
+            text += "\n\n\U0001f4b5 <b>Live Trading:</b>\n"
+            if balance is not None:
+                text += f"USDC Balance: <b>${balance:.2f}</b>\n"
+            text += (
+                f"Session: {session.get('successful', 0)} filled / "
+                f"{session.get('total', 0)} total (${session.get('total_amount', 0):.2f})\n"
+                f"All-time: {db.get('successful', 0)} filled / "
+                f"{db.get('total', 0)} total (${db.get('total_amount', 0):.2f})"
+            )
+
+        await self._send(text)
+
+    async def send_live_trade_alert(
+        self,
+        side: str,
+        slug: str,
+        amount: float,
+        order_id: str | None,
+        success: bool,
+        error_msg: str = "",
+    ) -> None:
+        """Send a live trade placement notification."""
+        if success:
+            text = (
+                f"\U0001f4b5 <b>LIVE TRADE PLACED</b>\n\n"
+                f"Market: {slug}\n"
+                f"Side: {side}\n"
+                f"Amount: ${amount:.2f}\n"
+                f"Order ID: {order_id or 'N/A'}"
+            )
+        else:
+            text = (
+                f"\u274c <b>LIVE TRADE FAILED</b>\n\n"
+                f"Market: {slug}\n"
+                f"Side: {side}\n"
+                f"Amount: ${amount:.2f}\n"
+                f"Error: {error_msg}"
+            )
+        await self._send(text)
+
+    async def send_live_settlement_alert(
+        self,
+        slug: str,
+        side: str,
+        outcome: str,
+        amount: float,
+        entry_price: float = 0.0,
+    ) -> None:
+        """Send a live trade settlement notification."""
+        if outcome == "WIN":
+            # Estimate profit: tokens × $1 - cost
+            tokens = amount / entry_price if entry_price > 0 else 0
+            profit = tokens - amount if tokens > 0 else 0
+            text = (
+                f"\u2705 <b>LIVE WIN</b>\n\n"
+                f"Market: {slug}\n"
+                f"Side: {side} | Cost: ${amount:.2f}\n"
+                f"Est. profit: ${profit:.2f}"
+            )
+        else:
+            text = (
+                f"\u274c <b>LIVE LOSS</b>\n\n"
+                f"Market: {slug}\n"
+                f"Side: {side} | Lost: ${amount:.2f}"
+            )
         await self._send(text)
 
     async def send_error_alert(self, error: str) -> None:

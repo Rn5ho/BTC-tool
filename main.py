@@ -7,6 +7,7 @@ mispricing exceeds the configured threshold, and sends Telegram alerts.
 """
 
 import asyncio
+import json
 import logging
 import signal
 import sys
@@ -105,8 +106,10 @@ class Orchestrator:
             fee_rate=settings.polymarket_fee_rate,
             fee_exponent=settings.polymarket_fee_exponent,
             always_trade=settings.always_trade,
+            min_confidence=settings.min_confidence,
         )
         self.paper_trader = None  # initialized in start()
+        self.live_trader = None   # initialized in start() when LIVE_TRADING=true
         self.alerter = None       # initialized in start()
 
         # State
@@ -132,6 +135,9 @@ class Orchestrator:
         self._MAX_EDGE: float = settings.max_edge_threshold
         # Skip when any single signal is near the +-0.5 saturation limits.
         self._MAX_SIGNAL_VALUE: float = settings.max_signal_value
+
+        # Live trade tracking — maps slug → {side, token_id} for auto-sell after settlement
+        self._live_trade_tokens: dict[str, dict] = {}
 
         # Heartbeat tracking — avoids flooding the console
         self._cycle_count: int = 0
@@ -186,6 +192,29 @@ class Orchestrator:
         )
         await self.paper_trader.restore_bankroll()
 
+        # Live trader (real Polymarket orders via py-clob-client)
+        if settings.live_trading:
+            from strategy.live_trader import LiveTrader, CLOB_AVAILABLE
+            if CLOB_AVAILABLE:
+                self.live_trader = LiveTrader(
+                    private_key=settings.polymarket_private_key,
+                    funder_address=settings.polymarket_funder_address,
+                    max_bet_usdc=settings.max_live_bet_usdc,
+                )
+                ok = await self.live_trader.initialize()
+                if ok:
+                    logger.info(
+                        "LIVE TRADING ENABLED — max bet $%.2f",
+                        settings.max_live_bet_usdc,
+                    )
+                else:
+                    logger.error("Live trader failed to initialize — running paper-only")
+                    self.live_trader = None
+            else:
+                logger.warning(
+                    "LIVE_TRADING=true but py-clob-client not installed — paper-only"
+                )
+
         # Telegram alerter
         from alerts.telegram import TelegramAlerter
         self.alerter = TelegramAlerter(
@@ -193,10 +222,22 @@ class Orchestrator:
             chat_id=settings.telegram_chat_id,
         )
         await self.alerter.start()
+        if self.live_trader and self.live_trader.is_active:
+            await self.alerter._send(
+                "\U0001f4b5 <b>LIVE TRADING ENABLED</b>\n\n"
+                f"Max bet: ${settings.max_live_bet_usdc:.2f}\n"
+                "Paper trading continues in parallel."
+            )
         self._register_bot_commands()
 
         # Polymarket session
         await self.polymarket.start()
+
+        # Prefetch recent candles from Binance REST API so the ML model
+        # can run immediately without waiting 30+ min for WS candles.
+        prefetched = await self.binance.prefetch_candles(count=35)
+        if prefetched >= 30:
+            logger.info("Prefetch complete — %d candles ready, skipping buffering wait", prefetched)
 
         # Register Binance callback for candle persistence
         self.binance.on("candle_closed", self._on_candle_closed)
@@ -212,6 +253,7 @@ class Orchestrator:
             asyncio.create_task(
                 self.alerter.run_command_listener(), name="telegram_cmds"
             ),
+            asyncio.create_task(self._proxy_watchdog(), name="proxy_watchdog"),
         ]
 
         logger.info("All tasks launched — entering main loop")
@@ -259,6 +301,8 @@ class Orchestrator:
         self.alerter.register_command("regime", self._cmd_regime)
         self.alerter.register_command("analyze", self._cmd_analyze)
         self.alerter.register_command("spread", self._cmd_spread)
+        self.alerter.register_command("balance", self._cmd_balance)
+        self.alerter.register_command("livetrades", self._cmd_livetrades)
 
     async def _cmd_status(self, args: str = "") -> str:
         """Handle /status — current BTC price, model output, market odds."""
@@ -293,11 +337,15 @@ class Orchestrator:
         state = "\u23f8 PAUSED" if self._paused else "\u25b6 ACTIVE"
         model_type = "ML" if self._use_ml else "Rule-based"
         mode = "always-trade" if settings.always_trade else "edge-threshold"
+        live_str = ""
+        if self.live_trader and self.live_trader.is_active:
+            live_status = "PAUSED" if self.live_trader.is_paused else "ACTIVE"
+            live_str = f"\nLive trading: <b>{live_status}</b> (max ${settings.max_live_bet_usdc:.2f})"
 
         return (
             f"\U0001f4ca <b>STATUS</b>\n\n"
             f"State: <b>{state}</b>\n"
-            f"Model: {model_type} ({mode})\n"
+            f"Model: {model_type} ({mode}){live_str}\n"
             f"BTC (Binance): <b>${btc:,.2f}</b>\n"
             f"BTC (Chainlink): {f'<b>${chainlink:,.2f}</b>' if chainlink else 'N/A'}\n"
             f"Window: {slug}\n"
@@ -427,6 +475,8 @@ class Orchestrator:
         if self._paused:
             return "\u23f8 Already paused. Use /resume to restart trading."
         self._paused = True
+        if self.live_trader:
+            self.live_trader.pause()
         logger.info("Trading PAUSED via Telegram command")
         return (
             "\u23f8 <b>Trading PAUSED</b>\n\n"
@@ -441,6 +491,8 @@ class Orchestrator:
         if not self._paused:
             return "\u25b6 Already running. Trading is active."
         self._paused = False
+        if self.live_trader:
+            self.live_trader.resume()
         logger.info("Trading RESUMED via Telegram command")
         return (
             "\u25b6 <b>Trading RESUMED</b>\n\n"
@@ -641,6 +693,54 @@ class Orchestrator:
             f"<b>DOWN token:</b>\n{_fmt_book('DOWN', down_book, down_price)}"
         )
 
+    async def _cmd_balance(self, args: str = "") -> str:
+        """Handle /balance — show USDC balance and live trading summary."""
+        if not self.live_trader or not self.live_trader.is_active:
+            return "\u26a0 Live trading is not enabled."
+        balance = await self.live_trader.get_balance()
+        if balance is None:
+            return "\u26a0 Failed to fetch balance."
+        db_stats = await self.db.get_live_trade_stats()
+        session = self.live_trader.get_session_summary()
+        pending = len(self._live_trade_tokens)
+        return (
+            f"\U0001f4b0 <b>POLYMARKET BALANCE</b>\n\n"
+            f"USDC: <b>${balance:.2f}</b>\n"
+            f"Max bet: ${settings.max_live_bet_usdc:.2f}\n"
+            f"Pending claims: {pending}\n\n"
+            f"<b>Session:</b> {session['successful']} filled / "
+            f"{session['total']} total (${session['total_amount']:.2f})\n"
+            f"<b>All-time:</b> {db_stats['successful']} filled / "
+            f"{db_stats['total']} total (${db_stats['total_amount']:.2f})"
+        )
+
+    async def _cmd_livetrades(self, args: str = "") -> str:
+        """Handle /livetrades — show live trade stats."""
+        if not self.live_trader or not self.live_trader.is_active:
+            # Fall back to DB stats even if trader not active this session
+            db_stats = await self.db.get_live_trade_stats()
+            if db_stats["total"] == 0:
+                return "\u26a0 No live trades recorded."
+            return (
+                f"\U0001f4b5 <b>LIVE TRADES (DB)</b>\n\n"
+                f"Total: {db_stats['total']}\n"
+                f"Successful: {db_stats['successful']}\n"
+                f"Failed: {db_stats['failed']}\n"
+                f"Total amount: ${db_stats['total_amount']:.2f}"
+            )
+
+        summary = self.live_trader.get_session_summary()
+        db_stats = await self.db.get_live_trade_stats()
+        return (
+            f"\U0001f4b5 <b>LIVE TRADES</b>\n\n"
+            f"<b>This session:</b>\n"
+            f"  Orders: {summary['total']} ({summary['successful']} filled)\n"
+            f"  Amount: ${summary['total_amount']:.2f}\n\n"
+            f"<b>All time (DB):</b>\n"
+            f"  Total: {db_stats['total']} ({db_stats['successful']} filled)\n"
+            f"  Amount: ${db_stats['total_amount']:.2f}"
+        )
+
     # ------------------------------------------------------------------
     # Main analysis loop
     # ------------------------------------------------------------------
@@ -649,18 +749,21 @@ class Orchestrator:
         """Run the feature → probability → edge → trade pipeline every cycle."""
 
         # Wait for Binance to accumulate some data first
+        min_candles = 30 if self._use_ml else 5
         logger.info(
-            "Waiting for initial data from Binance (need 5 closed 1-min candles, ~5 min) ..."
+            "Waiting for initial data from Binance (need %d closed 1-min candles) ...",
+            min_candles,
         )
         last_count = 0
-        while self._running and len(self.binance.candles) < 5:
+        while self._running and len(self.binance.candles) < min_candles:
             count = len(self.binance.candles)
             price = self.binance.get_latest_price()
             trades = len(self.binance.recent_trades)
             if count != last_count or last_count == 0:
                 logger.info(
-                    "Buffering: %d/5 candles | BTC: %s | trades: %d | orderbook: %s",
+                    "Buffering: %d/%d candles | BTC: %s | trades: %d | orderbook: %s",
                     count,
+                    min_candles,
                     f"${price:,.2f}" if price else "waiting...",
                     trades,
                     "yes" if self.binance.orderbook else "no",
@@ -960,6 +1063,64 @@ class Orchestrator:
                     midpoint_price=signal.get("midpoint_price"),
                 )
 
+        # Live trade — place real order on Polymarket
+        if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused:
+            # Determine token ID from market
+            if market:
+                token_id = (
+                    market.up_token_id if signal["side"] == "UP"
+                    else market.down_token_id
+                )
+                # Use paper trader's adaptive sizing, capped by max_live_bet
+                live_amount = self.paper_trader.compute_bet_size(
+                    signal["our_prob"],
+                    signal["market_prob"],
+                    confidence=signal.get("confidence", 0.0),
+                )
+                live_amount = max(1.00, min(live_amount, settings.max_live_bet_usdc))
+
+                live_result = await self.live_trader.place_order(
+                    token_id=token_id,
+                    amount_usdc=live_amount,
+                    side=signal["side"],
+                    market_slug=signal["market_slug"],
+                    entry_price=signal["entry_price"],
+                )
+
+                # Track token for auto-sell after settlement
+                if live_result["success"]:
+                    self._live_trade_tokens[signal["market_slug"]] = {
+                        "side": signal["side"],
+                        "token_id": token_id,
+                        "amount": live_result["amount"],
+                        "entry_price": signal["entry_price"],
+                    }
+
+                # Persist to DB
+                await self.db.save_live_trade(
+                    timestamp=int(time.time() * 1000),
+                    market_slug=signal["market_slug"],
+                    side=signal["side"],
+                    token_id=token_id,
+                    amount_usdc=live_result["amount"],
+                    order_id=live_result.get("order_id"),
+                    status="filled" if live_result["success"] else "failed",
+                    success=live_result["success"],
+                    response_json=json.dumps(live_result.get("response"))
+                    if live_result.get("response") else None,
+                )
+
+                # Telegram alert
+                if self.alerter:
+                    await self.alerter.send_live_trade_alert(
+                        side=signal["side"],
+                        slug=signal["market_slug"],
+                        amount=live_result["amount"],
+                        order_id=live_result.get("order_id"),
+                        success=live_result["success"],
+                        error_msg=live_result.get("error", ""),
+                    )
+
         # Telegram edge alert (only fires once per market — when trade is placed)
         if self.alerter:
             await self.alerter.send_edge_alert(
@@ -1020,8 +1181,64 @@ class Orchestrator:
                 stats.get("bankroll", 0),
             )
 
+        # Auto-sell winning live trade tokens to reclaim USDC.
+        # Runs as a background task with initial delay so it doesn't block
+        # the next window's trade placement.
+        slug = self._current_slug
+        if slug and slug in self._live_trade_tokens and self.live_trader:
+            live_info = self._live_trade_tokens.pop(slug)
+            trade_won = (live_info["side"] == "UP" and btc_went_up) or \
+                        (live_info["side"] == "DOWN" and not btc_went_up)
+
+            # Notify live trade settlement via Telegram
+            if self.alerter:
+                outcome = "WIN" if trade_won else "LOSS"
+                amt = live_info.get("amount", 0)
+                await self.alerter.send_live_settlement_alert(
+                    slug=slug,
+                    side=live_info["side"],
+                    outcome=outcome,
+                    amount=amt,
+                    entry_price=live_info.get("entry_price", 0),
+                )
+
+            if trade_won:
+                asyncio.create_task(
+                    self._delayed_auto_sell(slug, live_info)
+                )
+
             if self.alerter:
                 await self.alerter.send_stats_summary(stats)
+
+    async def _delayed_auto_sell(self, slug: str, live_info: dict) -> None:
+        """Background task: wait for matching engine, then auto-sell winning tokens.
+
+        Waits 10 seconds before the first attempt to give the matching engine
+        time to restart after market resolution. The sell_winning_tokens method
+        itself has retry logic with exponential backoff.
+        """
+        await asyncio.sleep(10)
+        logger.info(
+            "Auto-selling winning tokens for %s (%s)",
+            slug, live_info["side"],
+        )
+        sell_result = await self.live_trader.sell_winning_tokens(
+            token_id=live_info["token_id"],
+            market_slug=slug,
+            buy_amount_usdc=live_info.get("amount", 0.0),
+            buy_price=live_info.get("entry_price", 0.0),
+        )
+        if sell_result["success"]:
+            logger.info("Auto-sell successful — USDC reclaimed for %s", slug)
+        else:
+            logger.warning(
+                "Auto-sell failed for %s: %s — claim on polymarket.com",
+                slug, sell_result["error"],
+            )
+            if self.alerter:
+                await self.alerter.send_error_alert(
+                    f"Auto-sell failed for {slug} — claim manually on polymarket.com"
+                )
 
     async def _settle_stale_trades(self) -> None:
         """Settle any unsettled trades from previous sessions whose windows have ended.
@@ -1112,12 +1329,110 @@ class Orchestrator:
                     stats = await self.paper_trader.get_stats()
                     report = self.paper_trader.format_stats_report(stats)
                     logger.info("\n%s", report)
+
+                    # Attach live trading info if available
+                    live_info = None
+                    if self.live_trader and self.live_trader.is_active:
+                        balance = await self.live_trader.get_balance()
+                        db_stats = await self.db.get_live_trade_stats()
+                        session = self.live_trader.get_session_summary()
+                        live_info = {
+                            "balance": balance,
+                            "db_stats": db_stats,
+                            "session": session,
+                        }
+
                     if self.alerter:
-                        await self.alerter.send_stats_summary(stats)
+                        await self.alerter.send_stats_summary(
+                            stats, live_info=live_info
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Error in stats loop")
+
+    async def _proxy_watchdog(self) -> None:
+        """Monitor SOCKS5 proxy health and auto-pause live trading if it goes down.
+
+        Checks the proxy every 2 minutes by doing a lightweight TCP connect
+        to the SOCKS5 port.  When the proxy drops, live_trader is paused and
+        a Telegram alert is sent.  When the proxy comes back, live trading
+        is resumed automatically.
+        """
+        import os
+        proxy_url = os.environ.get("CLOB_PROXY", settings.clob_proxy)
+        if not proxy_url or not self.live_trader:
+            return  # No proxy configured or no live trading — nothing to watch
+
+        # Parse host:port from socks5://host:port
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(proxy_url)
+            proxy_host = parsed.hostname or "127.0.0.1"
+            proxy_port = parsed.port or 1080
+        except Exception:
+            proxy_host, proxy_port = "127.0.0.1", 1080
+
+        proxy_was_down = False
+        CHECK_INTERVAL = 120  # 2 minutes
+
+        # Wait for initial buffering to finish before starting checks
+        await asyncio.sleep(30)
+
+        while self._running:
+            try:
+                # Quick TCP connect to check if SOCKS5 port is open
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(proxy_host, proxy_port),
+                        timeout=5.0,
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+                    proxy_up = True
+                except (OSError, asyncio.TimeoutError):
+                    proxy_up = False
+
+                if not proxy_up and not proxy_was_down:
+                    # Proxy just went down — pause live trading
+                    proxy_was_down = True
+                    if self.live_trader and not self.live_trader.is_paused:
+                        self.live_trader.pause()
+                        logger.warning(
+                            "PROXY DOWN — live trading auto-paused (SOCKS5 %s:%d unreachable)",
+                            proxy_host, proxy_port,
+                        )
+                        if self.alerter:
+                            await self.alerter._send(
+                                "\u26a0 <b>PROXY DOWN</b>\n\n"
+                                "SOCKS5 proxy unreachable.\n"
+                                "Live trading auto-paused.\n"
+                                "Paper trading continues.\n\n"
+                                "Reconnect the SSH tunnel to resume."
+                            )
+
+                elif proxy_up and proxy_was_down:
+                    # Proxy recovered — resume live trading
+                    proxy_was_down = False
+                    if self.live_trader and self.live_trader.is_paused and not self._paused:
+                        self.live_trader.resume()
+                        logger.info(
+                            "PROXY RESTORED — live trading auto-resumed (SOCKS5 %s:%d)",
+                            proxy_host, proxy_port,
+                        )
+                        if self.alerter:
+                            await self.alerter._send(
+                                "\u2705 <b>PROXY RESTORED</b>\n\n"
+                                "SOCKS5 proxy is back.\n"
+                                "Live trading auto-resumed."
+                            )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error in proxy watchdog")
+
+            await asyncio.sleep(CHECK_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
