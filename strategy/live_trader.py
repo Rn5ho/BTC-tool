@@ -523,26 +523,27 @@ class LiveTrader:
             result["error"] = "LiveTrader not active"
             return result
 
-        sell_amount = round(tokens * best_bid, 2)
-        sell_amount = max(sell_amount, 1.00)  # CLOB $1 floor
-
         # CLOB 5-token minimum applies to sells too
         if tokens < 5:
             result["error"] = f"Token count {tokens:.2f} below CLOB 5-token minimum"
             logger.warning("Skipping early exit — %s", result["error"])
             return result
 
-        result["sell_amount"] = sell_amount
+        # For SELL MarketOrderArgs, amount = TOKEN COUNT (not USDC).
+        # Pass our full token count so the CLOB sells the entire position.
+        # Expected USDC proceeds = tokens × best_bid (for PnL tracking).
+        expected_usdc = round(tokens * best_bid, 2)
+        result["sell_amount"] = expected_usdc
 
         logger.info(
-            "Placing EARLY EXIT SELL: %s %.1f tokens @ bid $%.3f = $%.2f on %s",
-            token_id[:16], tokens, best_bid, sell_amount, market_slug,
+            "Placing EARLY EXIT SELL: %s %.1f tokens @ bid $%.3f = ~$%.2f on %s",
+            token_id[:16], tokens, best_bid, expected_usdc, market_slug,
         )
 
         try:
             order_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=sell_amount,
+                amount=round(tokens, 2),  # token count, not USDC
                 side=SELL,
             )
             signed_order = await asyncio.to_thread(
