@@ -359,6 +359,7 @@ class LiveTrader:
         side: str,
         market_slug: str = "",
         entry_price: float = 0.0,
+        exploration: bool = False,
     ) -> dict:
         """Place a GTC market buy order on Polymarket.
 
@@ -376,6 +377,10 @@ class LiveTrader:
         entry_price : float
             Token price from orderbook. Used to compute minimum USDC
             needed to meet the CLOB 5-token minimum order size.
+        exploration : bool
+            If True, use a lower USDC floor ($2.00 instead of $3.50) since
+            exploration trades are at low entry prices (0.25-0.35) where
+            even $2 buys 5+ tokens.
 
         Returns
         -------
@@ -401,11 +406,12 @@ class LiveTrader:
         # CLOB requires minimum 5 tokens per order.
         # MarketOrderArgs fills at the current best ask, which can shift
         # significantly from our entry_price signal in volatile 5-min markets.
-        # Worst case: entry price filter allows up to 0.65, so we need at
-        # least 5 × 0.65 = $3.25.  Use $3.50 as a hard floor to guarantee
-        # 5 tokens with margin at any price in our 0.35-0.65 range.
+        # Normal trades: $3.50 floor guarantees 5 tokens up to $0.70 fill.
+        # Exploration trades (entry 0.25-0.35): $2.00 floor is sufficient
+        # since 5 × 0.40 = $2.00, giving margin even if fill price shifts.
         price = entry_price if entry_price > 0 else 0.50
-        min_usdc = max(round(5.5 * price, 2), 3.50)
+        usdc_floor = 2.00 if exploration else 3.50
+        min_usdc = max(round(5.5 * price, 2), usdc_floor)
         amount_usdc = round(max(amount_usdc, min_usdc), 2)
 
         # Ensure amount is at least $1.00 after rounding (CLOB minimum for
@@ -566,7 +572,7 @@ class LiveTrader:
 
             logger.info(
                 "EARLY EXIT FILLED: %s $%.2f order=%s on %s",
-                token_id[:16], sell_amount, result["order_id"], market_slug,
+                token_id[:16], expected_usdc, result["order_id"], market_slug,
             )
 
         except Exception as exc:

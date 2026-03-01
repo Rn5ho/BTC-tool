@@ -342,13 +342,19 @@ class Orchestrator:
         p_up_str = "N/A"
         if candles >= 5:
             try:
-                feature_vec = self.features.compute_features(
-                    candles=self.binance.get_candles(n=50),
-                    orderbook=self.binance.orderbook,
-                    trades=list(self.binance.recent_trades),
-                    funding=self.binance.funding,
-                )
-                p_up = self.model.predict(feature_vec)
+                if self._use_ml and hasattr(self.model, "predict_from_candles"):
+                    window_ts = int(self._window_start_time) if self._window_start_time else int(time.time())
+                    p_up = self.model.predict_from_candles(
+                        self.binance.get_candles(n=50), window_ts
+                    )
+                else:
+                    feature_vec = self.features.compute_features(
+                        candles=self.binance.get_candles(n=50),
+                        orderbook=self.binance.orderbook,
+                        trades=list(self.binance.recent_trades),
+                        funding=self.binance.funding,
+                    )
+                    p_up = self.model.predict(feature_vec)
                 p_up_str = f"{p_up:.1%}"
             except Exception:
                 pass
@@ -1145,9 +1151,9 @@ class Orchestrator:
                     else market.down_token_id
                 )
                 # Use live trader's own adaptive sizing (based on live bankroll)
-                # Exploration trades: minimum size ($3.50 floor) for data collection
+                # Exploration trades: minimum size for data collection
                 if signal.get("exploration"):
-                    live_amount = 3.50
+                    live_amount = 2.00
                 else:
                     live_amount = self.live_trader.compute_bet_size(
                         confidence=signal.get("confidence", 0.0),
@@ -1159,6 +1165,7 @@ class Orchestrator:
                     side=signal["side"],
                     market_slug=signal["market_slug"],
                     entry_price=signal["entry_price"],
+                    exploration=bool(signal.get("exploration")),
                 )
 
                 # Persist to DB first (to get row ID for early exit tracking)
@@ -1308,14 +1315,15 @@ class Orchestrator:
 
         # ---- EARLY EXIT TRIGGER ----
         # Sell live tokens when bid is high enough to lock in profit.
-        # No time restriction — if someone offers 90%+ value at any point
-        # in the last 2 minutes, take it rather than risk a reversal.
+        # No time restriction — if someone offers 95%+ value at any point,
+        # take it rather than risk a reversal.  Backtest on 288 windows showed
+        # 0.95 is optimal: +$9.16 vs baseline (0.90 was only +$3.77).
         available_depth = best_bid_size + total_deep_size
         if (live_pos
                 and not live_pos.get("exited")
                 and not live_pos.get("exit_failed")
                 and self.live_trader
-                and best_bid >= 0.90
+                and best_bid >= 0.95
                 and available_depth >= 20):
 
             result = await self.live_trader.sell_early_exit(
@@ -1438,24 +1446,27 @@ class Orchestrator:
         # trades placed this session but not yet in the settlement DB flow)
         if slug and slug in self._live_trade_tokens:
             live_info = self._live_trade_tokens.pop(slug)
-            trade_won = (live_info["side"] == "UP" and btc_went_up) or \
-                        (live_info["side"] == "DOWN" and not btc_went_up)
 
-            if self.alerter:
-                outcome = "WIN" if trade_won else "LOSS"
-                amt = live_info.get("amount", 0)
-                await self.alerter.send_live_settlement_alert(
-                    slug=slug,
-                    side=live_info["side"],
-                    outcome=outcome,
-                    amount=amt,
-                    entry_price=live_info.get("entry_price", 0),
-                )
+            # Skip Telegram alert if this trade was already early-exited
+            if not live_info.get("exited"):
+                trade_won = (live_info["side"] == "UP" and btc_went_up) or \
+                            (live_info["side"] == "DOWN" and not btc_went_up)
 
-            if self.alerter:
-                await self.alerter.send_stats_summary(
-                    stats, live_info=await self._build_live_info()
-                )
+                if self.alerter:
+                    outcome = "WIN" if trade_won else "LOSS"
+                    amt = live_info.get("amount", 0)
+                    await self.alerter.send_live_settlement_alert(
+                        slug=slug,
+                        side=live_info["side"],
+                        outcome=outcome,
+                        amount=amt,
+                        entry_price=live_info.get("entry_price", 0),
+                    )
+
+                if self.alerter:
+                    await self.alerter.send_stats_summary(
+                        stats, live_info=await self._build_live_info()
+                    )
 
     async def _settle_live_trades_for_window(
         self, slug: str, btc_went_up: bool

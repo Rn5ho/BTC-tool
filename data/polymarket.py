@@ -110,7 +110,9 @@ class PolymarketClient:
         once during application startup.
         """
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
             logger.info("Polymarket client session created")
 
     async def stop(self) -> None:

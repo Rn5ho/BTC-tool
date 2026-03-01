@@ -56,6 +56,10 @@ class MLProbabilityModel:
         if feat_vec is None:
             return 0.5
 
+        if np.any(np.isnan(feat_vec)):
+            logger.warning("NaN detected in feature vector (predict), returning 0.5")
+            return 0.5
+
         feat_scaled = self._scaler.transform(feat_vec.reshape(1, -1))
         p_up = float(self._model.predict_proba(feat_scaled)[0, 1])
         p_up = max(0.05, min(0.95, p_up))
@@ -73,6 +77,10 @@ class MLProbabilityModel:
         """
         feat_vec = self._extract_features_from_candles(candles, window_start_ts)
         if feat_vec is None:
+            return 0.5
+
+        if np.any(np.isnan(feat_vec)):
+            logger.warning("NaN detected in feature vector, returning 0.5")
             return 0.5
 
         feat_scaled = self._scaler.transform(feat_vec.reshape(1, -1))
