@@ -1202,10 +1202,12 @@ class Orchestrator:
                     entry_price=live_info.get("entry_price", 0),
                 )
 
-            if trade_won:
-                asyncio.create_task(
-                    self._delayed_auto_sell(slug, live_info)
-                )
+            # Auto-sell disabled — Polymarket's claim/redeem system is
+            # unreliable. Claim winnings manually on polymarket.com.
+            # if trade_won:
+            #     asyncio.create_task(
+            #         self._delayed_auto_sell(slug, live_info)
+            #     )
 
             if self.alerter:
                 await self.alerter.send_stats_summary(stats)
