@@ -204,11 +204,12 @@ class EdgeDetector:
             entry_price, self.fee_rate, self.fee_exponent
         )
 
-        # Build signal breakdown — works with both model types
-        try:
-            signals = self.model.get_signal_breakdown(features)
-        except Exception:
-            signals = {"p_up": p_up, "confidence": confidence}
+        # Build signal breakdown using the actual p_up used for the trade
+        signals = {
+            "ml_p_up": p_up,
+            "ml_confidence": confidence,
+            "ml_side": best_side,
+        }
 
         result = {
             "side": best_side,
