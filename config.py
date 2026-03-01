@@ -22,13 +22,24 @@ class Settings(BaseSettings):
     # predicted direction.  Edge is still computed for bet sizing.
     always_trade: bool = True
 
+    # Minimum ML confidence (|P(up) - 0.5|) required to place a trade.
+    # Backtested sweet spot: 0.015 gives 56.9% WR on 53% of windows ($59/day).
+    min_confidence: float = 0.015
+
     # Sizing strategy: "fixed", "kelly", "adaptive"
     # - fixed: flat bet_size_usdc every trade
     # - kelly: half-Kelly based on edge
     # - adaptive: hybrid adaptive (confidence + streak + drawdown + rolling WR)
     sizing_strategy: str = "adaptive"
 
-    # Polymarket Builder Mode (for live trading — leave blank for paper-only)
+    # Live trading on Polymarket (real money via py-clob-client)
+    live_trading: bool = False
+    polymarket_private_key: str = ""       # EOA private key (hex, no 0x prefix)
+    polymarket_funder_address: str = ""    # Proxy wallet from polymarket.com settings
+    max_live_bet_usdc: float = 2.0        # Hard safety cap per live trade
+    clob_proxy: str = ""                   # SOCKS5 proxy for CLOB API (e.g. socks5://127.0.0.1:1080)
+
+    # Polymarket Builder Mode (legacy — not used by live_trader)
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""
     polymarket_passphrase: str = ""

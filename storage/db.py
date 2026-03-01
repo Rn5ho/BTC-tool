@@ -94,6 +94,23 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_trades_ts ON paper_trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_trades_slug ON paper_trades(market_slug);
                 CREATE INDEX IF NOT EXISTS idx_snapshots_slug ON market_snapshots(slug);
+
+                CREATE TABLE IF NOT EXISTS live_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    market_slug TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    token_id TEXT NOT NULL,
+                    amount_usdc REAL NOT NULL,
+                    order_id TEXT,
+                    status TEXT NOT NULL,
+                    success INTEGER NOT NULL DEFAULT 0,
+                    response_json TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_live_trades_ts ON live_trades(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_live_trades_slug ON live_trades(market_slug);
                 """
             )
             await self._db.commit()
@@ -118,6 +135,11 @@ class Database:
             # paper_trades spread columns
             ("paper_trades", "entry_spread", "REAL"),
             ("paper_trades", "midpoint_price", "REAL"),
+            # live_trades outcome tracking columns
+            ("live_trades", "outcome", "TEXT"),
+            ("live_trades", "pnl", "REAL"),
+            ("live_trades", "entry_price", "REAL"),
+            ("live_trades", "settled_at", "INTEGER"),
         ]
         for table, column, col_type in alter_statements:
             try:
@@ -272,6 +294,176 @@ class Database:
         except Exception:
             logger.exception("Failed to update paper trade %d", trade_id)
             raise
+
+    async def save_live_trade(
+        self,
+        timestamp: int,
+        market_slug: str,
+        side: str,
+        token_id: str,
+        amount_usdc: float,
+        order_id: Optional[str],
+        status: str,
+        success: bool,
+        response_json: Optional[str] = None,
+        entry_price: float = 0.0,
+    ) -> Optional[int]:
+        """Insert a live trade record. Returns the row id on success."""
+        try:
+            cursor = await self._db.execute(
+                """
+                INSERT INTO live_trades
+                    (timestamp, market_slug, side, token_id, amount_usdc,
+                     order_id, status, success, response_json, entry_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    market_slug,
+                    side,
+                    token_id,
+                    amount_usdc,
+                    order_id,
+                    status,
+                    1 if success else 0,
+                    response_json,
+                    entry_price,
+                ),
+            )
+            await self._db.commit()
+            logger.info(
+                "Saved live trade: %s %s $%.2f order=%s success=%s",
+                side, market_slug, amount_usdc, order_id, success,
+            )
+            return cursor.lastrowid
+        except Exception:
+            logger.exception("Failed to save live trade")
+            return None
+
+    async def get_live_trade_stats(self) -> dict:
+        """Compute aggregate stats for live trades."""
+        stats = {"total": 0, "successful": 0, "failed": 0, "total_amount": 0.0}
+        try:
+            cursor = await self._db.execute("SELECT COUNT(*) FROM live_trades")
+            row = await cursor.fetchone()
+            stats["total"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE success = 1"
+            )
+            row = await cursor.fetchone()
+            stats["successful"] = row[0]
+
+            stats["failed"] = stats["total"] - stats["successful"]
+
+            cursor = await self._db.execute(
+                "SELECT COALESCE(SUM(amount_usdc), 0.0) FROM live_trades WHERE success = 1"
+            )
+            row = await cursor.fetchone()
+            stats["total_amount"] = row[0]
+        except Exception:
+            logger.exception("Failed to compute live trade stats")
+        return stats
+
+    async def update_live_trade(
+        self, trade_id: int, outcome: str, pnl: float, settled_at: int
+    ) -> None:
+        """Update a live trade with settlement data."""
+        try:
+            await self._db.execute(
+                """
+                UPDATE live_trades
+                SET outcome = ?, pnl = ?, settled_at = ?
+                WHERE id = ?
+                """,
+                (outcome, pnl, settled_at, trade_id),
+            )
+            await self._db.commit()
+            logger.info(
+                "Updated live trade %d: outcome=%s pnl=%.4f",
+                trade_id, outcome, pnl,
+            )
+        except Exception:
+            logger.exception("Failed to update live trade %d", trade_id)
+
+    async def get_unsettled_live_trades(self) -> list[dict]:
+        """Return all successful live trades that have not yet been settled."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM live_trades WHERE success = 1 AND outcome IS NULL"
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch unsettled live trades")
+            return []
+
+    async def get_live_trading_stats_full(self) -> dict:
+        """Compute full live trading stats including win/loss/P&L."""
+        stats = {
+            "total": 0, "successful": 0, "failed": 0, "total_amount": 0.0,
+            "settled": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+            "total_pnl": 0.0,
+        }
+        try:
+            cursor = await self._db.execute("SELECT COUNT(*) FROM live_trades")
+            row = await cursor.fetchone()
+            stats["total"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE success = 1"
+            )
+            row = await cursor.fetchone()
+            stats["successful"] = row[0]
+            stats["failed"] = stats["total"] - stats["successful"]
+
+            cursor = await self._db.execute(
+                "SELECT COALESCE(SUM(amount_usdc), 0.0) FROM live_trades WHERE success = 1"
+            )
+            row = await cursor.fetchone()
+            stats["total_amount"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE outcome IS NOT NULL"
+            )
+            row = await cursor.fetchone()
+            stats["settled"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE outcome = 'WIN'"
+            )
+            row = await cursor.fetchone()
+            stats["wins"] = row[0]
+
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM live_trades WHERE outcome = 'LOSS'"
+            )
+            row = await cursor.fetchone()
+            stats["losses"] = row[0]
+
+            if stats["settled"] > 0:
+                stats["win_rate"] = stats["wins"] / stats["settled"]
+
+            cursor = await self._db.execute(
+                "SELECT COALESCE(SUM(pnl), 0.0) FROM live_trades WHERE pnl IS NOT NULL"
+            )
+            row = await cursor.fetchone()
+            stats["total_pnl"] = row[0]
+        except Exception:
+            logger.exception("Failed to compute full live trade stats")
+        return stats
+
+    async def restore_live_bankroll(self) -> float:
+        """Return cumulative live P&L from DB (for bankroll restoration)."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT COALESCE(SUM(pnl), 0.0) FROM live_trades WHERE pnl IS NOT NULL"
+            )
+            row = await cursor.fetchone()
+            return row[0]
+        except Exception:
+            logger.exception("Failed to restore live bankroll")
+            return 0.0
 
     async def save_market_snapshot(
         self,

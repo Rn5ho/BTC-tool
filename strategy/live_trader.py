@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -59,20 +60,41 @@ class LiveTrader:
         Hard safety cap per trade in USDC.
     """
 
+    # Hour-based sizing multipliers (UTC) — same as PaperTrader.
+    HOUR_MULTIPLIERS = {
+        4: 0.7, 7: 0.7,
+        6: 1.2, 8: 1.2, 10: 1.2, 12: 1.2,
+        16: 1.2, 18: 1.2, 22: 1.2,
+        9: 1.5, 14: 1.5, 20: 1.5,
+    }
+
     def __init__(
         self,
         private_key: str,
         funder_address: str,
         max_bet_usdc: float = 2.0,
+        fee_rate: float = 0.0,
+        fee_exponent: int = 2,
+        sizing_strategy: str = "adaptive",
     ) -> None:
         self._private_key = private_key
         self._funder_address = funder_address
         self._max_bet = max_bet_usdc
+        self._fee_rate = fee_rate
+        self._fee_exponent = fee_exponent
+        self._sizing_strategy = sizing_strategy
         self._client: Optional[object] = None
         self._active = False
         self._paused = False
         # In-memory trade log for session analysis
         self._session_trades: list[dict] = []
+
+        # Bankroll tracking (restored from DB on startup)
+        self.bankroll: float = 0.0
+        self.initial_bankroll: float = 0.0
+        self._max_bankroll: float = 0.0
+        self._consecutive_losses: int = 0
+        self._recent_outcomes: list[bool] = []
 
     @property
     def is_active(self) -> bool:
@@ -209,6 +231,90 @@ class LiveTrader:
             return None
 
     # ------------------------------------------------------------------
+    # Bankroll & sizing
+    # ------------------------------------------------------------------
+
+    def restore_bankroll(self, initial: float, historical_pnl: float) -> None:
+        """Set bankroll from initial capital + cumulative live P&L."""
+        self.initial_bankroll = initial
+        self.bankroll = initial + historical_pnl
+        self._max_bankroll = self.bankroll
+        logger.info(
+            "Live bankroll restored: initial=$%.2f + pnl=$%+.2f = $%.2f",
+            initial, historical_pnl, self.bankroll,
+        )
+
+    def adaptive_size(self, confidence: float) -> float:
+        """Hybrid adaptive sizing based on live bankroll and live outcomes."""
+        base_pct = 0.02
+
+        conf_mult = 0.5 + (confidence / 0.45) * 1.5
+        conf_mult = max(0.5, min(conf_mult, 2.0))
+
+        utc_hour = datetime.now(timezone.utc).hour
+        hour_mult = self.HOUR_MULTIPLIERS.get(utc_hour, 1.0)
+
+        streak_mult = 1.0
+        if self._consecutive_losses >= 5:
+            streak_mult = 0.5
+        elif self._consecutive_losses >= 3:
+            streak_mult = 0.75
+
+        dd_mult = 1.0
+        if self._max_bankroll > 0:
+            drawdown = (self._max_bankroll - self.bankroll) / self._max_bankroll
+            if drawdown > 0.25:
+                dd_mult = 0.5
+            elif drawdown > 0.15:
+                dd_mult = 0.75
+
+        wr_mult = 1.0
+        if len(self._recent_outcomes) >= 10:
+            recent_wr = sum(self._recent_outcomes[-20:]) / len(self._recent_outcomes[-20:])
+            if recent_wr > 0.55:
+                wr_mult = 1.3
+            elif recent_wr < 0.45:
+                wr_mult = 0.7
+
+        final_pct = base_pct * conf_mult * hour_mult * streak_mult * dd_mult * wr_mult
+        final_pct = max(0.005, min(final_pct, 0.08))
+
+        size = final_pct * self.bankroll
+
+        logger.debug(
+            "Live adaptive size: base=2%% x conf=%.2f x hour=%.2f x streak=%.2f x dd=%.2f x wr=%.2f "
+            "= %.1f%% -> $%.2f",
+            conf_mult, hour_mult, streak_mult, dd_mult, wr_mult,
+            final_pct * 100, size,
+        )
+        return size
+
+    def compute_bet_size(self, confidence: float = 0.0) -> float:
+        """Return live bet size in USDC, capped by bankroll and max bet."""
+        if self.bankroll <= 0:
+            return 0.0
+        if self._sizing_strategy == "adaptive":
+            size = self.adaptive_size(confidence)
+        else:
+            size = 0.02 * self.bankroll  # fallback: flat 2%
+        size = max(1.00, size)
+        size = min(size, self.bankroll, self._max_bet)
+        return size
+
+    def record_settlement(self, won: bool, pnl: float) -> None:
+        """Update internal bankroll/streak state after a live trade settles."""
+        self.bankroll += pnl
+        self._recent_outcomes.append(won)
+        if len(self._recent_outcomes) > 50:
+            self._recent_outcomes = self._recent_outcomes[-50:]
+        if won:
+            self._consecutive_losses = 0
+        else:
+            self._consecutive_losses += 1
+        if self.bankroll > self._max_bankroll:
+            self._max_bankroll = self.bankroll
+
+    # ------------------------------------------------------------------
     # Retry helper for 425 "Too Early" (matching engine restarting)
     # ------------------------------------------------------------------
 
@@ -286,9 +392,13 @@ class LiveTrader:
             return result
 
         # CLOB requires minimum 5 tokens per order.
-        # Compute minimum USDC: 5 tokens × entry_price.
+        # MarketOrderArgs fills at the current best ask, which can shift
+        # significantly from our entry_price signal in volatile 5-min markets.
+        # Worst case: entry price filter allows up to 0.65, so we need at
+        # least 5 × 0.65 = $3.25.  Use $3.50 as a hard floor to guarantee
+        # 5 tokens with margin at any price in our 0.35-0.65 range.
         price = entry_price if entry_price > 0 else 0.50
-        min_usdc = round(5.0 * price, 2)
+        min_usdc = max(round(5.5 * price, 2), 3.50)
         amount_usdc = round(max(amount_usdc, min_usdc), 2)
 
         # Ensure amount is at least $1.00 after rounding (CLOB minimum for
@@ -380,6 +490,83 @@ class LiveTrader:
             "order_id": result["order_id"],
             "error": result["error"],
         })
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Early exit — sell tokens before window settles
+    # ------------------------------------------------------------------
+
+    async def sell_early_exit(
+        self,
+        token_id: str,
+        tokens: float,
+        best_bid: float,
+        market_slug: str = "",
+    ) -> dict:
+        """Sell tokens early when bid is high enough to lock in profit.
+
+        Unlike ``sell_winning_tokens`` (post-resolution), this sells while the
+        market is still live.  The CLOB order book is active, so standard
+        retry timing is used.
+
+        Parameters
+        ----------
+        tokens : float
+            Exact token count from the buy (computed at buy time with fees).
+        best_bid : float
+            Current best bid price on the order book.
+        """
+        result: dict = {"success": False, "error": "", "order_id": None, "sell_amount": 0.0}
+
+        if not self._active or self._client is None:
+            result["error"] = "LiveTrader not active"
+            return result
+
+        sell_amount = round(tokens * best_bid, 2)
+        sell_amount = max(sell_amount, 1.00)  # CLOB $1 floor
+
+        # CLOB 5-token minimum applies to sells too
+        if tokens < 5:
+            result["error"] = f"Token count {tokens:.2f} below CLOB 5-token minimum"
+            logger.warning("Skipping early exit — %s", result["error"])
+            return result
+
+        result["sell_amount"] = sell_amount
+
+        logger.info(
+            "Placing EARLY EXIT SELL: %s %.1f tokens @ bid $%.3f = $%.2f on %s",
+            token_id[:16], tokens, best_bid, sell_amount, market_slug,
+        )
+
+        try:
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=sell_amount,
+                side=SELL,
+            )
+            signed_order = await asyncio.to_thread(
+                self._client.create_market_order, order_args
+            )
+            resp = await self._post_order_with_retry(signed_order, OrderType.GTC)
+
+            if isinstance(resp, dict):
+                result["order_id"] = resp.get("orderID", resp.get("id", ""))
+                result["success"] = True
+            else:
+                result["success"] = True
+
+            logger.info(
+                "EARLY EXIT FILLED: %s $%.2f order=%s on %s",
+                token_id[:16], sell_amount, result["order_id"], market_slug,
+            )
+
+        except Exception as exc:
+            result["error"] = str(exc)
+            logger.warning(
+                "EARLY EXIT FAILED for %s: %s — will settle normally",
+                market_slug, exc,
+            )
 
         return result
 

@@ -10,6 +10,7 @@ On a win the payout is shares * $1, so:
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from data.models import PaperTrade
@@ -103,12 +104,27 @@ class PaperTrader:
 
         return actual_fraction * self.bankroll
 
+    # Hour-based sizing multipliers (UTC).
+    # Derived from backtesting: training test set + out-of-sample validation.
+    # Consistently strong hours get 1.5x, good hours 1.2x, weak hours 0.7x.
+    #   Strong (both >57% WR): 9, 14, 20
+    #   Good   (both >53% WR): 6, 8, 10, 12, 16, 18, 22
+    #   Weak   (both <50% WR): 4, 7
+    #   Neutral (rest): 1.0x
+    HOUR_MULTIPLIERS = {
+        4: 0.7, 7: 0.7,                                # weak
+        6: 1.2, 8: 1.2, 10: 1.2, 12: 1.2,             # good
+        16: 1.2, 18: 1.2, 22: 1.2,                     # good
+        9: 1.5, 14: 1.5, 20: 1.5,                      # strong
+    }
+
     def adaptive_size(self, confidence: float) -> float:
         """Hybrid adaptive sizing: adjusts bet based on multiple factors.
 
         Base: 2% of bankroll
         Multipliers:
         - Confidence (|P-0.5|): 0.5x at low confidence, up to 2.0x at high
+        - Hour-of-day: 0.7x-1.5x based on backtested hourly WR
         - Streak: halve after 5+ consecutive losses
         - Drawdown: halve if drawdown > 25%
         - Rolling WR: 1.3x if last 20 trades >55% WR, 0.7x if <45%
@@ -121,6 +137,10 @@ class PaperTrader:
         # confidence ranges 0.0 (pure coin flip) to 0.45 (max model output)
         conf_mult = 0.5 + (confidence / 0.45) * 1.5
         conf_mult = max(0.5, min(conf_mult, 2.0))
+
+        # Hour-of-day multiplier
+        utc_hour = datetime.now(timezone.utc).hour
+        hour_mult = self.HOUR_MULTIPLIERS.get(utc_hour, 1.0)
 
         # Streak multiplier: reduce after consecutive losses
         streak_mult = 1.0
@@ -147,15 +167,15 @@ class PaperTrader:
             elif recent_wr < 0.45:
                 wr_mult = 0.7
 
-        final_pct = base_pct * conf_mult * streak_mult * dd_mult * wr_mult
+        final_pct = base_pct * conf_mult * hour_mult * streak_mult * dd_mult * wr_mult
         final_pct = max(0.005, min(final_pct, 0.08))  # clamp 0.5%-8%
 
         size = final_pct * self.bankroll
 
         logger.debug(
-            "Adaptive size: base=2%% x conf=%.2f x streak=%.2f x dd=%.2f x wr=%.2f "
+            "Adaptive size: base=2%% x conf=%.2f x hour=%.2f x streak=%.2f x dd=%.2f x wr=%.2f "
             "= %.1f%% -> $%.2f",
-            conf_mult, streak_mult, dd_mult, wr_mult,
+            conf_mult, hour_mult, streak_mult, dd_mult, wr_mult,
             final_pct * 100, size,
         )
 
@@ -172,6 +192,8 @@ class PaperTrader:
         else:
             size = self.bet_size
 
+        # Enforce $1 minimum (Polymarket minimum stake)
+        size = max(1.00, size)
         return min(size, self.bankroll)
 
     # ------------------------------------------------------------------

@@ -4,7 +4,7 @@
 
 BTC Polymarket 5-Minute Edge Finder — a real-time tool that monitors Binance BTC price data (spot + futures), uses a trained ML model to predict 5-minute BTC direction, and paper trades on Polymarket's binary UP/DOWN markets every 5-minute window. Telegram bot for alerts and interactive commands.
 
-**Status:** Deployed on Hetzner VPS (46.225.27.241) running 24/7 as a systemd service. ML model (RandomForestClassifier, 53.9% test accuracy on 34,100 samples) replaced the original rule-based model. Running in "always-trade" mode with $20 paper bankroll and hybrid adaptive bet sizing. **Live trading enabled and profitable** via py-clob-client with $5 max bet cap, routing CLOB API through SOCKS5 proxy (SSH tunnel → user's Mullvad VPN → Slovenia) to bypass Polymarket geoblock (Germany blocked). First 9 hours of live trading (2026-03-01): 43 real trades, +$5.24 profit (+26.2% ROI), $20 → $25.24.
+**Status:** Deployed on Hetzner VPS in Helsinki, Finland (65.21.178.90) running 24/7 as a systemd service. ML model (RandomForestClassifier, 53.9% test accuracy on 34,100 samples) replaced the original rule-based model. Running in "always-trade" mode with hybrid adaptive bet sizing. **Live trading enabled and profitable** via py-clob-client with $5 max bet cap, direct CLOB API access (no proxy needed from Finland). Live trading decoupled from paper trading — independent bankroll, adaptive sizing, and settlement tracking. **Early exit selling** active: sells tokens when bid >= $0.90 to lock in profit before settlement. ~$93 real capital deposited, ~60% WR across 160+ trades.
 
 ## Tech Stack
 
@@ -36,13 +36,13 @@ signals/        → Signal generation
 strategy/       → Trading logic
   edge.py       → Edge detection (compare P(up) vs Polymarket implied odds; uses ask price for entry; supports always-trade mode)
   paper_trader.py → Paper trading engine (fixed/Kelly/adaptive sizing, PnL with Polymarket fees, settlement)
-  live_trader.py  → Live trading engine (real Polymarket CLOB orders via py-clob-client, GTC market buys, SOCKS5 proxy, auto-sell winners)
+  live_trader.py  → Live trading engine (real Polymarket CLOB orders via py-clob-client, GTC market buys, independent bankroll/sizing/settlement, early exit selling)
 
 alerts/
-  telegram.py   → Telegram bot (edge alerts, trade notifications, settlements, interactive commands)
+  telegram.py   → Telegram bot (edge alerts, live trade notifications, live settlements, interactive commands — paper trades excluded)
 
 storage/
-  db.py         → SQLite (candles, feature_snapshots, paper_trades, market_snapshots with spread columns, historical price lookup)
+  db.py         → SQLite (candles, feature_snapshots, paper_trades, live_trades with outcome/pnl tracking, market_snapshots with spread columns, historical price lookup)
 
 models/         → Trained ML model artifacts
   best_model.pkl  → Serialized RandomForestClassifier (RF_d3, trained 2026-02-28)
@@ -78,11 +78,11 @@ python simulate_compounding.py
 python -m py_compile main.py config.py data/models.py data/binance_ws.py data/polymarket.py signals/indicators.py signals/features.py signals/probability.py signals/ml_probability.py strategy/edge.py strategy/paper_trader.py alerts/telegram.py storage/db.py
 ```
 
-### Hetzner VPS (46.225.27.241)
+### Hetzner VPS — Helsinki, Finland (65.21.178.90)
 
 ```bash
 # SSH into server (key at ~/.ssh/id_ed25519)
-ssh root@46.225.27.241
+ssh root@65.21.178.90
 
 # Check service status
 systemctl status btc-edge
@@ -94,20 +94,20 @@ tail -f /home/btcedge/BTC-tool/btc_edge.log
 systemctl kill -s SIGKILL btc-edge; systemctl reset-failed btc-edge; systemctl start btc-edge
 
 # Deploy files from local machine (from BTC-tool directory)
-scp config.py main.py root@46.225.27.241:/home/btcedge/BTC-tool/
-scp data/models.py data/polymarket.py root@46.225.27.241:/home/btcedge/BTC-tool/data/
-scp strategy/edge.py strategy/paper_trader.py root@46.225.27.241:/home/btcedge/BTC-tool/strategy/
-scp signals/ml_probability.py root@46.225.27.241:/home/btcedge/BTC-tool/signals/
-scp alerts/telegram.py root@46.225.27.241:/home/btcedge/BTC-tool/alerts/
-scp storage/db.py root@46.225.27.241:/home/btcedge/BTC-tool/storage/
-scp models/best_model.pkl models/scaler.pkl root@46.225.27.241:/home/btcedge/BTC-tool/models/
-scp .env root@46.225.27.241:/home/btcedge/BTC-tool/
+scp config.py main.py root@65.21.178.90:/home/btcedge/BTC-tool/
+scp data/models.py data/polymarket.py root@65.21.178.90:/home/btcedge/BTC-tool/data/
+scp strategy/edge.py strategy/paper_trader.py root@65.21.178.90:/home/btcedge/BTC-tool/strategy/
+scp signals/ml_probability.py root@65.21.178.90:/home/btcedge/BTC-tool/signals/
+scp alerts/telegram.py root@65.21.178.90:/home/btcedge/BTC-tool/alerts/
+scp storage/db.py root@65.21.178.90:/home/btcedge/BTC-tool/storage/
+scp models/best_model.pkl models/scaler.pkl root@65.21.178.90:/home/btcedge/BTC-tool/models/
+scp .env root@65.21.178.90:/home/btcedge/BTC-tool/
 
 # Download DB for analysis
-scp root@46.225.27.241:/home/btcedge/BTC-tool/btc_edge.db .
+scp root@65.21.178.90:/home/btcedge/BTC-tool/btc_edge.db .
 
 # Reset paper trading data
-ssh root@46.225.27.241 "cd /home/btcedge/BTC-tool && source venv/bin/activate && python -c \"import sqlite3; c=sqlite3.connect('btc_edge.db'); c.execute('DELETE FROM paper_trades'); c.commit(); print('Cleared', c.total_changes)\""
+ssh root@65.21.178.90 "cd /home/btcedge/BTC-tool && source venv/bin/activate && python -c \"import sqlite3; c=sqlite3.connect('btc_edge.db'); c.execute('DELETE FROM paper_trades'); c.commit(); print('Cleared', c.total_changes)\""
 ```
 
 ## Telegram Bot Commands
@@ -131,7 +131,7 @@ The bot (`@BTC5mBot`) supports interactive commands:
 | `/balance` | Show USDC balance, session stats, pending claims (live trading only) |
 | `/livetrades` | Show live trade stats (session + all-time from DB) |
 
-Periodic stats (every 30 min) include live trading info: USDC balance, session fills, all-time totals. Live trade WIN/LOSS settlement alerts are sent via Telegram with estimated profit.
+Periodic stats (every 30 min) include live trading info: USDC balance, session fills, all-time totals. Live trade WIN/LOSS/EARLY_EXIT settlement alerts are sent via Telegram. Paper trade notifications are excluded from Telegram (paper data is still collected in DB/logs).
 
 ## Configuration
 
@@ -160,7 +160,7 @@ LIVE_TRADING=true
 POLYMARKET_PRIVATE_KEY=...     # EOA private key (hex, no 0x prefix) from Rabby
 POLYMARKET_FUNDER_ADDRESS=...  # Proxy wallet from polymarket.com deposit settings
 MAX_LIVE_BET_USDC=5.0         # Hard safety cap (must accommodate 5-token CLOB minimum)
-CLOB_PROXY=socks5://127.0.0.1:1080  # SOCKS5 proxy for geoblock bypass
+# CLOB_PROXY=socks5://127.0.0.1:1080  # Not needed from Finland (no geoblock)
 
 # Polymarket fees
 POLYMARKET_FEE_RATE=0.25
@@ -196,9 +196,11 @@ Polymarket API → Implied P(up)  →  edge = our_P(side) - market_P(side)
                               ↓
                    Adaptive Sizing (confidence × hour-of-day × streak × drawdown × rolling WR)
                               ↓
-                        Paper Trader → simulate bet, log to SQLite
+                        Paper Trader → simulate bet, log to SQLite (no Telegram)
                               ↓
-                        Telegram Alert → notify user
+                        Live Trader → real CLOB order → Telegram Alert
+                              ↓
+                  Early Exit Monitor → sell at bid >= $0.90 → Telegram Alert
 ```
 
 ## ML Probability Model (v2 — Trained RandomForestClassifier)
@@ -282,8 +284,8 @@ The edge detector (`strategy/edge.py`) supports two modes:
 
 ### Safety Filters (both modes)
 1. **Min confidence** (`MIN_CONFIDENCE=0.015`): Skip when |P(up) - 0.5| below threshold (always-trade mode)
-2. **Max edge cap** (`MAX_EDGE_THRESHOLD=0.18`): Edges above 18% are rejected as model error
-3. **Entry price cap**: Reject entry prices above 0.90 or below 0.10 (thin book protection)
+2. **Max edge cap** (`MAX_EDGE_THRESHOLD=0.18`): Edges above 18% are rejected as model error (classic mode only; disabled in always-trade mode — edge size doesn't predict WR)
+3. **Entry price filter**: Reject entry prices outside 0.35-0.65 range (data shows 0.50-0.60 = 64% WR, above 0.65 drops to ~47%, below 0.35 = thin book/contrarian). **Note**: 0.35 floor may be too tight — causes long no-trade stretches when market trends. Revisit with WR data for the 0.30-0.35 bucket after collecting more samples.
 4. **Time gate** (`_MAX_ENTRY_SECONDS=120`): Only enter in first 2 minutes of 5-min window
 5. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
 6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT=0.15`): Skip if BTC moved >0.15% against our signal direction within current window
@@ -341,7 +343,7 @@ Live trading places real GTC market buy orders on Polymarket alongside paper tra
 - Order type: GTC market buy via `MarketOrderArgs`+`create_market_order`
 - CLOB 5-token minimum: amount auto-bumped to `5 × entry_price` (~$2.50 at typical prices)
 - Retry with exponential backoff on 425 "Too Early" errors (matching engine restarts)
-- Auto-sell winning tokens: **DISABLED** — Polymarket's claim/redeem system is unreliable. User claims manually on polymarket.com.
+- **Early exit selling**: `sell_early_exit()` sells tokens *before* resolution when bid >= $0.90. Replaces disabled post-resolution auto-sell. Unsold tokens claimed manually on polymarket.com.
 - Candle prefetch from Binance REST API eliminates 30-min buffering delay on restart
 
 ### py-clob-client Quirks & Patches
@@ -352,27 +354,18 @@ Live trading places real GTC market buy orders on Polymarket alongside paper tra
 - **Balance API**: `get_balance_allowance()` requires `BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)` — no default.
 - **pydantic-settings vs os.environ**: pydantic-settings reads .env but does NOT set OS env vars. Use `settings.clob_proxy` not `os.environ.get("CLOB_PROXY")`.
 
-### Geoblock Bypass
-- Hetzner VPS is in Germany — Polymarket blocks Germany
-- Solution: SSH reverse tunnel from user's local machine (Mullvad VPN → Slovenia)
-  - User runs: `ssh -R 1080 root@46.225.27.241` (keeps tunnel alive)
-  - VPS py-clob-client routes through `socks5://127.0.0.1:1080`
-- Monkey-patches py-clob-client's internal `httpx.Client` to use proxy (NOT global env vars)
-  - Only CLOB API calls go through proxy; Binance WS and Polymarket data streams are unaffected
-  - Requires `socksio` package for httpx SOCKS5 support
-- **Proxy watchdog**: Background task checks SOCKS5 port every 2 minutes
-  - Auto-pauses live trading if proxy goes down
-  - Auto-resumes when proxy comes back
-  - Sends Telegram alerts on state changes
+### Geoblock — Not Applicable
+- VPS is in Helsinki, Finland — Polymarket CLOB API is accessible directly (no geoblock)
+- Previously ran on Hetzner Germany with SSH tunnel proxy; migrated to Helsinki to eliminate proxy dependency
+- Proxy monkey-patching code still exists in live_trader.py but is inactive (CLOB_PROXY is empty)
 
 ### Safety Controls
 - Hard cap: `MAX_LIVE_BET_USDC=5.0` (accommodates 5-token minimum even at $0.70+ prices)
-- Minimum: `5 × entry_price` per trade (CLOB 5-token minimum, ~$2.50 at $0.50)
+- Minimum: `max(5.5 × entry_price, $3.50)` per trade — $3.50 hard floor guarantees 5 tokens at any fill price up to $0.70 (CLOB fill price can shift from entry_price signal)
 - Floor: `$1.00` minimum per order (CLOB rejects marketable orders below $1)
 - Balance check before each order
 - All paper trading safety filters apply (time gate, hour blacklist, trend conflict, confidence)
 - `/pause` stops both paper and live trading
-- Proxy watchdog auto-pauses on tunnel loss
 
 ### DB Schema
 ```sql
@@ -387,20 +380,30 @@ CREATE TABLE live_trades (
     status TEXT NOT NULL,
     success INTEGER NOT NULL DEFAULT 0,
     response_json TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    -- Settlement tracking (added for decoupled live trading)
+    entry_price REAL,
+    outcome TEXT,           -- 'WIN', 'LOSS', or 'EARLY_EXIT'
+    pnl REAL,
+    settled_at INTEGER
 );
 ```
+
+### Independent Live Trading
+- Live trader has its own bankroll, adaptive sizing, and settlement tracking (decoupled from paper trader)
+- On startup: `bankroll = VIRTUAL_BANKROLL + SUM(pnl) from live_trades`
+- `compute_bet_size(confidence)`: independent adaptive sizing (same algorithm as paper trader)
+- `record_settlement(won, pnl)`: updates bankroll, streak, drawdown state
+- Live trades settled in `_settle_live_trades_for_window()` alongside paper trades
+- `/stats` shows live stats as primary, paper as secondary
 
 ### Deploy Commands (live trading specific)
 ```bash
 # Deploy live trader
-scp strategy/live_trader.py root@46.225.27.241:/home/btcedge/BTC-tool/strategy/
+scp strategy/live_trader.py root@65.21.178.90:/home/btcedge/BTC-tool/strategy/
 
 # Check live trading status in logs
-ssh root@46.225.27.241 "tail -c 20000 /home/btcedge/BTC-tool/btc_edge.log | strings | grep -iE '(LIVE|proxy|FILLED|FAILED)'"
-
-# Check proxy health
-ssh root@46.225.27.241 "curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://ipinfo.io/json"
+ssh root@65.21.178.90 "tail -c 20000 /home/btcedge/BTC-tool/btc_edge.log | strings | grep -iE '(LIVE|FILLED|FAILED)'"
 ```
 
 ## Window Lifecycle & Settlement
@@ -417,15 +420,14 @@ ssh root@46.225.27.241 "curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 ht
 3. Initialize EdgeDetector with always_trade setting
 4. Initialize DB, PaperTrader (with sizing_strategy), TelegramAlerter
 5. Start Polymarket aiohttp session
-6. Initialize LiveTrader (if LIVE_TRADING=true): derive API creds, apply SOCKS5 proxy monkey-patch, patch rounding config
+6. Initialize LiveTrader (if LIVE_TRADING=true): derive API creds, patch rounding config, restore bankroll from DB
 7. Prefetch 35 candles from Binance REST API (skip 30-min buffering wait)
-8. Launch 6 concurrent asyncio tasks:
+8. Launch 5 concurrent asyncio tasks:
    - **Binance WS**: Streams kline_1m, depth20, aggTrade, futures funding
    - **Chainlink RTDS**: Streams BTC/USD from Polymarket's data service
-   - **Analysis loop**: Initializes window tracking, settles stale trades, then runs 3-second poll cycle
+   - **Analysis loop**: Initializes window tracking, settles stale trades (paper + live), then runs 3-second poll cycle with early exit selling (sells tokens when bid >= $0.90)
    - **Stats loop**: Periodic stats report every 30 minutes
    - **Telegram command listener**: Long-polls for incoming /commands
-   - **Proxy watchdog**: Checks SOCKS5 tunnel every 2 min, auto-pauses/resumes live trading
 
 ## Console Output Format
 
@@ -439,15 +441,16 @@ Clean ASCII output (Windows cp1252 safe):
 
 ## Deployment (Hetzner VPS)
 
-Runs 24/7 on Hetzner VPS at `46.225.27.241`:
+Runs 24/7 on Hetzner VPS in Helsinki, Finland at `65.21.178.90` (CX22 tier):
 
+- **Location**: Helsinki, Finland — no Polymarket geoblock, no proxy needed
 - **User**: `btcedge` (dedicated, non-root)
 - **Directory**: `/home/btcedge/BTC-tool`
 - **Service**: `btc-edge.service` via systemd (`Restart=always`, `RestartSec=10`)
 - **Logs**: `/home/btcedge/BTC-tool/btc_edge.log` (also via `journalctl -u btc-edge`)
-- **SSH key**: `~/.ssh/id_ed25519` (ed25519, comment "btc-tool-deploy")
+- **SSH key**: `~/.ssh/id_ed25519` (ed25519)
 - **Branch**: `claude/add-polymarket-btc-markets-kZRWJ`
-- **Python venv**: `/home/btcedge/BTC-tool/venv` (includes scikit-learn, numpy, aiohttp, etc.)
+- **Python**: 3.12, venv at `/home/btcedge/BTC-tool/venv` (includes scikit-learn, numpy, aiohttp, etc.)
 - **Hardening**: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths=/home/btcedge/BTC-tool`
 
 ## Known Issues & Fixes Applied
@@ -474,9 +477,11 @@ Runs 24/7 on Hetzner VPS at `46.225.27.241`:
 
 11. **425 "Too Early" on order placement** (fixed): Matching engine restarts cause transient 425 errors. Fixed with exponential backoff retry (3 attempts, 3s/6s/12s delays).
 
-12. **Auto-sell fails on resolved markets** (known — disabled): CLOB order book closes when 5-min markets resolve. Selling via CLOB after resolution doesn't work. Polymarket's own claim/redeem system is also unreliable. Auto-sell disabled; user claims manually on polymarket.com.
+12. **Auto-sell fails on resolved markets** (known — mitigated): CLOB order book closes when 5-min markets resolve. Selling via CLOB after resolution doesn't work. **Mitigated by early exit selling**: tokens are sold *before* resolution when bid >= $0.90. Remaining unsold tokens (losers, low-bid winners) are claimed manually on polymarket.com.
 
 13. **SCP to wrong path shadows packages** (fixed): `scp alerts/telegram.py root@host:/home/btcedge/BTC-tool/` creates `telegram.py` in project root, shadowing the `telegram` package. Always SCP to the full subdirectory path.
+
+14. **CLOB fill price shift causes <5 token failure** (fixed): Entry price signal was $0.385 but CLOB filled at ~$0.47, reducing token count below 5-token minimum. Fixed with `$3.50` hard floor: `min_usdc = max(round(5.5 * price, 2), 3.50)` guarantees 5 tokens at any fill price up to $0.70.
 
 ## Conventions
 
@@ -489,21 +494,55 @@ Runs 24/7 on Hetzner VPS at `46.225.27.241`:
 - Windows compatibility — no signal handlers (add_signal_handler wrapped in try/except NotImplementedError)
 - Paper trades stored as dicts in `_pending_trades` (keyed by market slug), persisted to SQLite
 
-## Live Trading Results (2026-03-01, first 9 hours)
+## Live Trading Results
 
+### Phase 1 (2026-03-01, first 9 hours — Germany VPS with proxy)
 From actual Polymarket CSV export:
 - **Deposited**: $20.00
 - **43 buy trades**, $100.33 total (capital recycled ~5x)
-- **11 sells** (auto-sell of winners): $45.87 recovered
-- **47 redeems** (manual claims): $59.70 recovered
 - **Final balance**: $25.24 → **+$5.24 profit (+26.2% ROI)**
-- **Fill rate**: 54% (38/70 attempts) — improved to ~95%+ after fixes
-- **Failure breakdown**: 18/32 fixed (rounding, proxy, GTC, precision), 14/32 fixed by raising cap to $5
+- **Fill rate**: 54% initially → ~95%+ after fixes
+
+### Phase 2 (2026-03-01 onwards — Helsinki VPS, decoupled)
+- **Capital**: ~$93 deposited total
+- **Paper trades**: 162 settled, 60% WR, +$19.77 P&L, bankroll $112.77
+- **Live trades**: Independently tracked with own bankroll ($115.87) and sizing
+- **Early exit selling**: Active — sells tokens when bid >= $0.90, no time restriction
+- **Live bankroll**: VIRTUAL_BANKROLL + cumulative_pnl restored on restart
+
+## Early Exit Selling
+
+Sells live tokens before settlement when the outcome is nearly certain, locking in ~90%+ of max profit and eliminating last-second reversal risk.
+
+### How It Works
+- `_monitor_early_exit()` in main.py runs every 3s poll cycle in the last 2 minutes of each window
+- Checks best bid price and depth for the active position's token
+- **Trigger**: `bid >= 0.90` AND `depth >= 20 tokens` — **no time restriction** (triggers as soon as conditions met)
+- `sell_early_exit()` in LiveTrader places a GTC SELL market order via `MarketOrderArgs(token_id, sell_amount, side=SELL)`
+- Sell amount: `round(tokens × best_bid, 2)`, minimum $1.00, requires >= 5 tokens
+- On success: DB updated with `outcome="EARLY_EXIT"`, PnL recorded, Telegram alert sent
+
+### Token Tracking
+- At buy time: `tokens = (amount_usdc / entry_price) × (1 - fee_factor)`
+- Stored in `_live_trade_tokens[slug]` dict alongside `db_id` for settlement updates
+- `exited=True` flag prevents double-settlement at window end
+
+### Settlement Integration
+- `get_unsettled_live_trades()` queries `WHERE outcome IS NULL` — EARLY_EXIT trades auto-skipped
+- `_live_trade_tokens` entry with `exited=True` also prevents in-memory settlement
+
+### Log format
+- Data: `[EARLY-EXIT] UP n-5m-... | 40s left | bid=0.760 x107 | depth>=0.85: 0 tokens | entry=0.500 profit=52.0%`
+- Sell: `[EARLY-EXIT SOLD] UP n-5m-... | bid=0.900 | tokens=6.5 | sell=$5.85 buy=$3.50 | pnl=$+2.35 | 29s before settlement`
+
+### CLOB API Notes
+- Bids sorted ascending (lowest first). Best bid = `bids[-1]`.
+- Bids fluctuate wildly in last 2 min. Winning positions reliably reach $0.90+ in last ~60s.
 
 ## Potential Next Steps
 
-- **On-chain token redemption**: Implement `redeemPositions()` via web3.py on the CTF contract to auto-claim winning tokens without relying on Polymarket's unreliable UI. Needs conditionId from market data, MATIC for gas.
-- **Early exits**: Sell tokens before window ends when price hits ~$0.95+ (market outcome nearly certain). Could capture profit without waiting for settlement.
+- **Widen entry price filter**: 0.35 floor may be too aggressive — causes long no-trade stretches when market trends (entry prices stuck at 0.29-0.34). Consider widening to 0.30-0.65 after collecting WR data for 0.30-0.35 bucket.
+- **On-chain token redemption**: Implement `redeemPositions()` via web3.py on the CTF contract to auto-claim winning tokens. Needs conditionId from market data, MATIC for gas.
 - **Model retraining**: Retrain periodically as market dynamics shift. Pipeline is ready (`ml_pipeline.py`), takes ~25 min.
 - **Feature expansion**: Liquidation data, funding rate momentum, cross-exchange flows, order book depth imbalance at multiple levels.
 - **Scale up bet sizing**: With proven profitability, increase capital and bet sizes. Current adaptive sizing uses 2% of bankroll as base.

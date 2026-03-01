@@ -31,6 +31,7 @@ class EdgeDetector:
         fee_rate: float = 0.0,
         fee_exponent: int = 2,
         always_trade: bool = False,
+        min_confidence: float = 0.015,
     ) -> None:
         self.model = model
         self.min_edge = min_edge
@@ -38,14 +39,16 @@ class EdgeDetector:
         self.fee_rate = fee_rate
         self.fee_exponent = fee_exponent
         self.always_trade = always_trade
+        self.min_confidence = min_confidence
         logger.info(
             "EdgeDetector initialised with min_edge=%.2f, max_edge=%.2f, fee_rate=%.3f, "
-            "fee_exponent=%d, always_trade=%s",
+            "fee_exponent=%d, always_trade=%s, min_confidence=%.3f",
             self.min_edge,
             self.max_edge,
             self.fee_rate,
             self.fee_exponent,
             self.always_trade,
+            self.min_confidence,
         )
 
     def _fee_adjusted_prob(self, market_price: float) -> float:
@@ -113,22 +116,22 @@ class EdgeDetector:
         if self.always_trade:
             # Always-trade mode: pick direction based on ML model, not edge.
             # We always enter a position — the question is which side.
-            best_side = "UP" if p_up > 0.5 else "DOWN"
-            best_edge = up_edge if best_side == "UP" else down_edge
-            # Edge can be negative in always-trade mode (market disagrees
-            # with our model). We still trade, using abs(edge) for sizing.
             confidence = abs(p_up - 0.5)
 
-            # Still skip absurdly large edges (model error).
-            if best_edge > self.max_edge:
-                logger.info(
-                    "Skipping — edge too large (%.1f%% > %.1f%% cap) on %s %s",
-                    best_edge * 100,
-                    self.max_edge * 100,
-                    best_side,
-                    market.slug,
+            # Skip when model confidence is below threshold
+            if confidence < self.min_confidence:
+                logger.debug(
+                    "Skipping — confidence %.3f%% < %.3f%% threshold on %s",
+                    confidence * 100, self.min_confidence * 100, market.slug,
                 )
                 return None
+
+            best_side = "UP" if p_up > 0.5 else "DOWN"
+            best_edge = up_edge if best_side == "UP" else down_edge
+
+            # In always-trade mode, edge cap is not applied — we trade the
+            # model's direction regardless of edge size.  The entry price filter
+            # below handles the real risk (thin books / stale prices).
         else:
             # Classic mode: only trade when we have a positive edge above threshold.
             candidates = []
@@ -175,6 +178,17 @@ class EdgeDetector:
         else:
             entry_price = market.down_best_ask if market.down_best_ask else raw_down
             spread = market.down_spread
+
+        # Reject entry prices outside the profitable range.
+        # Data shows 0.50-0.60 is the sweet spot (64% WR); above 0.65 the
+        # market has already priced in the move and WR drops to ~47%.
+        # Below 0.35 the book is too thin / contrarian.
+        if entry_price > 0.65 or entry_price < 0.35:
+            logger.info(
+                "Skipping — entry price %.3f outside 0.35-0.65 range on %s %s",
+                entry_price, best_side, market.slug,
+            )
+            return None
 
         fee_factor = compute_fee_factor(
             entry_price, self.fee_rate, self.fee_exponent

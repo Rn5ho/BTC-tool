@@ -400,10 +400,13 @@ class PolymarketClient:
             asks = data.get("asks", [])
             if not bids or not asks:
                 return None
-            best_bid = float(bids[0]["price"])
-            best_ask = float(asks[0]["price"])
-            bid_size = float(bids[0]["size"])
-            ask_size = float(asks[0]["size"])
+            # CLOB returns bids ascending (lowest first) and asks
+            # descending (highest first).
+            # Best bid = highest = bids[-1]. Best ask = lowest = asks[-1].
+            best_bid = float(bids[-1]["price"])
+            best_ask = float(asks[-1]["price"])
+            bid_size = float(bids[-1]["size"])
+            ask_size = float(asks[-1]["size"])
             spread = best_ask - best_bid
             midpoint = (best_bid + best_ask) / 2.0
             return PolymarketOrderBook(

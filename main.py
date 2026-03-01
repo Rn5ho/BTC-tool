@@ -12,6 +12,7 @@ import logging
 import signal
 import sys
 import time
+from typing import Optional
 
 from config import settings
 from data.binance_ws import BinanceDataCollector
@@ -200,12 +201,21 @@ class Orchestrator:
                     private_key=settings.polymarket_private_key,
                     funder_address=settings.polymarket_funder_address,
                     max_bet_usdc=settings.max_live_bet_usdc,
+                    fee_rate=settings.polymarket_fee_rate,
+                    fee_exponent=settings.polymarket_fee_exponent,
+                    sizing_strategy=settings.sizing_strategy,
                 )
                 ok = await self.live_trader.initialize()
                 if ok:
+                    # Restore live bankroll from DB
+                    live_pnl = await self.db.restore_live_bankroll()
+                    self.live_trader.restore_bankroll(
+                        settings.virtual_bankroll, live_pnl
+                    )
                     logger.info(
-                        "LIVE TRADING ENABLED — max bet $%.2f",
+                        "LIVE TRADING ENABLED — max bet $%.2f, bankroll $%.2f",
                         settings.max_live_bet_usdc,
+                        self.live_trader.bankroll,
                     )
                 else:
                     logger.error("Live trader failed to initialize — running paper-only")
@@ -355,20 +365,40 @@ class Orchestrator:
         )
 
     async def _cmd_stats(self, args: str = "") -> str:
-        """Handle /stats — trading performance summary."""
-        if not self.paper_trader:
-            return "Paper trader not initialized."
-        stats = await self.paper_trader.get_stats()
-        return (
-            f"\U0001f4c8 <b>TRADING STATS</b>\n\n"
-            f"Total trades: {stats.get('total_trades', 0)}\n"
-            f"Settled: {stats.get('settled_trades', 0)}\n"
-            f"Wins: {stats.get('wins', 0)} | Losses: {stats.get('losses', 0)}\n"
-            f"Win rate: <b>{stats.get('win_rate', 0):.1%}</b>\n"
-            f"Total P&amp;L: <b>${stats.get('total_pnl', 0):+.2f}</b>\n"
-            f"Bankroll: ${stats.get('bankroll', 0):,.2f}\n"
-            f"ROI: {stats.get('roi', 0):+.1%}"
-        )
+        """Handle /stats — trading performance summary (live primary, paper secondary)."""
+        parts = []
+
+        # Live stats (primary)
+        if self.live_trader and self.live_trader.is_active:
+            ls = await self.db.get_live_trading_stats_full()
+            roi = 0.0
+            if self.live_trader.initial_bankroll > 0:
+                roi = (self.live_trader.bankroll - self.live_trader.initial_bankroll) / self.live_trader.initial_bankroll
+            parts.append(
+                f"\U0001f4b5 <b>LIVE TRADING</b>\n"
+                f"Settled: {ls.get('settled', 0)} | "
+                f"W/L: {ls.get('wins', 0)}/{ls.get('losses', 0)}\n"
+                f"Win rate: <b>{ls.get('win_rate', 0):.1%}</b>\n"
+                f"P&amp;L: <b>${ls.get('total_pnl', 0):+.2f}</b>\n"
+                f"Bankroll: ${self.live_trader.bankroll:,.2f}\n"
+                f"ROI: {roi:+.1%}"
+            )
+
+        # Paper stats (secondary)
+        if self.paper_trader:
+            stats = await self.paper_trader.get_stats()
+            parts.append(
+                f"\U0001f4dd <b>PAPER TRADING</b>\n"
+                f"Settled: {stats.get('settled_trades', 0)} | "
+                f"W/L: {stats.get('wins', 0)}/{stats.get('losses', 0)}\n"
+                f"Win rate: {stats.get('win_rate', 0):.1%}\n"
+                f"P&amp;L: ${stats.get('total_pnl', 0):+.2f}\n"
+                f"Bankroll: ${stats.get('bankroll', 0):,.2f}"
+            )
+
+        if not parts:
+            return "No trading data."
+        return f"\U0001f4c8 <b>TRADING STATS</b>\n\n" + "\n\n".join(parts)
 
     async def _cmd_trades(self, args: str = "") -> str:
         """Handle /trades — list recent/pending paper trades."""
@@ -447,12 +477,21 @@ class Orchestrator:
             return "Paper trader not initialized."
 
         if not args.strip():
+            live_line = ""
+            if self.live_trader and self.live_trader.is_active:
+                live_line = (
+                    f"\n\n<b>Live:</b>\n"
+                    f"Bankroll: <b>${self.live_trader.bankroll:.2f}</b>\n"
+                    f"Initial: ${self.live_trader.initial_bankroll:.2f}\n"
+                    f"Sizing: {self.live_trader._sizing_strategy}"
+                )
             return (
                 f"\U0001f4b0 <b>BUDGET</b>\n\n"
-                f"Bankroll: <b>${self.paper_trader.bankroll:.2f}</b>\n"
+                f"<b>Paper:</b>\n"
+                f"Bankroll: ${self.paper_trader.bankroll:.2f}\n"
                 f"Initial: ${self.paper_trader.initial_bankroll:.2f}\n"
-                f"Bet size: ${self.paper_trader.bet_size:.2f}\n"
-                f"Kelly: {'on' if self.paper_trader.use_kelly else 'off'}"
+                f"Sizing: {self.paper_trader.sizing_strategy}"
+                f"{live_line}"
             )
 
         try:
@@ -464,6 +503,12 @@ class Orchestrator:
 
         self.paper_trader.bankroll = amount
         self.paper_trader.initial_bankroll = amount
+
+        # Also update live bankroll if active
+        if self.live_trader and self.live_trader.is_active:
+            self.live_trader.bankroll = amount
+            self.live_trader.initial_bankroll = amount
+            self.live_trader._max_bankroll = amount
 
         return (
             f"\U0001f4b0 <b>BUDGET UPDATED</b>\n\n"
@@ -694,52 +739,58 @@ class Orchestrator:
         )
 
     async def _cmd_balance(self, args: str = "") -> str:
-        """Handle /balance — show USDC balance and live trading summary."""
+        """Handle /balance — show USDC balance, live bankroll, and trading summary."""
         if not self.live_trader or not self.live_trader.is_active:
             return "\u26a0 Live trading is not enabled."
         balance = await self.live_trader.get_balance()
         if balance is None:
             return "\u26a0 Failed to fetch balance."
-        db_stats = await self.db.get_live_trade_stats()
+        db_stats = await self.db.get_live_trading_stats_full()
         session = self.live_trader.get_session_summary()
         pending = len(self._live_trade_tokens)
+        roi = 0.0
+        if self.live_trader.initial_bankroll > 0:
+            roi = (self.live_trader.bankroll - self.live_trader.initial_bankroll) / self.live_trader.initial_bankroll
         return (
             f"\U0001f4b0 <b>POLYMARKET BALANCE</b>\n\n"
             f"USDC: <b>${balance:.2f}</b>\n"
+            f"Live bankroll: <b>${self.live_trader.bankroll:.2f}</b>\n"
+            f"Live P&amp;L: ${db_stats.get('total_pnl', 0):+.2f} (ROI: {roi:+.1%})\n"
             f"Max bet: ${settings.max_live_bet_usdc:.2f}\n"
             f"Pending claims: {pending}\n\n"
+            f"<b>Results:</b> {db_stats.get('settled', 0)} settled | "
+            f"W/L: {db_stats.get('wins', 0)}/{db_stats.get('losses', 0)} "
+            f"({db_stats.get('win_rate', 0):.0%})\n"
             f"<b>Session:</b> {session['successful']} filled / "
-            f"{session['total']} total (${session['total_amount']:.2f})\n"
-            f"<b>All-time:</b> {db_stats['successful']} filled / "
-            f"{db_stats['total']} total (${db_stats['total_amount']:.2f})"
+            f"{session['total']} total (${session['total_amount']:.2f})"
         )
 
     async def _cmd_livetrades(self, args: str = "") -> str:
-        """Handle /livetrades — show live trade stats."""
-        if not self.live_trader or not self.live_trader.is_active:
-            # Fall back to DB stats even if trader not active this session
-            db_stats = await self.db.get_live_trade_stats()
-            if db_stats["total"] == 0:
-                return "\u26a0 No live trades recorded."
-            return (
-                f"\U0001f4b5 <b>LIVE TRADES (DB)</b>\n\n"
-                f"Total: {db_stats['total']}\n"
-                f"Successful: {db_stats['successful']}\n"
-                f"Failed: {db_stats['failed']}\n"
-                f"Total amount: ${db_stats['total_amount']:.2f}"
+        """Handle /livetrades — show live trade stats with P&L."""
+        db_stats = await self.db.get_live_trading_stats_full()
+        if db_stats["total"] == 0:
+            return "\u26a0 No live trades recorded."
+
+        lines = [
+            f"\U0001f4b5 <b>LIVE TRADES</b>\n",
+            f"<b>All time:</b>",
+            f"  Orders: {db_stats['total']} ({db_stats['successful']} filled, {db_stats['failed']} failed)",
+            f"  Settled: {db_stats['settled']} | W/L: {db_stats['wins']}/{db_stats['losses']}",
+            f"  Win rate: {db_stats['win_rate']:.1%}",
+            f"  P&amp;L: ${db_stats['total_pnl']:+.2f}",
+            f"  Volume: ${db_stats['total_amount']:.2f}",
+        ]
+
+        if self.live_trader and self.live_trader.is_active:
+            lines.append(f"\n  Bankroll: ${self.live_trader.bankroll:.2f}")
+            summary = self.live_trader.get_session_summary()
+            lines.append(
+                f"\n<b>This session:</b>\n"
+                f"  Orders: {summary['total']} ({summary['successful']} filled)\n"
+                f"  Amount: ${summary['total_amount']:.2f}"
             )
 
-        summary = self.live_trader.get_session_summary()
-        db_stats = await self.db.get_live_trade_stats()
-        return (
-            f"\U0001f4b5 <b>LIVE TRADES</b>\n\n"
-            f"<b>This session:</b>\n"
-            f"  Orders: {summary['total']} ({summary['successful']} filled)\n"
-            f"  Amount: ${summary['total_amount']:.2f}\n\n"
-            f"<b>All time (DB):</b>\n"
-            f"  Total: {db_stats['total']} ({db_stats['successful']} filled)\n"
-            f"  Amount: ${db_stats['total_amount']:.2f}"
-        )
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Main analysis loop
@@ -791,6 +842,7 @@ class Orchestrator:
 
         # Settle any stale unsettled trades from previous sessions
         await self._settle_stale_trades()
+        await self._settle_stale_live_trades()
 
         while self._running:
             try:
@@ -825,6 +877,10 @@ class Orchestrator:
                 self._window_btc_start or 0,
                 price_source,
             )
+
+        # 0b. Early exit monitoring — log bid prices for active positions
+        #     in the last 2 minutes of the window (data collection only).
+        await self._monitor_early_exit()
 
         # 1. Discover current Polymarket market
         market = await self.polymarket.discover_market()
@@ -983,10 +1039,10 @@ class Orchestrator:
                 )
                 return
 
-        # 6f. Max edge cap — edges above this are likely model error.
-        #     If our model says 20%+ edge over the market, the model is
-        #     probably wrong, not the market.
-        if signal["edge"] > self._MAX_EDGE:
+        # 6f. Max edge cap — only for classic (non-always-trade) mode.
+        #     In always-trade mode the edge is just model-vs-market gap, not
+        #     a quality signal, and the entry price filter handles thin books.
+        if not settings.always_trade and signal["edge"] > self._MAX_EDGE:
             logger.info(
                 "Skipping edge — too large (%.1f%% > %.1f%% cap): likely noise",
                 signal["edge"] * 100,
@@ -1043,25 +1099,9 @@ class Orchestrator:
             top_signals,
         )
 
-        # Paper trade
+        # Paper trade (no Telegram — paper stats kept in DB/logs only)
         if self.paper_trader:
-            trade_id = await self.paper_trader.place_trade(signal)
-            if trade_id is not None and self.alerter:
-                bet_size = self.paper_trader.compute_bet_size(
-                    signal["our_prob"],
-                    signal["market_prob"],
-                    confidence=signal.get("confidence", 0.0),
-                )
-                await self.alerter.send_trade_alert(
-                    side=signal["side"],
-                    slug=signal["market_slug"],
-                    size=bet_size,
-                    entry_price=signal["entry_price"],
-                    our_prob=signal["our_prob"],
-                    edge=signal["edge"],
-                    spread=signal.get("spread"),
-                    midpoint_price=signal.get("midpoint_price"),
-                )
+            await self.paper_trader.place_trade(signal)
 
         # Live trade — place real order on Polymarket
         if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused:
@@ -1071,13 +1111,10 @@ class Orchestrator:
                     market.up_token_id if signal["side"] == "UP"
                     else market.down_token_id
                 )
-                # Use paper trader's adaptive sizing, capped by max_live_bet
-                live_amount = self.paper_trader.compute_bet_size(
-                    signal["our_prob"],
-                    signal["market_prob"],
+                # Use live trader's own adaptive sizing (based on live bankroll)
+                live_amount = self.live_trader.compute_bet_size(
                     confidence=signal.get("confidence", 0.0),
                 )
-                live_amount = max(1.00, min(live_amount, settings.max_live_bet_usdc))
 
                 live_result = await self.live_trader.place_order(
                     token_id=token_id,
@@ -1087,17 +1124,8 @@ class Orchestrator:
                     entry_price=signal["entry_price"],
                 )
 
-                # Track token for auto-sell after settlement
-                if live_result["success"]:
-                    self._live_trade_tokens[signal["market_slug"]] = {
-                        "side": signal["side"],
-                        "token_id": token_id,
-                        "amount": live_result["amount"],
-                        "entry_price": signal["entry_price"],
-                    }
-
-                # Persist to DB
-                await self.db.save_live_trade(
+                # Persist to DB first (to get row ID for early exit tracking)
+                live_trade_id = await self.db.save_live_trade(
                     timestamp=int(time.time() * 1000),
                     market_slug=signal["market_slug"],
                     side=signal["side"],
@@ -1108,7 +1136,26 @@ class Orchestrator:
                     success=live_result["success"],
                     response_json=json.dumps(live_result.get("response"))
                     if live_result.get("response") else None,
+                    entry_price=signal["entry_price"],
                 )
+
+                # Track token for settlement + early exit
+                if live_result["success"]:
+                    from data.polymarket import compute_fee_factor
+                    fee_factor = compute_fee_factor(
+                        signal["entry_price"],
+                        settings.polymarket_fee_rate,
+                        settings.polymarket_fee_exponent,
+                    )
+                    tokens = (live_result["amount"] / signal["entry_price"]) * (1.0 - fee_factor)
+                    self._live_trade_tokens[signal["market_slug"]] = {
+                        "side": signal["side"],
+                        "token_id": token_id,
+                        "amount": live_result["amount"],
+                        "entry_price": signal["entry_price"],
+                        "tokens": tokens,
+                        "db_id": live_trade_id,
+                    }
 
                 # Telegram alert
                 if self.alerter:
@@ -1127,6 +1174,147 @@ class Orchestrator:
                 signal=signal,
                 features_breakdown=signal.get("signals", {}),
             )
+
+    # ------------------------------------------------------------------
+    # Early exit monitoring (data collection — no trading)
+    # ------------------------------------------------------------------
+
+    # Only log early exit data every N seconds to avoid flooding
+    _EARLY_EXIT_LOG_INTERVAL: float = 10.0
+    _last_early_exit_log: float = 0.0
+
+    async def _monitor_early_exit(self) -> None:
+        """Log bid prices for active positions in the last 2 min of window.
+
+        This is data collection only — no trades are placed.  The logs will
+        show whether there is enough liquidity to sell winning tokens early
+        (e.g. at $0.90+ bid) before the window settles.
+        """
+        if not self._current_slug or not self._window_start_time:
+            return
+
+        seconds_in = time.time() - self._window_start_time
+        # Only monitor in the last 120 seconds of the 5-min (300s) window
+        if seconds_in < 180:
+            return
+
+        # Rate-limit logging
+        now = time.time()
+        if now - self._last_early_exit_log < self._EARLY_EXIT_LOG_INTERVAL:
+            return
+
+        # Check if we have an active position (live or paper) on this window
+        slug = self._current_slug
+        live_pos = self._live_trade_tokens.get(slug)
+        paper_pos = self.paper_trader._pending_trades.get(slug) if self.paper_trader else None
+
+        if not live_pos and not paper_pos:
+            return
+
+        # Get the token_id for our position's side
+        pos = live_pos or paper_pos
+        side = pos["side"]
+        market = self.polymarket._current_market
+        if not market:
+            return
+
+        token_id = market.up_token_id if side == "UP" else market.down_token_id
+        entry_price = pos.get("entry_price", 0)
+
+        # Fetch the order book for our token
+        book_data = await self.polymarket.get_orderbook(token_id)
+        if not book_data:
+            return
+
+        self._last_early_exit_log = now
+
+        # Parse bids (buyers willing to buy our token).
+        # CLOB API returns bids sorted ascending — best bid is LAST.
+        bids = book_data.get("bids", [])
+        if not bids:
+            logger.info(
+                "[EARLY-EXIT] %s %s | %.0fs left | NO BIDS | entry=%.3f",
+                side, slug[-15:], 300 - seconds_in, entry_price,
+            )
+            return
+
+        # Best bid = highest price (last element in ascending sort)
+        best_bid = float(bids[-1].get("price", 0))
+        best_bid_size = float(bids[-1].get("size", 0))
+
+        # Total bid depth above 0.85
+        deep_bids = [(float(b["price"]), float(b["size"])) for b in bids if float(b["price"]) >= 0.85]
+        total_deep_size = sum(s for _, s in deep_bids)
+
+        # Current BTC price for context
+        btc = self.binance.get_latest_price()
+        btc_move = ""
+        if btc and self._window_btc_start:
+            delta = btc - self._window_btc_start
+            btc_move = f" | BTC {'+' if delta >= 0 else ''}{delta:.2f}"
+
+        # Would we profit by selling at best_bid?
+        profit_pct = ((best_bid / entry_price) - 1) * 100 if entry_price > 0 else 0
+
+        seconds_left = 300 - seconds_in
+
+        logger.info(
+            "[EARLY-EXIT] %s %s | %.0fs left | bid=%.3f x%.0f | depth>=0.85: %.0f tokens | "
+            "entry=%.3f profit=%.1f%%%s",
+            side, slug[-15:], seconds_left,
+            best_bid, best_bid_size,
+            total_deep_size,
+            entry_price, profit_pct, btc_move,
+        )
+
+        # ---- EARLY EXIT TRIGGER ----
+        # Sell live tokens when bid is high enough to lock in profit.
+        # No time restriction — if someone offers 90%+ value at any point
+        # in the last 2 minutes, take it rather than risk a reversal.
+        available_depth = best_bid_size + total_deep_size
+        if (live_pos
+                and not live_pos.get("exited")
+                and self.live_trader
+                and best_bid >= 0.90
+                and available_depth >= 20):
+
+            result = await self.live_trader.sell_early_exit(
+                token_id=token_id,
+                tokens=live_pos["tokens"],
+                best_bid=best_bid,
+                market_slug=slug,
+            )
+
+            if result["success"]:
+                sell_amount = result["sell_amount"]
+                buy_amount = live_pos["amount"]
+                pnl = sell_amount - buy_amount
+
+                await self.db.update_live_trade(
+                    live_pos["db_id"], "EARLY_EXIT", pnl, int(time.time()),
+                )
+                self.live_trader.record_settlement(pnl > 0, pnl)
+                live_pos["exited"] = True
+
+                logger.info(
+                    "[EARLY-EXIT SOLD] %s %s | bid=%.3f | tokens=%.1f | "
+                    "sell=$%.2f buy=$%.2f | pnl=$%+.2f | %.0fs before settlement",
+                    side, slug[-15:], best_bid, live_pos["tokens"],
+                    sell_amount, buy_amount, pnl, seconds_left,
+                )
+
+                # Telegram alert
+                if self.alerter:
+                    try:
+                        await self.alerter._send(
+                            f"<b>EARLY EXIT</b>\n\n"
+                            f"Market: {slug}\n"
+                            f"Side: {side} | Sold at ${best_bid:.3f}\n"
+                            f"Tokens: {live_pos['tokens']:.1f} | Sell: ${sell_amount:.2f}\n"
+                            f"PnL: <b>${pnl:+.2f}</b> | {seconds_left:.0f}s early"
+                        )
+                    except Exception:
+                        pass
 
     # ------------------------------------------------------------------
     # Window settlement
@@ -1181,16 +1369,18 @@ class Orchestrator:
                 stats.get("bankroll", 0),
             )
 
-        # Auto-sell winning live trade tokens to reclaim USDC.
-        # Runs as a background task with initial delay so it doesn't block
-        # the next window's trade placement.
+        # Settle live trades from DB for this window
         slug = self._current_slug
-        if slug and slug in self._live_trade_tokens and self.live_trader:
+        if self.live_trader and self.live_trader.is_active:
+            await self._settle_live_trades_for_window(slug, btc_went_up)
+
+        # Also handle in-memory tracked tokens (for Telegram alerts on
+        # trades placed this session but not yet in the settlement DB flow)
+        if slug and slug in self._live_trade_tokens:
             live_info = self._live_trade_tokens.pop(slug)
             trade_won = (live_info["side"] == "UP" and btc_went_up) or \
                         (live_info["side"] == "DOWN" and not btc_went_up)
 
-            # Notify live trade settlement via Telegram
             if self.alerter:
                 outcome = "WIN" if trade_won else "LOSS"
                 amt = live_info.get("amount", 0)
@@ -1202,15 +1392,141 @@ class Orchestrator:
                     entry_price=live_info.get("entry_price", 0),
                 )
 
-            # Auto-sell disabled — Polymarket's claim/redeem system is
-            # unreliable. Claim winnings manually on polymarket.com.
-            # if trade_won:
-            #     asyncio.create_task(
-            #         self._delayed_auto_sell(slug, live_info)
-            #     )
-
             if self.alerter:
-                await self.alerter.send_stats_summary(stats)
+                await self.alerter.send_stats_summary(
+                    stats, live_info=await self._build_live_info()
+                )
+
+    async def _settle_live_trades_for_window(
+        self, slug: str, btc_went_up: bool
+    ) -> None:
+        """Settle unsettled live trades matching the given slug."""
+        if not self.live_trader:
+            return
+        unsettled = await self.db.get_unsettled_live_trades()
+        for row in unsettled:
+            if row["market_slug"] != slug:
+                continue
+            side = row["side"]
+            amount = row["amount_usdc"]
+            entry_price = row.get("entry_price") or 0.0
+
+            won = (side == "UP" and btc_went_up) or (side == "DOWN" and not btc_went_up)
+            outcome = "WIN" if won else "LOSS"
+
+            # PnL calculation (same as paper trader)
+            if entry_price > 0:
+                fee_factor = 0.0
+                if self.live_trader._fee_rate > 0:
+                    from data.polymarket import compute_fee_factor
+                    fee_factor = compute_fee_factor(
+                        entry_price,
+                        self.live_trader._fee_rate,
+                        self.live_trader._fee_exponent,
+                    )
+                shares = (amount / entry_price) * (1.0 - fee_factor)
+                pnl = (shares - amount) if won else -amount
+            else:
+                pnl = -amount if not won else 0.0
+
+            # Update DB
+            settled_at = int(time.time() * 1000)
+            await self.db.update_live_trade(row["id"], outcome, pnl, settled_at)
+
+            # Update live trader internal state
+            self.live_trader.record_settlement(won, pnl)
+
+            logger.info(
+                "Settled live trade: %s %s -> %s | pnl=$%+.2f | live bankroll=$%.2f",
+                side, slug, outcome, pnl, self.live_trader.bankroll,
+            )
+
+    async def _settle_stale_live_trades(self) -> None:
+        """Settle stale unsettled live trades from previous sessions."""
+        if not self.live_trader:
+            return
+        unsettled = await self.db.get_unsettled_live_trades()
+        current_slug = self._current_slug or self.polymarket.get_current_slug()
+
+        stale = [r for r in unsettled if r["market_slug"] != current_slug]
+        if not stale:
+            return
+
+        logger.info(
+            "Found %d stale unsettled live trade(s) — settling", len(stale)
+        )
+
+        for row in stale:
+            slug = row["market_slug"]
+            try:
+                window_ts = int(slug.rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                logger.warning("Cannot parse window ts from live trade slug %s — voiding", slug)
+                await self.db.update_live_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            window_start_ms = window_ts * 1000
+            window_end_ms = (window_ts + 300) * 1000
+
+            btc_start = await self.db.get_btc_price_at(window_start_ms)
+            btc_end = await self.db.get_btc_price_at(window_end_ms)
+
+            if btc_start is None or btc_end is None:
+                logger.warning(
+                    "No candle data for live trade window %s — voiding trade %d",
+                    slug, row["id"],
+                )
+                await self.db.update_live_trade(
+                    row["id"], "VOID", 0.0, int(time.time() * 1000)
+                )
+                continue
+
+            btc_went_up = btc_end >= btc_start
+            side = row["side"]
+            amount = row["amount_usdc"]
+            entry_price = row.get("entry_price") or 0.0
+            won = (side == "UP" and btc_went_up) or (side == "DOWN" and not btc_went_up)
+            outcome = "WIN" if won else "LOSS"
+
+            if entry_price > 0:
+                fee_factor = 0.0
+                if self.live_trader._fee_rate > 0:
+                    from data.polymarket import compute_fee_factor
+                    fee_factor = compute_fee_factor(
+                        entry_price,
+                        self.live_trader._fee_rate,
+                        self.live_trader._fee_exponent,
+                    )
+                shares = (amount / entry_price) * (1.0 - fee_factor)
+                pnl = (shares - amount) if won else -amount
+            else:
+                pnl = -amount if not won else 0.0
+
+            settled_at = int(time.time() * 1000)
+            await self.db.update_live_trade(row["id"], outcome, pnl, settled_at)
+            self.live_trader.record_settlement(won, pnl)
+
+            logger.info(
+                "Settled stale live trade: %s %s | BTC $%.2f -> $%.2f (%s) | pnl=$%+.2f",
+                side, slug, btc_start, btc_end,
+                "UP" if btc_went_up else "DOWN", pnl,
+            )
+
+    async def _build_live_info(self) -> Optional[dict]:
+        """Build live trading info dict for stats summaries."""
+        if not self.live_trader or not self.live_trader.is_active:
+            return None
+        balance = await self.live_trader.get_balance()
+        db_stats = await self.db.get_live_trading_stats_full()
+        session = self.live_trader.get_session_summary()
+        return {
+            "balance": balance,
+            "db_stats": db_stats,
+            "session": session,
+            "bankroll": self.live_trader.bankroll,
+        }
 
     async def _delayed_auto_sell(self, slug: str, live_info: dict) -> None:
         """Background task: wait for matching engine, then auto-sell winning tokens.
@@ -1332,17 +1648,17 @@ class Orchestrator:
                     report = self.paper_trader.format_stats_report(stats)
                     logger.info("\n%s", report)
 
-                    # Attach live trading info if available
-                    live_info = None
+                    # Log live stats
                     if self.live_trader and self.live_trader.is_active:
-                        balance = await self.live_trader.get_balance()
-                        db_stats = await self.db.get_live_trade_stats()
-                        session = self.live_trader.get_session_summary()
-                        live_info = {
-                            "balance": balance,
-                            "db_stats": db_stats,
-                            "session": session,
-                        }
+                        ls = await self.db.get_live_trading_stats_full()
+                        logger.info(
+                            "Live stats: %d settled, %d/%d W/L, WR=%.1f%%, P&L=$%+.2f, bankroll=$%.2f",
+                            ls.get("settled", 0), ls.get("wins", 0), ls.get("losses", 0),
+                            ls.get("win_rate", 0) * 100, ls.get("total_pnl", 0),
+                            self.live_trader.bankroll,
+                        )
+
+                    live_info = await self._build_live_info()
 
                     if self.alerter:
                         await self.alerter.send_stats_summary(

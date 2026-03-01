@@ -183,32 +183,42 @@ class TelegramAlerter:
     async def send_stats_summary(
         self, stats: dict, live_info: Optional[dict] = None
     ) -> None:
-        """Send a periodic statistics summary with optional live trading info."""
-        text = (
-            f"\U0001f4c8 <b>STATS UPDATE</b>\n\n"
-            f"<b>Paper Trading:</b>\n"
-            f"Trades: {stats.get('total_trades', 0)} | Settled: {stats.get('settled_trades', 0)}\n"
-            f"Win rate: {stats.get('win_rate', 0):.1%}\n"
-            f"P&amp;L: ${stats.get('total_pnl', 0):+.2f}\n"
-            f"Bankroll: ${stats.get('bankroll', 0):.2f}\n"
-            f"ROI: {stats.get('roi', 0):+.1%}"
-        )
+        """Send a periodic statistics summary with live trading as primary."""
+        parts = [f"\U0001f4c8 <b>STATS UPDATE</b>\n"]
 
+        # Live trading first (primary)
         if live_info:
             balance = live_info.get("balance")
             db = live_info.get("db_stats", {})
             session = live_info.get("session", {})
-            text += "\n\n\U0001f4b5 <b>Live Trading:</b>\n"
+            bankroll = live_info.get("bankroll", 0)
+            parts.append("\U0001f4b5 <b>Live Trading:</b>")
             if balance is not None:
-                text += f"USDC Balance: <b>${balance:.2f}</b>\n"
-            text += (
+                parts.append(f"USDC: <b>${balance:.2f}</b> | Bankroll: ${bankroll:.2f}")
+            settled = db.get("settled", 0)
+            wins = db.get("wins", 0)
+            losses = db.get("losses", 0)
+            wr = db.get("win_rate", 0)
+            pnl = db.get("total_pnl", 0)
+            parts.append(
+                f"Settled: {settled} | W/L: {wins}/{losses} ({wr:.0%})\n"
+                f"P&amp;L: <b>${pnl:+.2f}</b>"
+            )
+            parts.append(
                 f"Session: {session.get('successful', 0)} filled / "
-                f"{session.get('total', 0)} total (${session.get('total_amount', 0):.2f})\n"
-                f"All-time: {db.get('successful', 0)} filled / "
-                f"{db.get('total', 0)} total (${db.get('total_amount', 0):.2f})"
+                f"{session.get('total', 0)} total"
             )
 
-        await self._send(text)
+        # Paper trading (secondary)
+        parts.append(
+            f"\n\U0001f4dd <b>Paper Trading:</b>\n"
+            f"Settled: {stats.get('settled_trades', 0)} | "
+            f"WR: {stats.get('win_rate', 0):.1%}\n"
+            f"P&amp;L: ${stats.get('total_pnl', 0):+.2f} | "
+            f"Bankroll: ${stats.get('bankroll', 0):.2f}"
+        )
+
+        await self._send("\n".join(parts))
 
     async def send_live_trade_alert(
         self,

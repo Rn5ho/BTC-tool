@@ -52,6 +52,51 @@ class BinanceDataCollector:
     # Public lifecycle
     # ------------------------------------------------------------------
 
+    async def prefetch_candles(self, count: int = 35) -> int:
+        """Fetch recent closed 1m candles from Binance REST API.
+
+        Populates ``self.candles`` so the ML model can run immediately
+        without waiting for 30+ minutes of WebSocket streaming.
+        Returns the number of candles loaded.
+        """
+        import aiohttp
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": "BTCUSDT", "interval": "1m", "limit": count + 1}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        logger.warning("Binance klines API returned %d", resp.status)
+                        return 0
+                    data = await resp.json()
+        except Exception as exc:
+            logger.warning("Failed to prefetch candles: %s", exc)
+            return 0
+
+        loaded = 0
+        for row in data:
+            # Binance kline format: [open_time, o, h, l, c, vol, close_time,
+            #   quote_vol, trades, taker_buy_vol, taker_buy_quote_vol, ignore]
+            is_closed = row[6] < int(time.time() * 1000)
+            if not is_closed:
+                continue  # skip the still-forming candle
+            candle = Candle(
+                timestamp=row[0],
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+                taker_buy_volume=float(row[9]),
+                trades=row[8],
+                closed=True,
+            )
+            self.candles.append(candle)
+            loaded += 1
+
+        logger.info("Prefetched %d candles from Binance REST API", loaded)
+        return loaded
+
     async def start(self) -> None:
         """Connect to Binance spot + futures streams and process messages."""
         self._running = True
