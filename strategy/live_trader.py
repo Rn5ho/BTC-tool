@@ -161,15 +161,22 @@ class LiveTrader:
 
                 _orig = OrderBuilder.get_market_order_amounts
 
+                from decimal import Decimal, ROUND_DOWN as _RD
+
                 def _patched(self, side, amount, price, round_config):
                     if side != _BUY:
                         return _orig(self, side, amount, price, round_config)
                     # BUY: taker=tokens (max 2 dec), maker=USDC (max 4 dec)
+                    # Use Decimal to avoid float imprecision (e.g. 5.93*0.59
+                    # = 3.49869... in float but exactly 3.4987 in Decimal).
                     raw_price = round_normal(price, round_config.price)
                     raw_taker = round_down(amount / raw_price, 2)
-                    raw_maker = raw_taker * raw_price
-                    if decimal_places(raw_maker) > 4:
-                        raw_maker = round_down(raw_maker, 4)
+                    d_taker = Decimal(str(raw_taker))
+                    d_price = Decimal(str(raw_price))
+                    d_maker = d_taker * d_price
+                    if d_maker.as_tuple().exponent < -4:
+                        d_maker = d_maker.quantize(Decimal("0.0001"), rounding=_RD)
+                    raw_maker = float(d_maker)
                     return (
                         UtilsBuy,
                         to_token_decimals(raw_maker),

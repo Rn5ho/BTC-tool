@@ -40,6 +40,7 @@ class EdgeDetector:
         self.fee_exponent = fee_exponent
         self.always_trade = always_trade
         self.min_confidence = min_confidence
+        self.last_skip_reason: str | None = None
         logger.info(
             "EdgeDetector initialised with min_edge=%.2f, max_edge=%.2f, fee_rate=%.3f, "
             "fee_exponent=%d, always_trade=%s, min_confidence=%.3f",
@@ -120,9 +121,8 @@ class EdgeDetector:
 
             # Skip when model confidence is below threshold
             if confidence < self.min_confidence:
-                logger.debug(
-                    "Skipping — confidence %.3f%% < %.3f%% threshold on %s",
-                    confidence * 100, self.min_confidence * 100, market.slug,
+                self.last_skip_reason = (
+                    f"low confidence ({confidence*100:.1f}% < {self.min_confidence*100:.1f}%)"
                 )
                 return None
 
@@ -184,9 +184,12 @@ class EdgeDetector:
         # Exploration range 0.25-0.35: traded at minimum size to collect WR data.
         # Below 0.25: too thin / too contrarian to be useful.
         if entry_price > 0.65 or entry_price < 0.25:
+            self.last_skip_reason = (
+                f"entry price ${entry_price:.3f} outside 0.25-0.65"
+            )
             logger.info(
-                "Skipping — entry price %.3f outside 0.25-0.65 range on %s %s",
-                entry_price, best_side, market.slug,
+                "Skipping — %s on %s %s",
+                self.last_skip_reason, best_side, market.slug,
             )
             return None
 

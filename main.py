@@ -145,6 +145,10 @@ class Orchestrator:
         self._last_heartbeat: float = 0.0
         self._HEARTBEAT_INTERVAL: float = 30.0  # seconds between status lines
 
+        # Track skip reason per window for Telegram notification
+        self._window_skip_reason: str | None = None
+        self._window_traded: bool = False
+
         # Hour blacklist — UTC hours where the model underperforms.
         # Parsed once from config; empty set = no blacklist.
         self._blacklist_hours: set[int] = set()
@@ -207,11 +211,22 @@ class Orchestrator:
                 )
                 ok = await self.live_trader.initialize()
                 if ok:
-                    # Restore live bankroll from DB
-                    live_pnl = await self.db.restore_live_bankroll()
-                    self.live_trader.restore_bankroll(
-                        settings.virtual_bankroll, live_pnl
-                    )
+                    # Prefer real CLOB balance over simulated DB PnL
+                    real_balance = await self.live_trader.get_balance()
+                    if real_balance is not None and real_balance > 0:
+                        self.live_trader.bankroll = real_balance
+                        self.live_trader.initial_bankroll = settings.virtual_bankroll
+                        self.live_trader._max_bankroll = real_balance
+                        logger.info(
+                            "Live bankroll from CLOB: $%.2f (deposited ~$%.2f)",
+                            real_balance, settings.virtual_bankroll,
+                        )
+                    else:
+                        # Fallback to DB-based restoration
+                        live_pnl = await self.db.restore_live_bankroll()
+                        self.live_trader.restore_bankroll(
+                            settings.virtual_bankroll, live_pnl
+                        )
                     logger.info(
                         "LIVE TRADING ENABLED — max bet $%.2f, bankroll $%.2f",
                         settings.max_live_bet_usdc,
@@ -881,6 +896,8 @@ class Orchestrator:
         if self._current_slug != current_slug:
             self._current_slug = current_slug
             self._window_start_time = self._slug_start_time(current_slug)
+            self._window_skip_reason = None
+            self._window_traded = False
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
             price_source = "Chainlink Stream"
@@ -970,6 +987,9 @@ class Orchestrator:
         )
 
         if signal is None:
+            # Capture skip reason from edge detector
+            if not self._window_skip_reason and self.edge_detector.last_skip_reason:
+                self._window_skip_reason = self.edge_detector.last_skip_reason
             # Quiet heartbeat — only log once every HEARTBEAT_INTERVAL
             now = time.time()
             if now - self._last_heartbeat >= self._HEARTBEAT_INTERVAL:
@@ -1003,6 +1023,7 @@ class Orchestrator:
 
         # 6a. Skip if trading is paused.
         if self._paused:
+            self._window_skip_reason = "paused"
             return
 
         # 6b. Skip if we already have a pending trade on this market.
@@ -1018,20 +1039,15 @@ class Orchestrator:
         #     After the cutoff the market has already priced in the move.
         seconds_in_window = time.time() - self._window_start_time
         if seconds_in_window > self._MAX_ENTRY_SECONDS:
-            logger.debug(
-                "Skipping edge — too late in window (%.0fs > %.0fs cutoff)",
-                seconds_in_window,
-                self._MAX_ENTRY_SECONDS,
-            )
+            if not self._window_skip_reason:
+                self._window_skip_reason = "time gate (>120s)"
             return
 
         # 6d. Hour blacklist — skip hours with historically poor performance.
         from datetime import datetime, timezone as _tz
         current_hour = datetime.now(_tz.utc).hour
         if current_hour in self._blacklist_hours:
-            logger.debug(
-                "Skipping edge — hour %02d:00 UTC is blacklisted", current_hour
-            )
+            self._window_skip_reason = f"blacklisted hour ({current_hour:02d}:00 UTC)"
             return
 
         # 6e. Trend-conflict filter — don't bet against a strong intra-window
@@ -1044,11 +1060,10 @@ class Orchestrator:
             btc_trending_down = window_move_pct < -self._TREND_CONFLICT_PCT
             if (signal["side"] == "UP" and btc_trending_down) or \
                (signal["side"] == "DOWN" and btc_trending_up):
-                logger.info(
-                    "Skipping edge — trend conflict: signal=%s but BTC moved %+.2f%% this window",
-                    signal["side"],
-                    window_move_pct,
+                self._window_skip_reason = (
+                    f"trend conflict ({signal['side']} vs BTC {window_move_pct:+.2f}%)"
                 )
+                logger.info("Skipping edge — %s", self._window_skip_reason)
                 return
 
         # 6f. Max edge cap — only for classic (non-always-trade) mode.
@@ -1111,6 +1126,8 @@ class Orchestrator:
             f"{btc_now:,.2f}" if btc_now else "N/A",
             top_signals,
         )
+
+        self._window_traded = True
 
         # Paper trade (no Telegram — paper stats kept in DB/logs only)
         if self.paper_trader:
@@ -1296,6 +1313,7 @@ class Orchestrator:
         available_depth = best_bid_size + total_deep_size
         if (live_pos
                 and not live_pos.get("exited")
+                and not live_pos.get("exit_failed")
                 and self.live_trader
                 and best_bid >= 0.90
                 and available_depth >= 20):
@@ -1306,6 +1324,13 @@ class Orchestrator:
                 best_bid=best_bid,
                 market_slug=slug,
             )
+
+            if not result["success"]:
+                live_pos["exit_failed"] = True
+                logger.warning(
+                    "[EARLY-EXIT] Sell failed for %s — will not retry this window",
+                    slug[-15:],
+                )
 
             if result["success"]:
                 sell_amount = result["sell_amount"]
@@ -1373,6 +1398,17 @@ class Orchestrator:
             direction,
             price_source,
         )
+
+        # Notify on skipped windows
+        if not self._window_traded and self._window_skip_reason and self.alerter:
+            try:
+                await self.alerter._send(
+                    f"<b>SKIPPED</b> {self._current_slug}\n"
+                    f"Reason: {self._window_skip_reason}\n"
+                    f"BTC: ${self._window_btc_start:,.2f} -> ${btc_end:,.2f} ({direction})"
+                )
+            except Exception:
+                pass
 
         if self.paper_trader:
             await self.paper_trader.settle_all_pending(
@@ -1669,6 +1705,19 @@ class Orchestrator:
                     stats = await self.paper_trader.get_stats()
                     report = self.paper_trader.format_stats_report(stats)
                     logger.info("\n%s", report)
+
+                    # Sync bankroll from real CLOB balance
+                    if self.live_trader and self.live_trader.is_active:
+                        real_bal = await self.live_trader.get_balance()
+                        if real_bal is not None and real_bal > 0:
+                            old_br = self.live_trader.bankroll
+                            self.live_trader.bankroll = real_bal
+                            if real_bal > self.live_trader._max_bankroll:
+                                self.live_trader._max_bankroll = real_bal
+                            logger.info(
+                                "Bankroll synced from CLOB: $%.2f (was $%.2f)",
+                                real_bal, old_br,
+                            )
 
                     # Log live stats
                     if self.live_trader and self.live_trader.is_active:
