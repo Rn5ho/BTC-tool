@@ -286,7 +286,7 @@ The edge detector (`strategy/edge.py`) supports two modes:
 ### Safety Filters (both modes)
 1. **Min confidence** (`MIN_CONFIDENCE=0.015`): Skip when |P(up) - 0.5| below threshold (always-trade mode)
 2. **Max edge cap** (`MAX_EDGE_THRESHOLD=0.18`): Edges above 18% are rejected as model error (classic mode only; disabled in always-trade mode — edge size doesn't predict WR)
-3. **Entry price filter**: Hard reject outside 0.25-0.65. Core range 0.35-0.65 uses normal sizing. **Exploration range 0.25-0.35**: traded at minimum size ($1 paper / $3.50 live) to collect WR data, tagged `trade_tag="exploration"` in DB.
+3. **Entry price filter**: Hard reject outside 0.25-0.65. Core range 0.35-0.65 uses normal sizing. **Exploration range 0.25-0.35**: traded at minimum size ($1 paper / $2.00 live) to collect WR data, tagged `trade_tag="exploration"` in DB. Live exploration uses $2.00 floor (not $3.50) since at entry prices 0.25-0.35, $2.00 buys 5+ tokens.
 4. **Time gate** (`_MAX_ENTRY_SECONDS=120`): Only enter in first 2 minutes of 5-min window
 5. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
 6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT=0.15`): Skip if BTC moved >0.15% against our signal direction within current window
@@ -502,6 +502,22 @@ Runs 24/7 on Hetzner VPS in Helsinki, Finland at `65.21.178.90` (CX22 tier):
 20. **Early exit retry spam on 1s loop** (fixed): After moving early exit to dedicated 1s loop, failed sell attempts retried every second. Fixed with `exit_failed` flag on the position dict.
 
 21. **DB PnL understates real profits** (known — mitigated): DB tracks simulated settlements while CLOB has real fills, maker trades (counterparty hitting our GTC orders), and manual redemptions. Gap was ~$30 after 14 hours. **Mitigated by syncing bankroll from real CLOB balance** on startup and every 30 min.
+
+22. **`sell_early_exit` NameError on success log** (fixed): `sell_amount` variable was undefined at line 569 of `live_trader.py`. Every successful early exit sell crashed the log line, caught by `except`, logged "EARLY EXIT FAILED" even though the CLOB order went through. Fixed: replaced with `expected_usdc`.
+
+23. **Duplicate Telegram alerts for early-exited trades** (fixed): `_settle_previous_window()` Path B sent WIN/LOSS settlement alerts for trades that were already early-exited. Fixed: added `if not live_info.get("exited")` guard.
+
+24. **No HTTP timeout on Polymarket API** (fixed): `aiohttp.ClientSession()` had no timeout — a hung API call would freeze the entire bot. Fixed: added `aiohttp.ClientTimeout(total=15)`.
+
+25. **`/status` showed wrong P(up)** (fixed): Used degraded 12-feature `predict()` fallback instead of `predict_from_candles()` with full 44 features. Same class of bug as #19. Fixed: `/status` now uses `predict_from_candles()` when ML model is active.
+
+26. **NaN in ML features could crash prediction** (fixed): No NaN check before `scaler.transform()`. A malformed Binance candle would propagate NaN through the entire feature vector. Fixed: added `np.isnan` guard in both `predict()` and `predict_from_candles()`.
+
+27. **`settled_at` timestamp inconsistency** (fixed): Early exit stored `settled_at` in seconds (`int(time.time())`), normal settlement in milliseconds (`int(time.time() * 1000)`). Fixed: early exit now uses milliseconds consistently.
+
+28. **No live trade dedup guard** (fixed): Paper trader checked `if slug in _pending_trades`, but live trader had no equivalent guard. Could theoretically double-order on same window. Fixed: added `if market.slug in self._live_trade_tokens: return`.
+
+29. **Missing DB index on live_trades settlement queries** (fixed): `WHERE success = 1 AND outcome IS NULL` ran as full table scan every settlement cycle. Added composite index `idx_live_trades_outcome ON live_trades(success, outcome)`.
 
 ## Conventions
 

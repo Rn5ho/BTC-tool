@@ -1038,6 +1038,8 @@ class Orchestrator:
             and market.slug in self.paper_trader._pending_trades
         ):
             return
+        if market.slug in self._live_trade_tokens:
+            return
 
         btc_now = self.binance.get_latest_price()
 
@@ -1346,7 +1348,7 @@ class Orchestrator:
                 pnl = sell_amount - buy_amount
 
                 await self.db.update_live_trade(
-                    live_pos["db_id"], "EARLY_EXIT", pnl, int(time.time()),
+                    live_pos["db_id"], "EARLY_EXIT", pnl, int(time.time() * 1000),
                 )
                 self.live_trader.record_settlement(pnl > 0, pnl)
                 live_pos["exited"] = True

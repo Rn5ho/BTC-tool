@@ -111,6 +111,7 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_live_trades_ts ON live_trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_live_trades_slug ON live_trades(market_slug);
+                CREATE INDEX IF NOT EXISTS idx_live_trades_outcome ON live_trades(success, outcome);
                 """
             )
             await self._db.commit()
