@@ -1404,9 +1404,10 @@ class Orchestrator:
             reason = self._window_skip_reason or "no signal from model"
             try:
                 await self.alerter._send(
-                    f"<b>SKIPPED</b> {self._current_slug}\n"
+                    f"SKIPPED {self._current_slug}\n"
                     f"Reason: {reason}\n"
-                    f"BTC: ${self._window_btc_start:,.2f} -> ${btc_end:,.2f} ({direction})"
+                    f"BTC: ${self._window_btc_start:,.2f} to ${btc_end:,.2f} ({direction})",
+                    parse_mode=None,
                 )
             except Exception:
                 logger.exception("Failed to send skip notification")
