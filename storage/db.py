@@ -140,6 +140,9 @@ class Database:
             ("live_trades", "pnl", "REAL"),
             ("live_trades", "entry_price", "REAL"),
             ("live_trades", "settled_at", "INTEGER"),
+            # trade_tag for exploration vs normal trades
+            ("paper_trades", "trade_tag", "TEXT"),
+            ("live_trades", "trade_tag", "TEXT"),
         ]
         for table, column, col_type in alter_statements:
             try:
@@ -239,8 +242,8 @@ class Database:
                 INSERT INTO paper_trades
                     (timestamp, market_slug, side, our_prob, market_prob,
                      edge, size_usdc, entry_price, outcome, pnl, settled_at,
-                     entry_spread, midpoint_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     entry_spread, midpoint_price, trade_tag)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.timestamp,
@@ -256,6 +259,7 @@ class Database:
                     trade.settled_at,
                     trade.entry_spread,
                     trade.midpoint_price,
+                    trade.trade_tag,
                 ),
             )
             await self._db.commit()
@@ -307,6 +311,7 @@ class Database:
         success: bool,
         response_json: Optional[str] = None,
         entry_price: float = 0.0,
+        trade_tag: Optional[str] = None,
     ) -> Optional[int]:
         """Insert a live trade record. Returns the row id on success."""
         try:
@@ -314,8 +319,9 @@ class Database:
                 """
                 INSERT INTO live_trades
                     (timestamp, market_slug, side, token_id, amount_usdc,
-                     order_id, status, success, response_json, entry_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     order_id, status, success, response_json, entry_price,
+                     trade_tag)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -328,6 +334,7 @@ class Database:
                     1 if success else 0,
                     response_json,
                     entry_price,
+                    trade_tag,
                 ),
             )
             await self._db.commit()

@@ -222,6 +222,10 @@ class PaperTrader:
             confidence=signal.get("confidence", abs(signal["our_prob"] - 0.5)),
         )
 
+        # Exploration trades: override sizing to minimum for data collection
+        if signal.get("size_override"):
+            bet_size = signal["size_override"]
+
         if bet_size <= 0:
             logger.info(
                 "Bet size is zero for %s (edge=%.4f) -- skipping",
@@ -241,6 +245,7 @@ class PaperTrader:
             entry_price=signal["entry_price"],
             entry_spread=signal.get("spread"),
             midpoint_price=signal.get("midpoint_price"),
+            trade_tag="exploration" if signal.get("exploration") else None,
         )
 
         await self.db.save_paper_trade(trade)

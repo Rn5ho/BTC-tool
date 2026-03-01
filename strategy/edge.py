@@ -179,16 +179,23 @@ class EdgeDetector:
             entry_price = market.down_best_ask if market.down_best_ask else raw_down
             spread = market.down_spread
 
-        # Reject entry prices outside the profitable range.
-        # Data shows 0.50-0.60 is the sweet spot (64% WR); above 0.65 the
-        # market has already priced in the move and WR drops to ~47%.
-        # Below 0.35 the book is too thin / contrarian.
-        if entry_price > 0.65 or entry_price < 0.35:
+        # Reject entry prices outside the tradeable range.
+        # Core range 0.35-0.65: data shows 0.50-0.60 = 64% WR, >0.65 drops to ~47%.
+        # Exploration range 0.25-0.35: traded at minimum size to collect WR data.
+        # Below 0.25: too thin / too contrarian to be useful.
+        if entry_price > 0.65 or entry_price < 0.25:
             logger.info(
-                "Skipping — entry price %.3f outside 0.35-0.65 range on %s %s",
+                "Skipping — entry price %.3f outside 0.25-0.65 range on %s %s",
                 entry_price, best_side, market.slug,
             )
             return None
+
+        exploration = entry_price < 0.35
+        if exploration:
+            logger.info(
+                "Exploration signal — entry price %.3f in 0.25-0.35 range on %s %s",
+                entry_price, best_side, market.slug,
+            )
 
         fee_factor = compute_fee_factor(
             entry_price, self.fee_rate, self.fee_exponent
@@ -212,6 +219,7 @@ class EdgeDetector:
             "confidence": confidence,
             "signals": signals,
             "market_slug": market.slug,
+            "exploration": exploration,
         }
 
         logger.debug(

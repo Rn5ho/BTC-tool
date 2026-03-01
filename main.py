@@ -1077,7 +1077,8 @@ class Orchestrator:
         )
         fee_pct = signal.get("fee_factor", 0.0) * 100
         conf_pct = signal.get("confidence", 0.0) * 100
-        model_tag = "ML" if self._use_ml else "RB"
+        explore_tag = " [EXPLORE]" if signal.get("exploration") else ""
+        model_tag = ("ML" if self._use_ml else "RB") + explore_tag
         spread_val = signal.get("spread")
         midpoint_val = signal.get("midpoint_price")
         spread_info = ""
@@ -1101,7 +1102,10 @@ class Orchestrator:
 
         # Paper trade (no Telegram — paper stats kept in DB/logs only)
         if self.paper_trader:
-            await self.paper_trader.place_trade(signal)
+            paper_signal = signal
+            if signal.get("exploration"):
+                paper_signal = {**signal, "size_override": 1.00}
+            await self.paper_trader.place_trade(paper_signal)
 
         # Live trade — place real order on Polymarket
         if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused:
@@ -1112,9 +1116,13 @@ class Orchestrator:
                     else market.down_token_id
                 )
                 # Use live trader's own adaptive sizing (based on live bankroll)
-                live_amount = self.live_trader.compute_bet_size(
-                    confidence=signal.get("confidence", 0.0),
-                )
+                # Exploration trades: minimum size ($3.50 floor) for data collection
+                if signal.get("exploration"):
+                    live_amount = 3.50
+                else:
+                    live_amount = self.live_trader.compute_bet_size(
+                        confidence=signal.get("confidence", 0.0),
+                    )
 
                 live_result = await self.live_trader.place_order(
                     token_id=token_id,
@@ -1125,6 +1133,7 @@ class Orchestrator:
                 )
 
                 # Persist to DB first (to get row ID for early exit tracking)
+                trade_tag = "exploration" if signal.get("exploration") else None
                 live_trade_id = await self.db.save_live_trade(
                     timestamp=int(time.time() * 1000),
                     market_slug=signal["market_slug"],
@@ -1137,6 +1146,7 @@ class Orchestrator:
                     response_json=json.dumps(live_result.get("response"))
                     if live_result.get("response") else None,
                     entry_price=signal["entry_price"],
+                    trade_tag=trade_tag,
                 )
 
                 # Track token for settlement + early exit

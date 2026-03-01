@@ -106,3 +106,4 @@ class PaperTrade:
     settled_at: Optional[int] = None
     entry_spread: Optional[float] = None  # bid-ask spread at entry
     midpoint_price: Optional[float] = None  # midpoint at entry (for comparison)
+    trade_tag: Optional[str] = None  # "exploration" for low-entry-price data collection trades
