@@ -2120,9 +2120,9 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def _stats_loop(self) -> None:
-        """Periodically log and send trading stats (every 30 minutes)."""
+        """Periodically log and send trading stats (every 60 minutes)."""
         while self._running:
-            await asyncio.sleep(1800)  # 30 minutes
+            await asyncio.sleep(3600)  # 60 minutes
             try:
                 if self.paper_trader:
                     stats = await self.paper_trader.get_stats()
