@@ -144,6 +144,11 @@ class Database:
             # trade_tag for exploration vs normal trades
             ("paper_trades", "trade_tag", "TEXT"),
             ("live_trades", "trade_tag", "TEXT"),
+            # regime detection columns
+            ("paper_trades", "regime_state", "TEXT"),
+            ("paper_trades", "regime_strength", "REAL"),
+            ("live_trades", "regime_state", "TEXT"),
+            ("live_trades", "regime_strength", "REAL"),
         ]
         for table, column, col_type in alter_statements:
             try:
@@ -243,8 +248,9 @@ class Database:
                 INSERT INTO paper_trades
                     (timestamp, market_slug, side, our_prob, market_prob,
                      edge, size_usdc, entry_price, outcome, pnl, settled_at,
-                     entry_spread, midpoint_price, trade_tag)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     entry_spread, midpoint_price, trade_tag,
+                     regime_state, regime_strength)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.timestamp,
@@ -261,6 +267,8 @@ class Database:
                     trade.entry_spread,
                     trade.midpoint_price,
                     trade.trade_tag,
+                    trade.regime_state,
+                    trade.regime_strength,
                 ),
             )
             await self._db.commit()
@@ -313,6 +321,8 @@ class Database:
         response_json: Optional[str] = None,
         entry_price: float = 0.0,
         trade_tag: Optional[str] = None,
+        regime_state: Optional[str] = None,
+        regime_strength: Optional[float] = None,
     ) -> Optional[int]:
         """Insert a live trade record. Returns the row id on success."""
         try:
@@ -321,8 +331,8 @@ class Database:
                 INSERT INTO live_trades
                     (timestamp, market_slug, side, token_id, amount_usdc,
                      order_id, status, success, response_json, entry_price,
-                     trade_tag)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     trade_tag, regime_state, regime_strength)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -336,6 +346,8 @@ class Database:
                     response_json,
                     entry_price,
                     trade_tag,
+                    regime_state,
+                    regime_strength,
                 ),
             )
             await self._db.commit()
@@ -407,56 +419,66 @@ class Database:
             return []
 
     async def get_live_trading_stats_full(self) -> dict:
-        """Compute full live trading stats including win/loss/P&L."""
+        """Compute full live trading stats including win/loss/P&L.
+
+        Includes ALL outcomes: WIN, LOSS, EARLY_EXIT, maker fills.
+        Win rate is calculated from WIN/(WIN+LOSS) only — early exits excluded
+        from WR denominator since they are neither a full win nor a full loss.
+        Total P&L always includes every settled trade (taker + maker + early exit).
+        """
         stats = {
             "total": 0, "successful": 0, "failed": 0, "total_amount": 0.0,
-            "settled": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
-            "total_pnl": 0.0,
+            "settled": 0, "wins": 0, "losses": 0, "early_exits": 0,
+            "maker_fills": 0, "win_rate": 0.0,
+            "total_pnl": 0.0, "early_exit_pnl": 0.0, "maker_pnl": 0.0,
         }
         try:
-            cursor = await self._db.execute("SELECT COUNT(*) FROM live_trades")
+            # Order counts
+            cursor = await self._db.execute(
+                """
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful,
+                    COALESCE(SUM(CASE WHEN success = 1 THEN amount_usdc ELSE 0 END), 0.0) as total_amount
+                FROM live_trades
+                """
+            )
             row = await cursor.fetchone()
             stats["total"] = row[0]
-
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM live_trades WHERE success = 1"
-            )
-            row = await cursor.fetchone()
-            stats["successful"] = row[0]
+            stats["successful"] = row[1]
             stats["failed"] = stats["total"] - stats["successful"]
+            stats["total_amount"] = row[2]
 
+            # Settlement stats — all in one query
             cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(amount_usdc), 0.0) FROM live_trades WHERE success = 1"
+                """
+                SELECT
+                    SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) as settled,
+                    SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN outcome = 'LOSS' THEN 1 ELSE 0 END) as losses,
+                    SUM(CASE WHEN outcome = 'EARLY_EXIT' THEN 1 ELSE 0 END) as early_exits,
+                    SUM(CASE WHEN trade_tag = 'maker_fill' AND outcome IS NOT NULL THEN 1 ELSE 0 END) as maker_fills,
+                    COALESCE(SUM(pnl), 0.0) as total_pnl,
+                    COALESCE(SUM(CASE WHEN outcome = 'EARLY_EXIT' THEN pnl ELSE 0 END), 0.0) as early_exit_pnl,
+                    COALESCE(SUM(CASE WHEN trade_tag = 'maker_fill' THEN pnl ELSE 0 END), 0.0) as maker_pnl
+                FROM live_trades
+                WHERE success = 1
+                """
             )
             row = await cursor.fetchone()
-            stats["total_amount"] = row[0]
+            stats["settled"] = row[0] or 0
+            stats["wins"] = row[1] or 0
+            stats["losses"] = row[2] or 0
+            stats["early_exits"] = row[3] or 0
+            stats["maker_fills"] = row[4] or 0
+            stats["total_pnl"] = row[5]
+            stats["early_exit_pnl"] = row[6]
+            stats["maker_pnl"] = row[7]
 
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM live_trades WHERE outcome IS NOT NULL"
-            )
-            row = await cursor.fetchone()
-            stats["settled"] = row[0]
-
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM live_trades WHERE outcome = 'WIN'"
-            )
-            row = await cursor.fetchone()
-            stats["wins"] = row[0]
-
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM live_trades WHERE outcome = 'LOSS'"
-            )
-            row = await cursor.fetchone()
-            stats["losses"] = row[0]
-
-            if stats["settled"] > 0:
-                stats["win_rate"] = stats["wins"] / stats["settled"]
-
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(pnl), 0.0) FROM live_trades WHERE pnl IS NOT NULL"
-            )
-            row = await cursor.fetchone()
-            stats["total_pnl"] = row[0]
+            # Win rate from W/L only (early exits excluded from denominator)
+            wl_total = stats["wins"] + stats["losses"]
+            if wl_total > 0:
+                stats["win_rate"] = stats["wins"] / wl_total
         except Exception:
             logger.exception("Failed to compute full live trade stats")
         return stats
@@ -472,6 +494,42 @@ class Database:
         except Exception:
             logger.exception("Failed to restore live bankroll")
             return 0.0
+
+    async def get_all_settled_live_trades(self) -> list[dict]:
+        """Return ALL settled live trades: WIN, LOSS, EARLY_EXIT, maker fills.
+
+        This is the canonical query for analysis/backtesting. Use this instead
+        of writing raw SQL — it guarantees no outcomes are missed.
+        """
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM live_trades "
+                "WHERE success = 1 AND outcome IS NOT NULL AND pnl IS NOT NULL "
+                "ORDER BY timestamp"
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch all settled live trades")
+            return []
+
+    async def get_all_settled_paper_trades(self) -> list[dict]:
+        """Return ALL settled paper trades: WIN, LOSS, EARLY_EXIT, regime_flip, etc.
+
+        This is the canonical query for analysis/backtesting. Use this instead
+        of writing raw SQL — it guarantees no outcomes are missed.
+        """
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM paper_trades "
+                "WHERE outcome IS NOT NULL AND pnl IS NOT NULL "
+                "ORDER BY timestamp"
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch all settled paper trades")
+            return []
 
     async def save_market_snapshot(
         self,
@@ -578,63 +636,58 @@ class Database:
             return []
 
     async def get_trading_stats(self) -> dict:
-        """Compute aggregate trading statistics across all paper trades."""
+        """Compute aggregate trading statistics across all paper trades.
+
+        Includes ALL outcomes: WIN, LOSS, EARLY_EXIT, regime_flip, exploration.
+        Win rate is calculated from WIN/(WIN+LOSS) only — early exits excluded
+        from WR denominator since they are neither a full win nor a full loss.
+        Total P&L always includes every settled trade.
+        """
         stats = {
             "total_trades": 0,
             "settled_trades": 0,
             "wins": 0,
             "losses": 0,
+            "early_exits": 0,
             "win_rate": 0.0,
             "total_pnl": 0.0,
+            "early_exit_pnl": 0.0,
             "avg_edge": 0.0,
             "avg_pnl_per_trade": 0.0,
         }
         try:
-            # Total trades
-            cursor = await self._db.execute("SELECT COUNT(*) FROM paper_trades")
+            # All counts in one query
+            cursor = await self._db.execute(
+                """
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) as settled,
+                    SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN outcome = 'LOSS' THEN 1 ELSE 0 END) as losses,
+                    SUM(CASE WHEN outcome = 'EARLY_EXIT' THEN 1 ELSE 0 END) as early_exits,
+                    COALESCE(SUM(pnl), 0.0) as total_pnl,
+                    COALESCE(SUM(CASE WHEN outcome = 'EARLY_EXIT' THEN pnl ELSE 0 END), 0.0) as early_exit_pnl,
+                    COALESCE(AVG(edge), 0.0) as avg_edge
+                FROM paper_trades
+                """
+            )
             row = await cursor.fetchone()
+
             stats["total_trades"] = row[0]
+            stats["settled_trades"] = row[1]
+            stats["wins"] = row[2]
+            stats["losses"] = row[3]
+            stats["early_exits"] = row[4]
+            stats["total_pnl"] = row[5]
+            stats["early_exit_pnl"] = row[6]
+            stats["avg_edge"] = row[7]
 
-            # Settled trades
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM paper_trades WHERE outcome IS NOT NULL"
-            )
-            row = await cursor.fetchone()
-            stats["settled_trades"] = row[0]
+            # Win rate from W/L only (early exits excluded from denominator)
+            wl_total = stats["wins"] + stats["losses"]
+            if wl_total > 0:
+                stats["win_rate"] = stats["wins"] / wl_total
 
-            # Wins
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM paper_trades WHERE outcome = 'WIN'"
-            )
-            row = await cursor.fetchone()
-            stats["wins"] = row[0]
-
-            # Losses
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM paper_trades WHERE outcome = 'LOSS'"
-            )
-            row = await cursor.fetchone()
-            stats["losses"] = row[0]
-
-            # Win rate
-            if stats["settled_trades"] > 0:
-                stats["win_rate"] = stats["wins"] / stats["settled_trades"]
-
-            # Total PnL
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(pnl), 0.0) FROM paper_trades WHERE pnl IS NOT NULL"
-            )
-            row = await cursor.fetchone()
-            stats["total_pnl"] = row[0]
-
-            # Average edge
-            cursor = await self._db.execute(
-                "SELECT COALESCE(AVG(edge), 0.0) FROM paper_trades"
-            )
-            row = await cursor.fetchone()
-            stats["avg_edge"] = row[0]
-
-            # Average PnL per settled trade
+            # Average PnL per settled trade (all outcomes)
             if stats["settled_trades"] > 0:
                 stats["avg_pnl_per_trade"] = stats["total_pnl"] / stats["settled_trades"]
 
@@ -643,3 +696,38 @@ class Database:
             logger.exception("Failed to compute trading stats")
 
         return stats
+
+    async def get_recent_live_trades(self, n: int = 5) -> list[dict]:
+        """Return the last N settled live trades, most recent first."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM live_trades "
+                "WHERE success = 1 AND outcome IS NOT NULL "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (n,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch recent live trades")
+            return []
+
+    async def get_today_live_trades(self) -> list[dict]:
+        """Return all settled live trades from today (UTC)."""
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_ms = int(start_of_day.timestamp() * 1000)
+            cursor = await self._db.execute(
+                "SELECT * FROM live_trades "
+                "WHERE success = 1 AND outcome IS NOT NULL "
+                "AND timestamp >= ? "
+                "ORDER BY timestamp",
+                (start_ms,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch today's live trades")
+            return []
