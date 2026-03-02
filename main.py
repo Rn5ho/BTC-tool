@@ -1305,23 +1305,20 @@ class Orchestrator:
                         "db_id": live_trade_id,
                     }
 
-                # Telegram alert
+                # Telegram alert — combined trade + signal info
                 if self.alerter:
-                    await self.alerter.send_live_trade_alert(
+                    await self.alerter.send_trade_placed_alert(
                         side=signal["side"],
                         slug=signal["market_slug"],
                         amount=live_result["amount"],
+                        entry_price=signal["entry_price"],
+                        confidence=signal.get("confidence", 0.0),
+                        edge=signal.get("edge", 0.0),
                         order_id=live_result.get("order_id"),
                         success=live_result["success"],
                         error_msg=live_result.get("error", ""),
                     )
 
-        # Telegram edge alert (only fires once per market — when trade is placed)
-        if self.alerter:
-            await self.alerter.send_edge_alert(
-                signal=signal,
-                features_breakdown=signal.get("signals", {}),
-            )
 
     # ------------------------------------------------------------------
     # Early exit monitoring (data collection — no trading)
