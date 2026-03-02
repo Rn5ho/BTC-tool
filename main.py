@@ -19,6 +19,7 @@ from data.binance_ws import BinanceDataCollector
 from data.polymarket import PolymarketClient
 from signals.features import FeatureEngine
 from signals.probability import ProbabilityModel
+from signals.regime import RegimeDetector
 from strategy.edge import EdgeDetector
 from storage.db import Database
 
@@ -109,6 +110,9 @@ class Orchestrator:
             always_trade=settings.always_trade,
             min_confidence=settings.min_confidence,
         )
+        self.regime_detector = RegimeDetector(
+            trend_threshold=settings.regime_trend_threshold,
+        )
         self.paper_trader = None  # initialized in start()
         self.live_trader = None   # initialized in start() when LIVE_TRADING=true
         self.alerter = None       # initialized in start()
@@ -116,6 +120,7 @@ class Orchestrator:
         # State
         self._running = False
         self._paused = False  # when True, analysis loop skips trading
+        self._current_regime = None  # RegimeState from last classification
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
         self._window_start_time: float = 0.0  # unix timestamp of window start (from slug)
@@ -123,7 +128,7 @@ class Orchestrator:
         # Trade entry timing — only enter trades in the first N seconds of a
         # 5-minute window.  After this cutoff the market has already priced in
         # the move and any "edge" our model sees is likely stale.
-        self._MAX_ENTRY_SECONDS: float = 120.0  # first 2 minutes of the 5-min window
+        self._MAX_ENTRY_SECONDS: float = 60.0  # first 60s only — data shows 60-120s entries have 24.5% WR (-$53)
 
         # Trend-conflict filter — if BTC has already moved more than this
         # percentage within the current window and our signal is the opposite
@@ -147,6 +152,7 @@ class Orchestrator:
 
         # Track skip reason per window for Telegram notification
         self._window_skip_reason: str | None = None
+        self._window_skip_notified: bool = False
         self._window_traded: bool = False
 
         # Hour blacklist — UTC hours where the model underperforms.
@@ -169,6 +175,60 @@ class Orchestrator:
             return float(slug.rsplit("-", 1)[1])
         except (IndexError, ValueError):
             return time.time()
+
+    def _build_flipped_signal(
+        self, original: dict, market, new_side: str
+    ) -> dict | None:
+        """Build a flipped signal for paper trading during trends.
+
+        Swaps the side to the trend direction, looks up the correct entry
+        price from the market order book, and recalculates probabilities.
+        Returns None if the flipped entry price is outside the tradeable range.
+        """
+        from data.polymarket import compute_fee_factor
+
+        if new_side == "UP":
+            entry_price = market.up_best_ask if market.up_best_ask else market.up_price
+            midpoint = market.up_price
+            spread = market.up_spread
+            market_prob = market.up_price
+        else:
+            entry_price = market.down_best_ask if market.down_best_ask else market.down_price
+            midpoint = market.down_price
+            spread = market.down_spread
+            market_prob = market.down_price
+
+        # Entry price filter (same as edge detector)
+        if entry_price > 0.65 or entry_price < 0.25:
+            return None
+
+        # For flipped trades, set our_prob slightly above market to reflect
+        # trend conviction (we're betting on regime, not the ML model).
+        our_prob = market_prob + 0.02
+
+        fee_factor = compute_fee_factor(
+            entry_price, settings.polymarket_fee_rate, settings.polymarket_fee_exponent
+        )
+        adj_market = market_prob / (1.0 - fee_factor) if fee_factor < 1.0 else market_prob
+        edge = max(our_prob - adj_market, 0.001)
+
+        return {
+            "side": new_side,
+            "our_prob": our_prob,
+            "market_prob": market_prob,
+            "edge": edge,
+            "entry_price": entry_price,
+            "midpoint_price": midpoint,
+            "spread": spread,
+            "fee_factor": fee_factor,
+            "confidence": abs(self._current_regime.strength),
+            "signals": original.get("signals", {}),
+            "market_slug": original["market_slug"],
+            "exploration": entry_price < 0.35,
+            "regime_state": original.get("regime_state"),
+            "regime_strength": original.get("regime_strength"),
+            "regime_flip": True,
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -319,16 +379,14 @@ class Orchestrator:
         self.alerter.register_command("status", self._cmd_status)
         self.alerter.register_command("stats", self._cmd_stats)
         self.alerter.register_command("trades", self._cmd_trades)
-        self.alerter.register_command("reset", self._cmd_reset)
-        self.alerter.register_command("budget", self._cmd_budget)
+        self.alerter.register_command("recent", self._cmd_recent)
+        self.alerter.register_command("today", self._cmd_today)
         self.alerter.register_command("pause", self._cmd_pause)
         self.alerter.register_command("resume", self._cmd_resume)
         self.alerter.register_command("weights", self._cmd_weights)
         self.alerter.register_command("regime", self._cmd_regime)
         self.alerter.register_command("analyze", self._cmd_analyze)
         self.alerter.register_command("spread", self._cmd_spread)
-        self.alerter.register_command("balance", self._cmd_balance)
-        self.alerter.register_command("livetrades", self._cmd_livetrades)
 
     async def _cmd_status(self, args: str = "") -> str:
         """Handle /status — current BTC price, model output, market odds."""
@@ -387,155 +445,154 @@ class Orchestrator:
         )
 
     async def _cmd_stats(self, args: str = "") -> str:
-        """Handle /stats — trading performance summary (live primary, paper secondary)."""
+        """Handle /stats — comprehensive trading stats (live primary)."""
         parts = []
 
         # Live stats (primary)
         if self.live_trader and self.live_trader.is_active:
             ls = await self.db.get_live_trading_stats_full()
+            balance = await self.live_trader.get_balance()
+            session = self.live_trader.get_session_summary()
             roi = 0.0
             if self.live_trader.initial_bankroll > 0:
                 roi = (self.live_trader.bankroll - self.live_trader.initial_bankroll) / self.live_trader.initial_bankroll
+            ee_str = f" + {ls.get('early_exits', 0)}ee" if ls.get("early_exits") else ""
+            mk_str = f" + {ls.get('maker_fills', 0)}mk" if ls.get("maker_fills") else ""
+
+            balance_line = ""
+            if balance is not None:
+                balance_line = f"USDC: <b>${balance:.2f}</b>\n"
+
             parts.append(
                 f"\U0001f4b5 <b>LIVE TRADING</b>\n"
+                f"{balance_line}"
+                f"Bankroll: <b>${self.live_trader.bankroll:,.2f}</b> | ROI: {roi:+.1%}\n"
                 f"Settled: {ls.get('settled', 0)} | "
-                f"W/L: {ls.get('wins', 0)}/{ls.get('losses', 0)}\n"
+                f"W/L: {ls.get('wins', 0)}/{ls.get('losses', 0)}{ee_str}{mk_str}\n"
                 f"Win rate: <b>{ls.get('win_rate', 0):.1%}</b>\n"
                 f"P&amp;L: <b>${ls.get('total_pnl', 0):+.2f}</b>\n"
-                f"Bankroll: ${self.live_trader.bankroll:,.2f}\n"
-                f"ROI: {roi:+.1%}"
+                f"Volume: ${ls.get('total_amount', 0):,.2f}\n"
+                f"Max bet: ${settings.max_live_bet_usdc:.2f}\n"
+                f"Session: {session.get('successful', 0)} filled / "
+                f"{session.get('total', 0)} total"
             )
 
-        # Paper stats (secondary)
+        # Paper stats (secondary — one compact line)
         if self.paper_trader:
             stats = await self.paper_trader.get_stats()
             parts.append(
-                f"\U0001f4dd <b>PAPER TRADING</b>\n"
-                f"Settled: {stats.get('settled_trades', 0)} | "
-                f"W/L: {stats.get('wins', 0)}/{stats.get('losses', 0)}\n"
-                f"Win rate: {stats.get('win_rate', 0):.1%}\n"
-                f"P&amp;L: ${stats.get('total_pnl', 0):+.2f}\n"
-                f"Bankroll: ${stats.get('bankroll', 0):,.2f}"
+                f"\n\U0001f4dd Paper: "
+                f"{stats.get('wins', 0)}W/{stats.get('losses', 0)}L "
+                f"({stats.get('win_rate', 0):.0%}) "
+                f"${stats.get('total_pnl', 0):+.2f}"
             )
 
         if not parts:
             return "No trading data."
-        return f"\U0001f4c8 <b>TRADING STATS</b>\n\n" + "\n\n".join(parts)
+        return f"\U0001f4c8 <b>STATS</b>\n\n" + "\n\n".join(parts)
 
     async def _cmd_trades(self, args: str = "") -> str:
-        """Handle /trades — list recent/pending paper trades."""
-        if not self.paper_trader:
-            return "Paper trader not initialized."
+        """Handle /trades — list pending live positions and recent settlements."""
+        # Pending live positions (in-memory, this session)
+        pending = self._live_trade_tokens
+        unsettled = await self.db.get_unsettled_live_trades()
 
-        pending = self.paper_trader._pending_trades
-        if not pending:
-            stats = await self.paper_trader.get_stats()
-            settled = stats.get('settled_trades', 0)
+        if not pending and not unsettled:
+            db_stats = await self.db.get_live_trading_stats_full()
             return (
                 f"\U0001f4dd <b>TRADES</b>\n\n"
-                f"No pending trades.\n"
-                f"Total settled: {settled}"
+                f"No pending positions.\n"
+                f"Settled: {db_stats.get('settled', 0)} | "
+                f"W/L: {db_stats.get('wins', 0)}/{db_stats.get('losses', 0)}"
             )
 
-        lines = [f"\U0001f4dd <b>PENDING TRADES</b>\n"]
-        for slug, trade in pending.items():
+        lines = [f"\U0001f4dd <b>PENDING POSITIONS</b>\n"]
+        for slug, info in pending.items():
+            status = ""
+            if info.get("exited"):
+                status = " [EXITED]"
             lines.append(
-                f"  {trade['side']} {slug}\n"
-                f"  Entry: {trade['entry_price']:.3f} | "
-                f"Size: ${trade['size_usdc']:.2f}"
+                f"  {info['side']} {slug}{status}\n"
+                f"  Entry: {info.get('entry_price', 0):.3f} | "
+                f"Size: ${info.get('amount', 0):.2f} | "
+                f"Tokens: {info.get('tokens', 0):.1f}"
+            )
+        # Show DB unsettled trades not in memory (from previous sessions)
+        memory_slugs = set(pending.keys())
+        db_only = [r for r in unsettled if r["market_slug"] not in memory_slugs]
+        if db_only:
+            lines.append(f"\n<b>Unsettled (prior sessions):</b>")
+            for r in db_only[:5]:
+                lines.append(
+                    f"  {r['side']} {r['market_slug']}\n"
+                    f"  Entry: {r.get('entry_price', 0):.3f} | "
+                    f"Size: ${r['amount_usdc']:.2f}"
+                )
+            if len(db_only) > 5:
+                lines.append(f"  ... and {len(db_only) - 5} more")
+        return "\n".join(lines)
+
+    async def _cmd_recent(self, args: str = "") -> str:
+        """Handle /recent [N] — show last N settled live trades."""
+        n = 5
+        if args.strip():
+            try:
+                n = min(max(int(args.strip()), 1), 10)
+            except ValueError:
+                return "Usage: /recent [1-10]"
+
+        trades = await self.db.get_recent_live_trades(n)
+        if not trades:
+            return "\U0001f4dd No settled live trades yet."
+
+        lines = [f"\U0001f4dd <b>LAST {len(trades)} TRADES</b>\n"]
+        now_ms = int(time.time() * 1000)
+        for t in trades:
+            outcome = t.get("outcome", "?")
+            icon = "\u2705" if outcome == "WIN" else ("\u274c" if outcome == "LOSS" else "\U0001f4b0")
+            pnl = t.get("pnl", 0) or 0
+            entry = t.get("entry_price", 0) or 0
+            side = t.get("side", "?")
+            ago_min = (now_ms - t["timestamp"]) / 60000
+            if ago_min < 60:
+                ago_str = f"{ago_min:.0f}m ago"
+            elif ago_min < 1440:
+                ago_str = f"{ago_min / 60:.1f}h ago"
+            else:
+                ago_str = f"{ago_min / 1440:.1f}d ago"
+            lines.append(
+                f"{icon} {side} @ {entry:.3f} | "
+                f"${pnl:+.2f} | {ago_str}"
             )
         return "\n".join(lines)
 
-    async def _cmd_reset(self, args: str = "") -> str:
-        """Handle /reset — clear all trade data and reset bankroll.
+    async def _cmd_today(self, args: str = "") -> str:
+        """Handle /today — today's trading performance (UTC)."""
+        trades = await self.db.get_today_live_trades()
+        if not trades:
+            return "\U0001f4c5 No live trades today (UTC)."
 
-        This is a destructive operation so requires confirmation via
-        a second /reset within 30 seconds.
-        """
-        if not self.paper_trader:
-            return "Paper trader not initialized."
+        wins = sum(1 for t in trades if t["outcome"] == "WIN")
+        losses = sum(1 for t in trades if t["outcome"] == "LOSS")
+        early_exits = sum(1 for t in trades if t["outcome"] == "EARLY_EXIT")
+        total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
 
-        now = time.time()
-        # Simple confirmation: first /reset sets a timestamp, second /reset
-        # within 30s actually resets.
-        if hasattr(self, "_reset_requested_at") and now - self._reset_requested_at < 30:
-            try:
-                # Clear trades from DB
-                await self.db._db.execute("DELETE FROM paper_trades")
-                await self.db._db.execute("DELETE FROM feature_snapshots")
-                await self.db._db.execute("DELETE FROM market_snapshots")
-                await self.db._db.commit()
+        # Best and worst trade
+        best = max(trades, key=lambda t: t.get("pnl", 0) or 0)
+        worst = min(trades, key=lambda t: t.get("pnl", 0) or 0)
 
-                # Reset in-memory state
-                self.paper_trader._pending_trades.clear()
-                self.paper_trader._total_fees = 0.0
-                self.paper_trader.bankroll = self.paper_trader.initial_bankroll
+        wl_total = wins + losses
+        wr = (wins / wl_total * 100) if wl_total > 0 else 0
 
-                self._reset_requested_at = 0
-                logger.info("Database RESET via Telegram command")
-                return (
-                    "\U0001f5d1 <b>RESET COMPLETE</b>\n\n"
-                    f"All trades cleared.\n"
-                    f"Bankroll reset to ${self.paper_trader.initial_bankroll:.2f}"
-                )
-            except Exception as e:
-                logger.exception("Error during reset")
-                return f"\u26a0 Reset failed: {e}"
-        else:
-            self._reset_requested_at = now
-            return (
-                "\u26a0 <b>CONFIRM RESET</b>\n\n"
-                "This will delete ALL trade data and reset the bankroll.\n"
-                "Send /reset again within 30 seconds to confirm."
-            )
-
-    async def _cmd_budget(self, args: str = "") -> str:
-        """Handle /budget [amount] — show or set the bankroll.
-
-        /budget        — show current bankroll and bet size
-        /budget 200    — set bankroll to $200
-        """
-        if not self.paper_trader:
-            return "Paper trader not initialized."
-
-        if not args.strip():
-            live_line = ""
-            if self.live_trader and self.live_trader.is_active:
-                live_line = (
-                    f"\n\n<b>Live:</b>\n"
-                    f"Bankroll: <b>${self.live_trader.bankroll:.2f}</b>\n"
-                    f"Initial: ${self.live_trader.initial_bankroll:.2f}\n"
-                    f"Sizing: {self.live_trader._sizing_strategy}"
-                )
-            return (
-                f"\U0001f4b0 <b>BUDGET</b>\n\n"
-                f"<b>Paper:</b>\n"
-                f"Bankroll: ${self.paper_trader.bankroll:.2f}\n"
-                f"Initial: ${self.paper_trader.initial_bankroll:.2f}\n"
-                f"Sizing: {self.paper_trader.sizing_strategy}"
-                f"{live_line}"
-            )
-
-        try:
-            amount = float(args.strip())
-            if amount <= 0:
-                return "Amount must be positive."
-        except ValueError:
-            return f"Invalid amount: {args.strip()}\nUsage: /budget 200"
-
-        self.paper_trader.bankroll = amount
-        self.paper_trader.initial_bankroll = amount
-
-        # Also update live bankroll if active
-        if self.live_trader and self.live_trader.is_active:
-            self.live_trader.bankroll = amount
-            self.live_trader.initial_bankroll = amount
-            self.live_trader._max_bankroll = amount
-
-        return (
-            f"\U0001f4b0 <b>BUDGET UPDATED</b>\n\n"
-            f"Bankroll set to <b>${amount:.2f}</b>"
-        )
+        ee_str = f" + {early_exits}ee" if early_exits else ""
+        lines = [
+            f"\U0001f4c5 <b>TODAY (UTC)</b>\n",
+            f"Trades: {len(trades)} | W/L: {wins}/{losses}{ee_str} ({wr:.0f}%)",
+            f"P&amp;L: <b>${total_pnl:+.2f}</b>",
+            f"Best: ${best.get('pnl', 0) or 0:+.2f} ({best['side']} @ {best.get('entry_price', 0) or 0:.3f})",
+            f"Worst: ${worst.get('pnl', 0) or 0:+.2f} ({worst['side']} @ {worst.get('entry_price', 0) or 0:.3f})",
+        ]
+        return "\n".join(lines)
 
     async def _cmd_pause(self, args: str = "") -> str:
         """Handle /pause — stop placing new trades (data collection continues)."""
@@ -587,53 +644,66 @@ class Orchestrator:
         return "\n".join(lines)
 
     async def _cmd_regime(self, args: str = "") -> str:
-        """Handle /regime — show current market regime from EMA cross + BB position."""
+        """Handle /regime — show full 5-component regime detection breakdown."""
         candles = self.binance.get_candles(n=50)
-        if len(candles) < 21:
-            return "\u26a0 Need at least 21 candles for regime calculation."
+        if len(candles) < 30:
+            return "\u26a0 Need at least 30 candles for regime calculation."
 
         from signals.indicators import TechnicalIndicators
 
-        ema_cross = TechnicalIndicators.ema_cross_signal(candles)
-        bb_pos = TechnicalIndicators.bb_position(candles)
-        if hasattr(self.model, '_normalize_regime'):
-            regime = self.model._normalize_regime(ema_cross, bb_pos)
-        else:
-            # ML model: compute regime as simple EMA cross signal
-            regime = max(-0.5, min(0.5, ema_cross * 100))
+        regime = self.regime_detector.classify(candles)
 
-        # Visual bar
-        bar_pos = int((regime + 0.5) * 20)  # 0-20 scale
+        # Visual bar: map strength [-1, 1] to position [0, 20]
+        bar_pos = int((regime.strength + 1.0) * 10)
         bar_pos = max(0, min(20, bar_pos))
         bar = "\u2591" * bar_pos + "\u2588" + "\u2591" * (20 - bar_pos)
 
-        if regime < -0.15:
-            label = "BEARISH"
-        elif regime > 0.15:
-            label = "BULLISH"
-        else:
-            label = "NEUTRAL"
+        labels = {
+            "trending_up": "TRENDING UP",
+            "trending_down": "TRENDING DOWN",
+            "ranging": "RANGING",
+        }
+        label = labels.get(regime.regime, regime.regime.upper())
+
+        # Direction consistency detail
+        recent = candles[-20:]
+        ups = sum(1 for c in recent if c.close > c.open)
+        downs = len(recent) - ups
+        dir_detail = f"{max(ups, downs)}/{len(recent)} {'UP' if ups > downs else 'DOWN'}"
+
+        # Price vs EMA detail
+        closes = [c.close for c in candles]
+        ema21 = TechnicalIndicators.ema(closes, 21)
+        recent10 = candles[-10:]
+        above = sum(1 for c in recent10 if c.close > ema21)
+        pve_detail = f"{above}/10 {'above' if above >= 5 else 'below'}"
+
+        # Momentum detail
+        mom10 = TechnicalIndicators.momentum(candles, lookback=10)
+        mom20 = TechnicalIndicators.momentum(candles, lookback=20)
+        mom_agree = "agree" if (mom10 > 0) == (mom20 > 0) else "disagree"
 
         btc = self.binance.get_latest_price()
-        closes = [c.close for c in candles]
         ema9 = TechnicalIndicators.ema(closes, 9)
-        ema21 = TechnicalIndicators.ema(closes, 21)
-        lower, middle, upper = TechnicalIndicators.bollinger_bands(candles)
 
         return (
             f"\U0001f30d <b>MARKET REGIME</b>\n\n"
-            f"Regime: <b>{label}</b> ({regime:+.3f})\n"
+            f"Regime: <b>{label}</b> (strength: {regime.strength:+.2f})\n"
             f"[{bar}]\n"
             f"  BEAR {'<' * 10} {'>' * 10} BULL\n\n"
             f"<b>Components:</b>\n"
-            f"  EMA cross: {ema_cross:+.4f} (EMA9=${ema9:,.0f} vs EMA21=${ema21:,.0f})\n"
-            f"  BB position: {bb_pos:.3f} (0=lower, 1=upper)\n"
-            f"  BB range: ${lower:,.0f} - ${upper:,.0f}\n\n"
-            f"BTC: ${btc:,.2f}"
+            f"  Direction (20c):  {dir_detail} ({regime.direction_pct:+.2f})\n"
+            f"  Momentum 10/20m:  {mom_agree} ({regime.momentum_score:+.2f})\n"
+            f"  EMA-21 slope:     {regime.ema_slope:+.2f}\n"
+            f"  Price vs EMA:     {pve_detail} ({regime.price_vs_ema:+.2f})\n"
+            f"  EMA cross:        {regime.ema_cross:+.2f}\n\n"
+            f"BTC: ${btc:,.2f} | EMA9: ${ema9:,.0f} | EMA21: ${ema21:,.0f}\n"
+            f"Threshold: {self.regime_detector.trend_threshold:.2f} | "
+            f"Paper filter: {'ACTIVE' if regime.regime != 'ranging' else 'off'}"
         )
 
     async def _cmd_analyze(self, args: str = "") -> str:
-        """Handle /analyze — run trade analysis on the DB."""
+        """Handle /analyze — run trade analysis on live trades (incl. maker fills)."""
         try:
             import sqlite3 as _sqlite3
             from collections import defaultdict as _defaultdict
@@ -642,41 +712,31 @@ class Orchestrator:
             conn = _sqlite3.connect(self.db.db_path)
             conn.row_factory = _sqlite3.Row
             trades = [dict(r) for r in conn.execute(
-                "SELECT * FROM paper_trades WHERE outcome IS NOT NULL ORDER BY timestamp"
+                "SELECT * FROM live_trades "
+                "WHERE success = 1 AND outcome IS NOT NULL "
+                "ORDER BY timestamp"
             ).fetchall()]
             conn.close()
 
             if not trades:
-                return "\u26a0 No settled trades to analyze."
+                return "\u26a0 No settled live trades to analyze."
 
-            total = len(trades)
-            wins = sum(1 for t in trades if t["outcome"] == "WIN")
+            # Split by type
+            taker_trades = [t for t in trades if t.get("trade_tag") != "maker_fill"]
+            maker_trades = [t for t in trades if t.get("trade_tag") == "maker_fill"]
+            early_exits = [t for t in trades if t["outcome"] == "EARLY_EXIT"]
+            settled = [t for t in trades if t["outcome"] in ("WIN", "LOSS")]
+
+            total = len(settled)
+            wins = sum(1 for t in settled if t["outcome"] == "WIN")
             losses = total - wins
             total_pnl = sum(t["pnl"] or 0 for t in trades)
-            avg_pnl = total_pnl / total if total else 0
-
-            # Edge bucket analysis
-            buckets = [
-                ("5-8%", 0.05, 0.08), ("8-12%", 0.08, 0.12),
-                ("12-16%", 0.12, 0.16), ("16-20%", 0.16, 0.20),
-                ("20%+", 0.20, 1.00),
-            ]
-            edge_lines = []
-            for label, lo, hi in buckets:
-                subset = [t for t in trades if lo <= t["edge"] < hi]
-                if not subset:
-                    continue
-                bwins = sum(1 for t in subset if t["outcome"] == "WIN")
-                bwr = bwins / len(subset) * 100
-                bpnl = sum(t["pnl"] or 0 for t in subset)
-                edge_lines.append(
-                    f"  {label:>6s}: {bwr:.0f}% ({bwins}/{len(subset)}) ${bpnl:+.2f}"
-                )
+            avg_pnl = total_pnl / len(trades) if trades else 0
 
             # Side analysis
             side_lines = []
             for side in ("UP", "DOWN"):
-                subset = [t for t in trades if t["side"] == side]
+                subset = [t for t in settled if t["side"] == side]
                 if not subset:
                     continue
                 swins = sum(1 for t in subset if t["outcome"] == "WIN")
@@ -686,9 +746,26 @@ class Orchestrator:
                     f"  {side}: {swr:.0f}% ({swins}/{len(subset)}) ${spnl:+.2f}"
                 )
 
-            # Hour analysis (top 3 best, worst)
+            # Entry price bucket analysis
+            price_buckets = [
+                ("0.25-0.35", 0.25, 0.35), ("0.35-0.45", 0.35, 0.45),
+                ("0.45-0.55", 0.45, 0.55), ("0.55-0.65", 0.55, 0.65),
+            ]
+            price_lines = []
+            for label, lo, hi in price_buckets:
+                subset = [t for t in settled if t.get("entry_price") and lo <= t["entry_price"] < hi]
+                if not subset:
+                    continue
+                bwins = sum(1 for t in subset if t["outcome"] == "WIN")
+                bwr = bwins / len(subset) * 100
+                bpnl = sum(t["pnl"] or 0 for t in subset)
+                price_lines.append(
+                    f"  {label}: {bwr:.0f}% ({bwins}/{len(subset)}) ${bpnl:+.2f}"
+                )
+
+            # Hour analysis
             hour_stats: dict[int, list[bool]] = _defaultdict(list)
-            for t in trades:
+            for t in settled:
                 ts = t["timestamp"] / 1000
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc)
                 hour_stats[dt.hour].append(t["outcome"] == "WIN")
@@ -711,17 +788,26 @@ class Orchestrator:
                     wr = sum(ws) / len(ws) * 100
                     hour_lines.append(f"    {h:02d}:00 UTC  {wr:.0f}% ({len(ws)} trades)")
 
+            # Taker vs maker breakdown
+            taker_pnl = sum(t["pnl"] or 0 for t in taker_trades)
+            maker_pnl = sum(t["pnl"] or 0 for t in maker_trades)
+            early_pnl = sum(t["pnl"] or 0 for t in early_exits)
+
             text = (
-                f"\U0001f4ca <b>TRADE ANALYSIS</b>\n\n"
+                f"\U0001f4ca <b>LIVE TRADE ANALYSIS</b>\n\n"
                 f"<b>Overall:</b>\n"
-                f"  Trades: {total} | W/L: {wins}/{losses}\n"
+                f"  Trades: {total} W/L | W/L: {wins}/{losses}\n"
                 f"  Win rate: {wins/total*100:.1f}%\n"
-                f"  P&amp;L: ${total_pnl:+.2f} (avg ${avg_pnl:+.2f})\n\n"
-                f"<b>By edge size:</b>\n"
-                + "\n".join(edge_lines) + "\n\n"
+                f"  P&amp;L: ${total_pnl:+.2f}\n\n"
+                f"<b>By source:</b>\n"
+                f"  Taker (our orders): {len(taker_trades)} | ${taker_pnl:+.2f}\n"
+                f"  Maker (others hit us): {len(maker_trades)} | ${maker_pnl:+.2f}\n"
+                f"  Early exits: {len(early_exits)} | ${early_pnl:+.2f}\n\n"
                 f"<b>By side:</b>\n"
                 + "\n".join(side_lines)
             )
+            if price_lines:
+                text += "\n\n<b>By entry price:</b>\n" + "\n".join(price_lines)
             if hour_lines:
                 text += "\n\n<b>By hour (UTC):</b>\n" + "\n".join(hour_lines)
 
@@ -759,60 +845,6 @@ class Orchestrator:
             f"<b>UP token:</b>\n{_fmt_book('UP', up_book, up_price)}\n\n"
             f"<b>DOWN token:</b>\n{_fmt_book('DOWN', down_book, down_price)}"
         )
-
-    async def _cmd_balance(self, args: str = "") -> str:
-        """Handle /balance — show USDC balance, live bankroll, and trading summary."""
-        if not self.live_trader or not self.live_trader.is_active:
-            return "\u26a0 Live trading is not enabled."
-        balance = await self.live_trader.get_balance()
-        if balance is None:
-            return "\u26a0 Failed to fetch balance."
-        db_stats = await self.db.get_live_trading_stats_full()
-        session = self.live_trader.get_session_summary()
-        pending = len(self._live_trade_tokens)
-        roi = 0.0
-        if self.live_trader.initial_bankroll > 0:
-            roi = (self.live_trader.bankroll - self.live_trader.initial_bankroll) / self.live_trader.initial_bankroll
-        return (
-            f"\U0001f4b0 <b>POLYMARKET BALANCE</b>\n\n"
-            f"USDC: <b>${balance:.2f}</b>\n"
-            f"Live bankroll: <b>${self.live_trader.bankroll:.2f}</b>\n"
-            f"Live P&amp;L: ${db_stats.get('total_pnl', 0):+.2f} (ROI: {roi:+.1%})\n"
-            f"Max bet: ${settings.max_live_bet_usdc:.2f}\n"
-            f"Pending claims: {pending}\n\n"
-            f"<b>Results:</b> {db_stats.get('settled', 0)} settled | "
-            f"W/L: {db_stats.get('wins', 0)}/{db_stats.get('losses', 0)} "
-            f"({db_stats.get('win_rate', 0):.0%})\n"
-            f"<b>Session:</b> {session['successful']} filled / "
-            f"{session['total']} total (${session['total_amount']:.2f})"
-        )
-
-    async def _cmd_livetrades(self, args: str = "") -> str:
-        """Handle /livetrades — show live trade stats with P&L."""
-        db_stats = await self.db.get_live_trading_stats_full()
-        if db_stats["total"] == 0:
-            return "\u26a0 No live trades recorded."
-
-        lines = [
-            f"\U0001f4b5 <b>LIVE TRADES</b>\n",
-            f"<b>All time:</b>",
-            f"  Orders: {db_stats['total']} ({db_stats['successful']} filled, {db_stats['failed']} failed)",
-            f"  Settled: {db_stats['settled']} | W/L: {db_stats['wins']}/{db_stats['losses']}",
-            f"  Win rate: {db_stats['win_rate']:.1%}",
-            f"  P&amp;L: ${db_stats['total_pnl']:+.2f}",
-            f"  Volume: ${db_stats['total_amount']:.2f}",
-        ]
-
-        if self.live_trader and self.live_trader.is_active:
-            lines.append(f"\n  Bankroll: ${self.live_trader.bankroll:.2f}")
-            summary = self.live_trader.get_session_summary()
-            lines.append(
-                f"\n<b>This session:</b>\n"
-                f"  Orders: {summary['total']} ({summary['successful']} filled)\n"
-                f"  Amount: ${summary['total_amount']:.2f}"
-            )
-
-        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Main analysis loop
@@ -883,7 +915,7 @@ class Orchestrator:
         """Dedicated 1-second loop for early exit monitoring.
 
         Runs independently of the main 3-second analysis loop so we can
-        react faster to fleeting bid spikes in the last 2 minutes.
+        react faster to fleeting bid spikes throughout the window.
         """
         while self._running:
             try:
@@ -907,6 +939,7 @@ class Orchestrator:
             self._current_slug = current_slug
             self._window_start_time = self._slug_start_time(current_slug)
             self._window_skip_reason = None
+            self._window_skip_notified = False
             self._window_traded = False
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
@@ -920,6 +953,15 @@ class Orchestrator:
                 self._window_btc_start or 0,
                 price_source,
             )
+
+        # 0b. Retry _window_btc_start if it was None at init (e.g. after restart)
+        if self._window_btc_start is None:
+            price = self.polymarket.get_chainlink_stream_price()
+            if price is None:
+                price = self.binance.get_latest_price()
+            if price is not None:
+                self._window_btc_start = price
+                logger.info("Late BTC start price: $%.2f", price)
 
         # 1. Discover current Polymarket market
         market = await self.polymarket.discover_market()
@@ -990,6 +1032,9 @@ class Orchestrator:
             market_slug=market.slug,
         )
 
+        # 4b. Compute market regime
+        self._current_regime = self.regime_detector.classify(candles)
+
         # 5. Detect edge (pass p_up_override so edge detector uses ML prediction)
         self._cycle_count += 1
         signal = self.edge_detector.evaluate(
@@ -1000,6 +1045,20 @@ class Orchestrator:
             # Capture skip reason from edge detector
             if not self._window_skip_reason and self.edge_detector.last_skip_reason:
                 self._window_skip_reason = self.edge_detector.last_skip_reason
+            # Real-time skip notification — tell user immediately when window is skipped
+            if self._window_skip_reason and not self._window_skip_notified and self.alerter:
+                self._window_skip_notified = True
+                btc_now_rt = self.binance.get_latest_price()
+                btc_str = f" | BTC: ${btc_now_rt:,.2f}" if btc_now_rt else ""
+                try:
+                    await self.alerter._send(
+                        f"SKIP {market.slug}\n"
+                        f"Reason: {self._window_skip_reason}\n"
+                        f"P(up): {p_up:.1%}{btc_str}",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    logger.exception("Failed to send real-time skip notification")
             # Quiet heartbeat — only log once every HEARTBEAT_INTERVAL
             now = time.time()
             if now - self._last_heartbeat >= self._HEARTBEAT_INTERVAL:
@@ -1017,14 +1076,20 @@ class Orchestrator:
                 spread_str = ""
                 if market.up_spread is not None:
                     spread_str = f" | spread={market.up_spread:.4f}"
+                regime_str = ""
+                if self._current_regime:
+                    r = self._current_regime
+                    regime_labels = {"trending_up": "TREND_UP", "trending_down": "TREND_DN", "ranging": "RANGE"}
+                    regime_str = f" | regime={regime_labels.get(r.regime, r.regime)}({r.strength:+.2f})"
                 logger.info(
-                    "-- Status %s: BTC $%s | P(up)=%.1f%% | Mkt=%.0f/%.0f%s%s",
+                    "-- Status %s: BTC $%s | P(up)=%.1f%% | Mkt=%.0f/%.0f%s%s%s",
                     model_tag,
                     f"{btc_now:,.2f}" if btc_now else "N/A",
                     p_up * 100,
                     market.up_price * 100,
                     market.down_price * 100,
                     spread_str,
+                    regime_str,
                     stats_str,
                 )
             return
@@ -1052,7 +1117,7 @@ class Orchestrator:
         seconds_in_window = time.time() - self._window_start_time
         if seconds_in_window > self._MAX_ENTRY_SECONDS:
             if not self._window_skip_reason:
-                self._window_skip_reason = "time gate (>120s)"
+                self._window_skip_reason = "time gate (>60s)"
             return
 
         # 6d. Hour blacklist — skip hours with historically poor performance.
@@ -1077,6 +1142,25 @@ class Orchestrator:
                 )
                 logger.info("Skipping edge — %s", self._window_skip_reason)
                 return
+
+        # 6e2. Regime flip (paper only — live trades use model's original signal)
+        #   When a strong trend is detected, flip the paper signal to bet WITH
+        #   the trend instead of the model's counter-trend prediction.
+        paper_flip_signal = None  # None = use model's signal; dict = use flipped signal
+        if (self._current_regime
+                and self._current_regime.regime != "ranging"
+                and abs(self._current_regime.strength) >= settings.regime_flip_threshold):
+            trend_side = self.regime_detector.get_trend_side(self._current_regime)
+            if trend_side and trend_side != signal["side"]:
+                flipped = self._build_flipped_signal(signal, market, trend_side)
+                if flipped:
+                    paper_flip_signal = flipped
+                    logger.info(
+                        "Paper FLIP: %s -> %s (regime=%s, str=%.2f)",
+                        signal["side"], trend_side,
+                        self._current_regime.regime,
+                        self._current_regime.strength,
+                    )
 
         # 6f. Max edge cap — only for classic (non-always-trade) mode.
         #     In always-trade mode the edge is just model-vs-market gap, not
@@ -1106,6 +1190,10 @@ class Orchestrator:
                 )
                 return
 
+        # Attach regime info to signal dict for downstream use
+        signal["regime_state"] = self._current_regime.regime if self._current_regime else None
+        signal["regime_strength"] = self._current_regime.strength if self._current_regime else None
+
         signals_brief = signal.get("signals", {})
         # Filter to numeric values only (ML breakdown includes string 'ml_side')
         numeric_signals = {k: v for k, v in signals_brief.items() if isinstance(v, (int, float))}
@@ -1116,16 +1204,22 @@ class Orchestrator:
         )
         fee_pct = signal.get("fee_factor", 0.0) * 100
         conf_pct = signal.get("confidence", 0.0) * 100
+        flip_tag = " [FLIP]" if paper_flip_signal else ""
         explore_tag = " [EXPLORE]" if signal.get("exploration") else ""
-        model_tag = ("ML" if self._use_ml else "RB") + explore_tag
+        model_tag = ("ML" if self._use_ml else "RB") + flip_tag + explore_tag
         spread_val = signal.get("spread")
         midpoint_val = signal.get("midpoint_price")
         spread_info = ""
         if spread_val is not None and midpoint_val is not None:
             spread_info = f" spread={spread_val:.4f} mid={midpoint_val:.3f}"
+        regime_tag = ""
+        if self._current_regime:
+            r = self._current_regime
+            regime_labels = {"trending_up": "TREND_UP", "trending_down": "TREND_DN", "ranging": "RANGE"}
+            regime_tag = f" regime={regime_labels.get(r.regime, r.regime)}({r.strength:+.2f})"
         logger.info(
             ">>> %s %s %s | our=%.1f%% mkt=%.1f%% edge=%+.1f%% "
-            "conf=%.1f%% fee=%.2f%%%s | BTC=$%s | [%s]",
+            "conf=%.1f%%%s fee=%.2f%%%s | BTC=$%s | [%s]",
             model_tag,
             signal["side"],
             signal["market_slug"],
@@ -1133,6 +1227,7 @@ class Orchestrator:
             signal["market_prob"] * 100,
             signal["edge"] * 100,
             conf_pct,
+            regime_tag,
             fee_pct,
             spread_info,
             f"{btc_now:,.2f}" if btc_now else "N/A",
@@ -1142,14 +1237,18 @@ class Orchestrator:
         self._window_traded = True
 
         # Paper trade (no Telegram — paper stats kept in DB/logs only)
+        # Use flipped signal during strong trends, otherwise use model's signal
         if self.paper_trader:
-            paper_signal = signal
-            if signal.get("exploration"):
-                paper_signal = {**signal, "size_override": 1.00}
+            paper_signal = paper_flip_signal if paper_flip_signal else signal
+            if paper_signal.get("exploration"):
+                paper_signal = {**paper_signal, "size_override": 1.00}
+            elif paper_signal.get("regime_flip"):
+                paper_signal = {**paper_signal, "trade_tag_override": "regime_flip"}
             await self.paper_trader.place_trade(paper_signal)
 
         # Live trade — place real order on Polymarket
-        if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused:
+        # Skip exploration trades (entry price 0.25-0.35) for live — paper-only data collection
+        if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused and not signal.get("exploration"):
             # Determine token ID from market
             if market:
                 token_id = (
@@ -1157,13 +1256,9 @@ class Orchestrator:
                     else market.down_token_id
                 )
                 # Use live trader's own adaptive sizing (based on live bankroll)
-                # Exploration trades: minimum size for data collection
-                if signal.get("exploration"):
-                    live_amount = 2.00
-                else:
-                    live_amount = self.live_trader.compute_bet_size(
-                        confidence=signal.get("confidence", 0.0),
-                    )
+                live_amount = self.live_trader.compute_bet_size(
+                    confidence=signal.get("confidence", 0.0),
+                )
 
                 live_result = await self.live_trader.place_order(
                     token_id=token_id,
@@ -1171,11 +1266,10 @@ class Orchestrator:
                     side=signal["side"],
                     market_slug=signal["market_slug"],
                     entry_price=signal["entry_price"],
-                    exploration=bool(signal.get("exploration")),
                 )
 
                 # Persist to DB first (to get row ID for early exit tracking)
-                trade_tag = "exploration" if signal.get("exploration") else None
+                trade_tag = None
                 live_trade_id = await self.db.save_live_trade(
                     timestamp=int(time.time() * 1000),
                     market_slug=signal["market_slug"],
@@ -1189,6 +1283,8 @@ class Orchestrator:
                     if live_result.get("response") else None,
                     entry_price=signal["entry_price"],
                     trade_tag=trade_tag,
+                    regime_state=signal.get("regime_state"),
+                    regime_strength=signal.get("regime_strength"),
                 )
 
                 # Track token for settlement + early exit
@@ -1236,18 +1332,18 @@ class Orchestrator:
     _last_early_exit_log: float = 0.0
 
     async def _monitor_early_exit(self) -> None:
-        """Log bid prices for active positions in the last 2 min of window.
+        """Monitor bid prices for active positions and sell when threshold hit.
 
-        This is data collection only — no trades are placed.  The logs will
-        show whether there is enough liquidity to sell winning tokens early
-        (e.g. at $0.90+ bid) before the window settles.
+        Runs every 1s for the whole window (after a 10s grace period to avoid
+        stale book data right after entry).  Tiered exit thresholds by entry
+        price — cheap entries exit aggressively, expensive entries stay conservative.
         """
         if not self._current_slug or not self._window_start_time:
             return
 
         seconds_in = time.time() - self._window_start_time
-        # Only monitor in the last 120 seconds of the 5-min (300s) window
-        if seconds_in < 180:
+        # Skip first 10 seconds — book data may be stale right after entry
+        if seconds_in < 10:
             return
 
         # Rate-limit logging
@@ -1320,17 +1416,26 @@ class Orchestrator:
         )
 
         # ---- EARLY EXIT TRIGGER ----
-        # Sell live tokens when bid is high enough to lock in profit.
-        # No time restriction — if someone offers 95%+ value at any point,
-        # take it rather than risk a reversal.  Backtest on 288 windows showed
-        # 0.95 is optimal: +$9.16 vs baseline (0.90 was only +$3.77).
+        # Tiered thresholds by entry price. Cheap entries (<0.50) have
+        # low WR (13-25%) and benefit from aggressive exits. Expensive
+        # entries keep the conservative 0.95 threshold.
+        # Data: 640 trades, validated on live + paper + CLOB ground truth.
+        exit_threshold = self.live_trader.get_exit_threshold(entry_price) if self.live_trader else 0.95
         available_depth = best_bid_size + total_deep_size
+        # Retry logic: allow up to 3 attempts with 5s cooldown between each
+        exit_attempts = live_pos.get("exit_attempts", 0) if live_pos else 0
+        last_attempt = live_pos.get("last_exit_attempt", 0) if live_pos else 0
+        cooldown_ok = (now - last_attempt) >= 5
         if (live_pos
                 and not live_pos.get("exited")
-                and not live_pos.get("exit_failed")
+                and exit_attempts < 3
+                and cooldown_ok
                 and self.live_trader
-                and best_bid >= 0.95
+                and best_bid >= exit_threshold
                 and available_depth >= 20):
+
+            live_pos["exit_attempts"] = exit_attempts + 1
+            live_pos["last_exit_attempt"] = now
 
             result = await self.live_trader.sell_early_exit(
                 token_id=token_id,
@@ -1340,10 +1445,9 @@ class Orchestrator:
             )
 
             if not result["success"]:
-                live_pos["exit_failed"] = True
                 logger.warning(
-                    "[EARLY-EXIT] Sell failed for %s — will not retry this window",
-                    slug[-15:],
+                    "[EARLY-EXIT] Sell failed for %s (attempt %d/3) — will retry after 5s cooldown",
+                    slug[-15:], live_pos["exit_attempts"],
                 )
 
             if result["success"]:
@@ -1357,20 +1461,23 @@ class Orchestrator:
                 self.live_trader.record_settlement(pnl > 0, pnl)
                 live_pos["exited"] = True
 
+                tier = "low" if entry_price < 0.35 else ("mid" if entry_price < 0.50 else "high")
                 logger.info(
-                    "[EARLY-EXIT SOLD] %s %s | bid=%.3f | tokens=%.1f | "
-                    "sell=$%.2f buy=$%.2f | pnl=$%+.2f | %.0fs before settlement",
-                    side, slug[-15:], best_bid, live_pos["tokens"],
+                    "[EARLY-EXIT SOLD] %s %s | bid=%.3f (threshold=%.2f, tier=%s) | "
+                    "tokens=%.1f | sell=$%.2f buy=$%.2f | pnl=$%+.2f | %.0fs left",
+                    side, slug[-15:], best_bid, exit_threshold, tier,
+                    live_pos["tokens"],
                     sell_amount, buy_amount, pnl, seconds_left,
                 )
 
                 # Telegram alert
                 if self.alerter:
                     try:
+                        tier_label = "low" if entry_price < 0.35 else ("mid" if entry_price < 0.50 else "high")
                         await self.alerter._send(
-                            f"<b>EARLY EXIT</b>\n\n"
+                            f"<b>EARLY EXIT</b> ({tier_label} tier)\n\n"
                             f"Market: {slug}\n"
-                            f"Side: {side} | Sold at ${best_bid:.3f}\n"
+                            f"Side: {side} | Sold at ${best_bid:.3f} (threshold {exit_threshold:.2f})\n"
                             f"Tokens: {live_pos['tokens']:.1f} | Sell: ${sell_amount:.2f}\n"
                             f"PnL: <b>${pnl:+.2f}</b> | {seconds_left:.0f}s early"
                         )
@@ -1381,58 +1488,149 @@ class Orchestrator:
     # Window settlement
     # ------------------------------------------------------------------
 
-    async def _settle_previous_window(self) -> None:
-        """Settle paper trades from the previous 5-minute window.
+    async def _query_gamma_resolution(self, slug: str, max_retries: int = 3) -> str | None:
+        """Query Gamma API for the actual Polymarket resolution of a market.
 
-        Uses Chainlink RTDS stream price (Polymarket's resolution source).
-        Falls back to Binance spot if the stream is unavailable.
+        Returns "UP", "DOWN", or None if not yet resolved.
+        Retries with delays to allow on-chain resolution to complete.
         """
-        if self._window_btc_start is None:
-            return
+        import aiohttp as _aiohttp
 
-        # Prefer Chainlink RTDS stream (Polymarket's actual resolution source)
+        for attempt in range(max_retries):
+            if attempt > 0:
+                await asyncio.sleep(3)  # wait between retries
+
+            try:
+                async with _aiohttp.ClientSession(
+                    timeout=_aiohttp.ClientTimeout(total=8)
+                ) as session:
+                    url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+
+                events = data if isinstance(data, list) else [data]
+                if not events:
+                    continue
+                market = events[0].get("markets", [{}])[0]
+                if not market.get("closed"):
+                    continue
+
+                outcomes = market.get("outcomes", [])
+                if isinstance(outcomes, str):
+                    outcomes = json.loads(outcomes)
+                prices = market.get("outcomePrices", [])
+                if isinstance(prices, str):
+                    prices = json.loads(prices)
+
+                up_idx = outcomes.index("Up") if "Up" in outcomes else None
+                if up_idx is not None:
+                    up_price = float(prices[up_idx])
+                    if up_price >= 0.99:
+                        return "UP"
+                    elif up_price <= 0.01:
+                        return "DOWN"
+            except Exception:
+                continue
+
+        return None
+
+    async def _settle_previous_window(self) -> None:
+        """Settle trades from the previous 5-minute window.
+
+        For live trades: queries Gamma API for actual Polymarket resolution.
+        For paper trades: uses Chainlink/Binance price comparison (best effort).
+        """
+        # Get BTC end price for paper trading + logging
         btc_end = self.polymarket.get_chainlink_stream_price()
         price_source = "Chainlink Stream"
         if btc_end is None:
             btc_end = self.binance.get_latest_price()
             price_source = "Binance (fallback)"
-        if btc_end is None:
-            logger.warning("Cannot settle — no BTC end price available")
+
+        # Query Gamma API for the ACTUAL Polymarket resolution (source of truth)
+        slug = self._current_slug
+        gamma_resolution = None
+        if slug:
+            # Wait a few seconds for on-chain resolution to finalize
+            await asyncio.sleep(5)
+            gamma_resolution = await self._query_gamma_resolution(slug)
+
+        # Price-based direction (for paper trades + logging)
+        have_prices = self._window_btc_start is not None and btc_end is not None
+        if have_prices:
+            btc_went_up_price = btc_end > self._window_btc_start
+            direction_price = "UP" if btc_went_up_price else "DOWN"
+            delta = btc_end - self._window_btc_start
+        else:
+            btc_went_up_price = None
+            direction_price = "UNKNOWN"
+            delta = 0.0
+
+        # Use Gamma resolution if available, fall back to price comparison
+        if gamma_resolution:
+            btc_went_up = gamma_resolution == "UP"
+            direction = gamma_resolution
+            settlement_source = "Gamma API"
+        elif have_prices:
+            btc_went_up = btc_went_up_price
+            direction = direction_price
+            settlement_source = price_source
+        else:
+            logger.warning("Cannot settle %s — no Gamma resolution and no price data", slug)
+            # Still send end-of-window skip summary even when settlement fails
+            if not self._window_traded and self.alerter:
+                reason = self._window_skip_reason or "no signal from model"
+                try:
+                    await self.alerter._send(
+                        f"SKIPPED {self._current_slug}\n"
+                        f"Reason: {reason}\n"
+                        f"BTC: N/A (no settlement data)",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    logger.exception("Failed to send skip notification")
             return
 
-        btc_went_up = btc_end > self._window_btc_start  # strict: flat = DOWN on Polymarket
-        direction = "UP" if btc_went_up else "DOWN"
-        delta = btc_end - self._window_btc_start
+        # Log if Gamma disagrees with price data
+        if gamma_resolution and have_prices and gamma_resolution != direction_price:
+            logger.warning(
+                "Gamma resolution (%s) DISAGREES with %s price (%s) for %s",
+                gamma_resolution, price_source, direction_price, slug,
+            )
+
         logger.info(
             "--- WINDOW SETTLED: %s | BTC $%.2f -> $%.2f (%+.2f = %s) [%s]",
             self._current_slug,
-            self._window_btc_start,
-            btc_end,
+            self._window_btc_start or 0,
+            btc_end or 0,
             delta,
             direction,
-            price_source,
+            settlement_source,
         )
 
         # Notify on skipped windows
         if not self._window_traded and self.alerter:
             reason = self._window_skip_reason or "no signal from model"
             try:
+                btc_start_str = f"${self._window_btc_start:,.2f}" if self._window_btc_start else "N/A"
+                btc_end_str = f"${btc_end:,.2f}" if btc_end else "N/A"
                 await self.alerter._send(
                     f"SKIPPED {self._current_slug}\n"
                     f"Reason: {reason}\n"
-                    f"BTC: ${self._window_btc_start:,.2f} to ${btc_end:,.2f} ({direction})",
+                    f"BTC: {btc_start_str} to {btc_end_str} ({direction})",
                     parse_mode=None,
                 )
             except Exception:
                 logger.exception("Failed to send skip notification")
 
-        if self.paper_trader:
+        if self.paper_trader and have_prices:
             await self.paper_trader.settle_all_pending(
                 btc_start_price=self._window_btc_start,
                 btc_end_price=btc_end,
             )
 
-            # Log updated stats after settlement
             stats = await self.paper_trader.get_stats()
             logger.info(
                 "--- P&L: $%+.2f | Win rate: %.0f%% (%d/%d) | Bankroll: $%.2f",
@@ -1443,17 +1641,14 @@ class Orchestrator:
                 stats.get("bankroll", 0),
             )
 
-        # Settle live trades from DB for this window
-        slug = self._current_slug
+        # Settle live trades using Gamma resolution (or price fallback)
         if self.live_trader and self.live_trader.is_active:
             await self._settle_live_trades_for_window(slug, btc_went_up)
 
-        # Also handle in-memory tracked tokens (for Telegram alerts on
-        # trades placed this session but not yet in the settlement DB flow)
+        # Telegram alerts for in-memory tracked positions
         if slug and slug in self._live_trade_tokens:
             live_info = self._live_trade_tokens.pop(slug)
 
-            # Skip Telegram alert if this trade was already early-exited
             if not live_info.get("exited"):
                 trade_won = (live_info["side"] == "UP" and btc_went_up) or \
                             (live_info["side"] == "DOWN" and not btc_went_up)
@@ -1519,7 +1714,11 @@ class Orchestrator:
             )
 
     async def _settle_stale_live_trades(self) -> None:
-        """Settle stale unsettled live trades from previous sessions."""
+        """Settle stale unsettled live trades from previous sessions.
+
+        Uses Gamma API for actual resolution (source of truth).
+        Falls back to candle price comparison if Gamma unavailable.
+        """
         if not self.live_trader:
             return
         unsettled = await self.db.get_unsettled_live_trades()
@@ -1533,34 +1732,42 @@ class Orchestrator:
             "Found %d stale unsettled live trade(s) — settling", len(stale)
         )
 
+        # Cache Gamma resolutions by slug
+        gamma_cache: dict[str, str | None] = {}
+
         for row in stale:
             slug = row["market_slug"]
-            try:
-                window_ts = int(slug.rsplit("-", 1)[-1])
-            except (ValueError, IndexError):
-                logger.warning("Cannot parse window ts from live trade slug %s — voiding", slug)
-                await self.db.update_live_trade(
-                    row["id"], "VOID", 0.0, int(time.time() * 1000)
-                )
-                continue
 
-            window_start_ms = window_ts * 1000
-            window_end_ms = (window_ts + 300) * 1000
+            # Try Gamma API first (source of truth)
+            if slug not in gamma_cache:
+                gamma_cache[slug] = await self._query_gamma_resolution(slug, max_retries=1)
 
-            btc_start = await self.db.get_btc_price_at(window_start_ms)
-            btc_end = await self.db.get_btc_price_at(window_end_ms)
+            gamma_res = gamma_cache[slug]
+            if gamma_res:
+                btc_went_up = gamma_res == "UP"
+            else:
+                # Fall back to candle data
+                try:
+                    window_ts = int(slug.rsplit("-", 1)[-1])
+                except (ValueError, IndexError):
+                    logger.warning("Cannot parse window ts from slug %s — voiding", slug)
+                    await self.db.update_live_trade(
+                        row["id"], "VOID", 0.0, int(time.time() * 1000)
+                    )
+                    continue
 
-            if btc_start is None or btc_end is None:
-                logger.warning(
-                    "No candle data for live trade window %s — voiding trade %d",
-                    slug, row["id"],
-                )
-                await self.db.update_live_trade(
-                    row["id"], "VOID", 0.0, int(time.time() * 1000)
-                )
-                continue
+                btc_start = await self.db.get_btc_price_at(window_ts * 1000)
+                btc_end = await self.db.get_btc_price_at((window_ts + 300) * 1000)
+                if btc_start is None or btc_end is None:
+                    logger.warning(
+                        "No data for live trade %s — voiding trade %d", slug, row["id"],
+                    )
+                    await self.db.update_live_trade(
+                        row["id"], "VOID", 0.0, int(time.time() * 1000)
+                    )
+                    continue
+                btc_went_up = btc_end > btc_start
 
-            btc_went_up = btc_end > btc_start  # strict: flat = DOWN on Polymarket
             side = row["side"]
             amount = row["amount_usdc"]
             entry_price = row.get("entry_price") or 0.0
@@ -1585,10 +1792,10 @@ class Orchestrator:
             await self.db.update_live_trade(row["id"], outcome, pnl, settled_at)
             self.live_trader.record_settlement(won, pnl)
 
+            source = "Gamma" if gamma_res else "candle"
             logger.info(
-                "Settled stale live trade: %s %s | BTC $%.2f -> $%.2f (%s) | pnl=$%+.2f",
-                side, slug, btc_start, btc_end,
-                "UP" if btc_went_up else "DOWN", pnl,
+                "Settled stale live trade: %s %s -> %s | pnl=$%+.2f [%s]",
+                side, slug, outcome, pnl, source,
             )
 
     async def _sync_maker_fills(self) -> None:
@@ -1937,6 +2144,10 @@ class Orchestrator:
                                 "Bankroll synced from CLOB: $%.2f (was $%.2f)",
                                 real_bal, old_br,
                             )
+
+                    # Settle any stale unsettled live trades (Gamma API)
+                    if self.live_trader and self.live_trader.is_active:
+                        await self._settle_stale_live_trades()
 
                     # Sync maker fills from CLOB API
                     if self.live_trader and self.live_trader.is_active:
