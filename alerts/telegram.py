@@ -111,54 +111,37 @@ class TelegramAlerter:
     # Public alert methods
     # ------------------------------------------------------------------
 
-    async def send_edge_alert(
-        self, signal: dict, features_breakdown: dict
-    ) -> None:
-        """Send an edge-detection alert with signal details and feature scores."""
-        side_emoji = "\U0001f7e2" if signal["side"] == "UP" else "\U0001f534"
-        text = (
-            f"\U0001f514 <b>EDGE DETECTED</b>\n\n"
-            f"Market: {signal['market_slug']}\n"
-            f"{side_emoji} Side: <b>{signal['side']}</b>\n"
-            f"Our P({signal['side']}): <b>{signal['our_prob']:.1%}</b>\n"
-            f"Market P({signal['side']}): {signal['market_prob']:.1%}\n"
-            f"Edge: <b>{signal['edge']:+.1%}</b>\n\n"
-            f"\U0001f4ca <b>Signals:</b>\n"
-        )
-        for name, value in features_breakdown.items():
-            if isinstance(value, (int, float)):
-                text += f"  {name}: {value:+.4f}\n"
-            else:
-                text += f"  {name}: {value}\n"
-
-        await self._send(text)
-
-    async def send_trade_alert(
+    async def send_trade_placed_alert(
         self,
         side: str,
         slug: str,
-        size: float,
+        amount: float,
         entry_price: float,
-        our_prob: float,
+        confidence: float,
         edge: float,
-        spread: float | None = None,
-        midpoint_price: float | None = None,
+        order_id: str | None = None,
+        success: bool = True,
+        error_msg: str = "",
     ) -> None:
-        """Send a paper-trade placement notification."""
-        spread_line = ""
-        if spread is not None and midpoint_price is not None:
-            spread_line = (
-                f"\nSpread: {spread:.4f} | "
-                f"Mid: {midpoint_price:.3f} | Ask: {entry_price:.3f}"
+        """Send a combined trade placement notification (edge + order details)."""
+        if success:
+            side_emoji = "\U0001f7e2" if side == "UP" else "\U0001f534"
+            text = (
+                f"{side_emoji} <b>LIVE TRADE PLACED</b>\n\n"
+                f"Market: {slug}\n"
+                f"Side: <b>{side}</b> @ {entry_price:.3f}\n"
+                f"Size: <b>${amount:.2f}</b>\n"
+                f"Confidence: {confidence:.1%} | Edge: {edge:+.1%}\n"
+                f"Order: {order_id or 'N/A'}"
             )
-        text = (
-            f"\U0001f4dd <b>PAPER TRADE PLACED</b>\n\n"
-            f"Market: {slug}\n"
-            f"Side: {side} @ {entry_price:.3f}\n"
-            f"Size: ${size:.2f}\n"
-            f"Our prob: {our_prob:.1%} | Edge: {edge:+.1%}"
-            f"{spread_line}"
-        )
+        else:
+            text = (
+                f"\u274c <b>LIVE TRADE FAILED</b>\n\n"
+                f"Market: {slug}\n"
+                f"Side: {side} @ {entry_price:.3f}\n"
+                f"Amount: ${amount:.2f}\n"
+                f"Error: {error_msg}"
+            )
         await self._send(text)
 
     async def send_settlement_alert(
@@ -200,8 +183,12 @@ class TelegramAlerter:
             losses = db.get("losses", 0)
             wr = db.get("win_rate", 0)
             pnl = db.get("total_pnl", 0)
+            ee = db.get("early_exits", 0)
+            ee_str = f" + {ee}ee" if ee else ""
+            mk = db.get("maker_fills", 0)
+            mk_str = f" + {mk}mk" if mk else ""
             parts.append(
-                f"Settled: {settled} | W/L: {wins}/{losses} ({wr:.0%})\n"
+                f"Settled: {settled} | W/L: {wins}/{losses}{ee_str}{mk_str} ({wr:.0%})\n"
                 f"P&amp;L: <b>${pnl:+.2f}</b>"
             )
             parts.append(
@@ -219,34 +206,6 @@ class TelegramAlerter:
         )
 
         await self._send("\n".join(parts))
-
-    async def send_live_trade_alert(
-        self,
-        side: str,
-        slug: str,
-        amount: float,
-        order_id: str | None,
-        success: bool,
-        error_msg: str = "",
-    ) -> None:
-        """Send a live trade placement notification."""
-        if success:
-            text = (
-                f"\U0001f4b5 <b>LIVE TRADE PLACED</b>\n\n"
-                f"Market: {slug}\n"
-                f"Side: {side}\n"
-                f"Amount: ${amount:.2f}\n"
-                f"Order ID: {order_id or 'N/A'}"
-            )
-        else:
-            text = (
-                f"\u274c <b>LIVE TRADE FAILED</b>\n\n"
-                f"Market: {slug}\n"
-                f"Side: {side}\n"
-                f"Amount: ${amount:.2f}\n"
-                f"Error: {error_msg}"
-            )
-        await self._send(text)
 
     async def send_live_settlement_alert(
         self,
