@@ -1046,7 +1046,7 @@ class Orchestrator:
             if not self._window_skip_reason and self.edge_detector.last_skip_reason:
                 self._window_skip_reason = self.edge_detector.last_skip_reason
             # Real-time skip notification — tell user immediately when window is skipped
-            if self._window_skip_reason and not self._window_skip_notified and self.alerter:
+            if self._window_skip_reason and not self._window_skip_notified and not self._window_traded and self.alerter:
                 self._window_skip_notified = True
                 btc_now_rt = self.binance.get_latest_price()
                 btc_str = f" | BTC: ${btc_now_rt:,.2f}" if btc_now_rt else ""
