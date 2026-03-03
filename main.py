@@ -155,6 +155,11 @@ class Orchestrator:
         self._window_skip_notified: bool = False
         self._window_traded: bool = False
 
+        # Loss streak guard — pause a side after consecutive same-side losses
+        # Only tracks our taker trades (not maker_fills) for accuracy
+        self._side_outcomes: dict[str, list[str]] = {"UP": [], "DOWN": []}  # last N outcomes per side
+        self._side_paused: dict[str, float] = {}  # side -> pause expiry timestamp
+
         # Hour blacklist — UTC hours where the model underperforms.
         # Parsed once from config; empty set = no blacklist.
         self._blacklist_hours: set[int] = set()
@@ -1127,6 +1132,26 @@ class Orchestrator:
             self._window_skip_reason = f"blacklisted hour ({current_hour:02d}:00 UTC)"
             return
 
+        # 6d2. Loss streak guard — pause a side after consecutive losses.
+        #      Acts as early warning for potential trend onset before regime
+        #      detector has enough data (~20 min lag).
+        flip_signal = None  # initialized early so streak guard can check it
+        trade_side = signal["side"]
+        if flip_signal and settings.regime_flip_live:
+            trade_side = flip_signal["side"]
+        if trade_side in self._side_paused:
+            if time.time() < self._side_paused[trade_side]:
+                self._window_skip_reason = (
+                    f"streak guard ({settings.streak_pause_threshold}x {trade_side} LOSS)"
+                )
+                logger.info("Skipping edge — %s", self._window_skip_reason)
+                return
+            else:
+                # Pause expired — clear it, tag next trade
+                del self._side_paused[trade_side]
+                logger.info("Streak guard expired for %s — resuming", trade_side)
+                signal["_post_streak"] = True
+
         # 6e. Trend-conflict filter — don't bet against a strong intra-window
         #     price move.  If BTC has already moved more than TREND_CONFLICT_PCT
         #     in one direction this window and our signal is the opposite, the
@@ -1146,7 +1171,7 @@ class Orchestrator:
         # 6e2. Regime flip — when a strong trend is detected, flip the signal
         #   to bet WITH the trend instead of the model's counter-trend prediction.
         #   Applies to paper always; live when regime_flip_live=True.
-        flip_signal = None  # None = use model's signal; dict = use flipped signal
+        # (flip_signal initialized before streak guard above)
         if (self._current_regime
                 and self._current_regime.regime != "ranging"
                 and abs(self._current_regime.strength) >= settings.regime_flip_threshold):
@@ -1274,7 +1299,11 @@ class Orchestrator:
                 )
 
                 # Persist to DB first (to get row ID for early exit tracking)
-                trade_tag = "regime_flip" if (flip_signal and settings.regime_flip_live) else None
+                trade_tag = None
+                if flip_signal and settings.regime_flip_live:
+                    trade_tag = "regime_flip"
+                elif live_signal.get("_post_streak"):
+                    trade_tag = "post_streak"
                 live_trade_id = await self.db.save_live_trade(
                     timestamp=int(time.time() * 1000),
                     market_slug=live_signal["market_slug"],
@@ -1461,6 +1490,14 @@ class Orchestrator:
                     live_pos["db_id"], "EARLY_EXIT", pnl, int(time.time() * 1000),
                 )
                 self.live_trader.record_settlement(pnl > 0, pnl)
+
+                # Early exit breaks loss streak (it was a profitable rescue)
+                side = live_pos["side"]
+                if side in self._side_outcomes:
+                    self._side_outcomes[side].append("EARLY_EXIT")
+                    if len(self._side_outcomes[side]) > 10:
+                        self._side_outcomes[side] = self._side_outcomes[side][-10:]
+
                 live_pos["exited"] = True
 
                 tier = "low" if entry_price < 0.35 else ("mid" if entry_price < 0.50 else "high")
@@ -1714,6 +1751,34 @@ class Orchestrator:
 
             # Update live trader internal state
             self.live_trader.record_settlement(won, pnl)
+
+            # Update streak guard (skip maker_fills — only track our taker trades)
+            trade_tag = row.get("trade_tag")
+            if trade_tag not in ("maker_fill",):
+                self._side_outcomes[side].append(outcome)
+                # Keep only last 10
+                if len(self._side_outcomes[side]) > 10:
+                    self._side_outcomes[side] = self._side_outcomes[side][-10:]
+                # Check for consecutive losses
+                recent = self._side_outcomes[side]
+                threshold = settings.streak_pause_threshold
+                if (len(recent) >= threshold
+                        and all(r == "LOSS" for r in recent[-threshold:])):
+                    pause_seconds = settings.streak_pause_windows * 300
+                    self._side_paused[side] = time.time() + pause_seconds
+                    logger.warning(
+                        "STREAK GUARD: %dx %s LOSS — pausing %s for %d windows (%.0fs)",
+                        threshold, side, side, settings.streak_pause_windows, pause_seconds,
+                    )
+                    if self.alerter:
+                        try:
+                            await self.alerter._send(
+                                f"STREAK GUARD: {threshold}x {side} LOSS\n"
+                                f"Pausing {side} for {settings.streak_pause_windows} windows",
+                                parse_mode=None,
+                            )
+                        except Exception:
+                            pass
 
             logger.info(
                 "Settled live trade: %s %s -> %s | pnl=$%+.2f | live bankroll=$%.2f",
