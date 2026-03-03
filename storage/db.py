@@ -149,6 +149,14 @@ class Database:
             ("paper_trades", "regime_strength", "REAL"),
             ("live_trades", "regime_state", "TEXT"),
             ("live_trades", "regime_strength", "REAL"),
+            # early exit data collection (2026-03-03)
+            ("live_trades", "max_bid_during_window", "REAL"),
+            ("live_trades", "exit_threshold_used", "REAL"),
+            # order book depth sizes (2026-03-03)
+            ("market_snapshots", "up_bid_size", "REAL"),
+            ("market_snapshots", "up_ask_size", "REAL"),
+            ("market_snapshots", "down_bid_size", "REAL"),
+            ("market_snapshots", "down_ask_size", "REAL"),
         ]
         for table, column, col_type in alter_statements:
             try:
@@ -386,17 +394,25 @@ class Database:
         return stats
 
     async def update_live_trade(
-        self, trade_id: int, outcome: str, pnl: float, settled_at: int
+        self,
+        trade_id: int,
+        outcome: str,
+        pnl: float,
+        settled_at: int,
+        max_bid_during_window: float | None = None,
+        exit_threshold_used: float | None = None,
     ) -> None:
         """Update a live trade with settlement data."""
         try:
             await self._db.execute(
                 """
                 UPDATE live_trades
-                SET outcome = ?, pnl = ?, settled_at = ?
+                SET outcome = ?, pnl = ?, settled_at = ?,
+                    max_bid_during_window = ?, exit_threshold_used = ?
                 WHERE id = ?
                 """,
-                (outcome, pnl, settled_at, trade_id),
+                (outcome, pnl, settled_at,
+                 max_bid_during_window, exit_threshold_used, trade_id),
             )
             await self._db.commit()
             logger.info(
@@ -543,6 +559,10 @@ class Database:
         down_best_bid: Optional[float] = None,
         down_best_ask: Optional[float] = None,
         down_spread: Optional[float] = None,
+        up_bid_size: Optional[float] = None,
+        up_ask_size: Optional[float] = None,
+        down_bid_size: Optional[float] = None,
+        down_ask_size: Optional[float] = None,
     ) -> None:
         """Insert a market price snapshot."""
         try:
@@ -552,12 +572,14 @@ class Database:
                 INSERT INTO market_snapshots
                     (timestamp, slug, up_price, down_price, btc_price,
                      up_best_bid, up_best_ask, up_spread,
-                     down_best_bid, down_best_ask, down_spread)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     down_best_bid, down_best_ask, down_spread,
+                     up_bid_size, up_ask_size, down_bid_size, down_ask_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (ts, slug, up_price, down_price, btc_price,
                  up_best_bid, up_best_ask, up_spread,
-                 down_best_bid, down_best_ask, down_spread),
+                 down_best_bid, down_best_ask, down_spread,
+                 up_bid_size, up_ask_size, down_bid_size, down_ask_size),
             )
             await self._db.commit()
             logger.debug(

@@ -974,6 +974,7 @@ class Orchestrator:
             return
 
         # 2. Refresh live Polymarket prices + order books
+        up_book = down_book = None
         book_result = await self.polymarket.get_live_prices_with_book(market)
         if book_result:
             up_price, down_price, up_book, down_book = book_result
@@ -1008,6 +1009,10 @@ class Orchestrator:
             down_best_bid=market.down_best_bid,
             down_best_ask=market.down_best_ask,
             down_spread=market.down_spread,
+            up_bid_size=up_book.bid_size if up_book else None,
+            up_ask_size=up_book.ask_size if up_book else None,
+            down_bid_size=down_book.bid_size if down_book else None,
+            down_ask_size=down_book.ask_size if down_book else None,
         )
 
         # 3. Compute features
@@ -1421,6 +1426,12 @@ class Orchestrator:
         best_bid = float(bids[-1].get("price", 0))
         best_bid_size = float(bids[-1].get("size", 0))
 
+        # Track max bid during this window for data collection
+        if live_pos:
+            prev_max = live_pos.get("max_bid", 0)
+            if best_bid > prev_max:
+                live_pos["max_bid"] = best_bid
+
         # Total bid depth above 0.85
         deep_bids = [(float(b["price"]), float(b["size"])) for b in bids if float(b["price"]) >= 0.85]
         total_deep_size = sum(s for _, s in deep_bids)
@@ -1488,6 +1499,8 @@ class Orchestrator:
 
                 await self.db.update_live_trade(
                     live_pos["db_id"], "EARLY_EXIT", pnl, int(time.time() * 1000),
+                    max_bid_during_window=live_pos.get("max_bid"),
+                    exit_threshold_used=exit_threshold,
                 )
                 self.live_trader.record_settlement(pnl > 0, pnl)
 
@@ -1745,9 +1758,19 @@ class Orchestrator:
             else:
                 pnl = -amount if not won else 0.0
 
-            # Update DB
+            # Update DB — include max bid and exit threshold for data collection
             settled_at = int(time.time() * 1000)
-            await self.db.update_live_trade(row["id"], outcome, pnl, settled_at)
+            live_pos = self._live_trade_tokens.get(slug)
+            max_bid = live_pos.get("max_bid") if live_pos else None
+            exit_th = (
+                self.live_trader.get_exit_threshold(entry_price)
+                if entry_price > 0 else None
+            )
+            await self.db.update_live_trade(
+                row["id"], outcome, pnl, settled_at,
+                max_bid_during_window=max_bid,
+                exit_threshold_used=exit_th,
+            )
 
             # Update live trader internal state
             self.live_trader.record_settlement(won, pnl)

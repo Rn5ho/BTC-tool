@@ -76,10 +76,11 @@ class Settings(BaseSettings):
 
     # Adaptive early exit — tiered thresholds by entry price
     # Lower entry prices have lower WR and benefit from aggressive exits.
-    # Data: 640 trades, validated on live + paper + CLOB ground truth.
-    early_exit_threshold_low: float = 0.60    # entry < 0.35 (~15% WR)
-    early_exit_threshold_mid: float = 0.65    # entry 0.35-0.50 (~25% WR)
-    early_exit_threshold_high: float = 0.95   # entry >= 0.50 (~55% WR)
+    # Data: 548 trades with 102K market snapshots (bid spike analysis).
+    early_exit_threshold_low: float = 0.50     # entry < 0.35: lottery tickets, exit on any spike
+    early_exit_threshold_low_mid: float = 0.45 # entry 0.35-0.40: brief spikes, grab profit fast
+    early_exit_threshold_mid: float = 0.65     # entry 0.40-0.50: decent exit rate at 0.65
+    early_exit_threshold_high: float = 0.95    # entry >= 0.50 (~55% WR, conservative)
 
     # Hour blacklist (UTC hours where model underperforms; skip trading)
     blacklist_hours: str = "2"  # comma-separated UTC hours, e.g. "2,11,19"

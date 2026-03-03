@@ -182,10 +182,11 @@ STREAK_PAUSE_WINDOWS=2         # number of 5-min windows to pause (~10 min)
 # Confidence dampening — shrink P(up) toward 0.5 to counter model overconfidence
 CONFIDENCE_DAMPEN=0.6          # 1.0 = no dampening, 0.0 = always 50%
 
-# Adaptive early exit — tiered thresholds by entry price
-EARLY_EXIT_THRESHOLD_LOW=0.60  # entry < 0.35 (~15% WR, aggressive exit)
-EARLY_EXIT_THRESHOLD_MID=0.65  # entry 0.35-0.50 (~25% WR)
-EARLY_EXIT_THRESHOLD_HIGH=0.95 # entry >= 0.50 (~55% WR, conservative)
+# Adaptive early exit — 4-tier thresholds by entry price
+EARLY_EXIT_THRESHOLD_LOW=0.50      # entry < 0.35: lottery tickets, exit on any spike
+EARLY_EXIT_THRESHOLD_LOW_MID=0.45  # entry 0.35-0.40: brief spikes, grab profit fast
+EARLY_EXIT_THRESHOLD_MID=0.65      # entry 0.40-0.50: decent exit rate
+EARLY_EXIT_THRESHOLD_HIGH=0.95     # entry >= 0.50 (~55% WR, conservative)
 
 # Hour blacklist (UTC hours to skip trading)
 BLACKLIST_HOURS=2              # comma-separated, e.g. "2,3,4"
@@ -197,11 +198,11 @@ Applied in `strategy/edge.py` and `main.py` before every trade:
 
 1. **Min confidence** (`MIN_CONFIDENCE=0.015`): Skip when |P(up) - 0.5| below threshold
 2. **Entry price filter**: Hard reject outside 0.25-0.65. Exploration range 0.25-0.35 uses minimum size, tagged `trade_tag="exploration"`
-3. **Time gate** (`_MAX_ENTRY_SECONDS=60`): Only enter in first 60 seconds of 5-min window (data: 60-120s entries had 24.5% WR, -$53 on 53 trades)
+3. **Time gate** (`_MAX_ENTRY_SECONDS=60`): Only enter in first 60 seconds of 5-min window *(deployed 2026-03-02)*
 4. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
-5. **Loss streak guard** (`STREAK_PAUSE_THRESHOLD=3`): After 3 consecutive LOSS on the same side, pause that side for 2 windows (~10 min). Early exits break the chain. Only tracks taker trades. Sends Telegram alert on trigger. First trade after pause tagged `post_streak`.
+5. **Loss streak guard** (`STREAK_PAUSE_THRESHOLD=3`): After 3 consecutive LOSS on the same side, pause that side for 2 windows (~10 min). Early exits break the chain. Only tracks taker trades. Sends Telegram alert on trigger. First trade after pause tagged `post_streak`. *(deployed 2026-03-03 ~21:30 UTC)*
 6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT=0.15`): Skip if BTC moved >0.15% against signal direction
-7. **Regime flip** (`REGIME_FLIP_THRESHOLD=0.35`): When regime strength >= 0.35 (trending), flip both paper and live trades to bet WITH the trend. Tagged `trade_tag='regime_flip'`. Data: 82-100% trend continuation at this threshold. Controlled by `REGIME_FLIP_LIVE`.
+7. **Regime flip** (`REGIME_FLIP_THRESHOLD=0.35`): When regime strength >= 0.35 (trending), flip both paper and live trades to bet WITH the trend. Tagged `trade_tag='regime_flip'`. Data: 82-100% trend continuation at this threshold. Controlled by `REGIME_FLIP_LIVE`. *(deployed 2026-03-03 ~21:30 UTC)*
 8. **One trade per window**: No duplicate bets on same market slug
 9. **Pause**: `/pause` stops new trades while data collection continues
 10. **Flat close = DOWN**: Polymarket resolves ties as DOWN. Uses strict `>` (not `>=`)
@@ -210,13 +211,14 @@ Applied in `strategy/edge.py` and `main.py` before every trade:
 
 Dedicated 1-second monitoring loop (`_early_exit_loop()` → `_monitor_early_exit()`) sells live positions when the bid price reaches a threshold, locking in profit before settlement risk.
 
-**Tiered thresholds by entry price** (deployed 2026-03-02):
+**4-tier thresholds by entry price** *(updated 2026-03-03 from 548-trade bid spike analysis)*:
 
-| Entry Price | Exit Threshold | Win Rate | Rationale |
-|-------------|---------------|----------|-----------|
-| < 0.35 | 0.60 | ~15% | Lottery tickets — sell on any spike |
-| 0.35 - 0.50 | 0.65 | ~25% | Low WR — exit aggressively |
-| >= 0.50 | 0.95 | ~55% | Conservative, proven threshold |
+| Entry Price | Exit Threshold | Losses Caught | Rationale |
+|-------------|---------------|--------------|-----------|
+| < 0.35 | 0.50 | 87% (13/15) | Lottery tickets — spike briefly, grab any profit |
+| 0.35 - 0.40 | 0.45 | 88% (22/25) | Brief spikes rarely reach 0.65, exit fast |
+| 0.40 - 0.50 | 0.65 | 55% (37/67) | Decent exit rate at current threshold |
+| >= 0.50 | 0.95 | 12% (16/131) | High WR, conservative — let winners run |
 
 - **First touch**: Sell immediately when `bid >= threshold` (no hold-confirmation — bid spikes on losers last only 5-8 seconds)
 - **Monitoring window**: Entire 5-min window after a 10-second grace period (avoids stale book data right after entry)
@@ -226,7 +228,8 @@ Dedicated 1-second monitoring loop (`_early_exit_loop()` → `_monitor_early_exi
 - **DB outcome**: `"EARLY_EXIT"` — skipped by unsettled trade queries
 - **Asymmetric payoff**: Each rescue saves avg +$4.44, each regretted exit costs avg -$0.61 (7:1 ratio)
 - **`get_exit_threshold(entry_price)`** in `LiveTrader` returns the appropriate threshold
-- **Data**: Validated on 640 trades (live + paper) and 45 CLOB ground-truth trades
+- **Data collection**: Each settled trade stores `max_bid_during_window` and `exit_threshold_used` for future ML modeling of exit probability
+- **Data**: Validated on 548 trades with 102K market snapshots (bid spike analysis)
 
 ## Danger Zone: py-clob-client Landmines
 
@@ -248,6 +251,7 @@ These three bugs will silently break live trading if the workarounds are removed
 - Console output must be ASCII-safe (no emojis in logger.info)
 - Windows compatibility — no signal handlers (add_signal_handler wrapped in try/except NotImplementedError)
 - Paper trades stored as dicts in `_pending_trades` (keyed by market slug), persisted to SQLite
+- **Changelog required**: When deploying any feature or behavior change to VPS, add a row to the Changelog table at the bottom of this file with the date (UTC), a short description, and a link to the design doc if one exists. This is critical for distinguishing which data was collected under which version.
 
 ## Detailed Reference Docs
 
@@ -258,3 +262,19 @@ See `docs/` for in-depth reference material (read on-demand when working in spec
 - **`docs/trading-logic.md`** — Data flow diagram, edge detection modes, bet sizing strategies (fixed/kelly/adaptive with multiplier details), paper trading fee model, window lifecycle & settlement (Gamma API, two-tier), startup sequence
 - **`docs/known-issues.md`** — All 32 historical bug fixes and known issues with descriptions and resolutions
 - **`docs/plans/`** — Design documents and implementation plans (adaptive early exit design + plan)
+
+## Changelog
+
+Reverse-chronological log of deployed changes. Check timestamps to know what data was collected under which version.
+
+| Date (UTC) | Change | Design Doc |
+|------------|--------|------------|
+| 2026-03-03 ~21:00 | **Data collection upgrade**: `max_bid_during_window` + `exit_threshold_used` on live_trades, `bid_size`/`ask_size` on market_snapshots — enables ML-based exit prediction and adaptive sizing research | — |
+| 2026-03-03 ~20:30 | **4-tier early exit**: Split 3-tier into 4-tier thresholds based on 548-trade bid spike analysis. <0.35: 0.60->0.50, 0.35-0.40: 0.65->0.45, 0.40-0.50: 0.65 (unchanged), >=0.50: 0.95 (unchanged). Catches 87% of cheap losses vs 20% before | — |
+| 2026-03-03 ~21:30 | **Trend protection**: Chainlink price buffer for boundary-accurate settlement, live regime flip (strength >= 0.35), loss streak guard (3x LOSS pauses side for 2 windows) | `docs/plans/2026-03-03-trend-protection-design.md` |
+| 2026-03-02 ~18:00 | **Adaptive early exit**: Tiered thresholds by entry price (<0.35/0.35-0.50/>=0.50), full-window monitoring, retry logic, token balance query | `docs/plans/2026-03-02-adaptive-early-exit-design.md` |
+| 2026-03-02 ~16:00 | **Telegram cleanup**: 13 -> 10 commands, combined trade alert, /recent + /today, 60-min stats interval | `docs/plans/2026-03-02-telegram-cleanup-design.md` |
+| 2026-03-02 ~14:00 | **Entry time gate**: Tightened from 120s to 60s (60-120s entries had 24.5% WR) | — |
+| 2026-03-01 | **Confidence filter**: MIN_CONFIDENCE=0.015, skip low-signal windows | — |
+| 2026-02-28 | **ML model trained**: RF_d3 (53.9% accuracy, 34,100 samples, 44 features) | — |
+| 2026-02-28 | **Live trading launched**: py-clob-client, GTC orders, Helsinki VPS | — |

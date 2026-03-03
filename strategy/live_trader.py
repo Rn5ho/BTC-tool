@@ -15,6 +15,7 @@ Safety features:
 import asyncio
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -510,6 +511,46 @@ class LiveTrader:
     # Early exit — sell tokens before window settles
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def get_exit_threshold(entry_price: float) -> float:
+        """Return the early exit bid threshold based on entry price tier.
+
+        Cheap entries have low WR and benefit from aggressive exits.
+        Expensive entries have decent WR and should stay conservative.
+        Thresholds validated on 548 trades with 102K market snapshots.
+        """
+        from config import settings
+        if entry_price < 0.35:
+            return settings.early_exit_threshold_low
+        if entry_price < 0.40:
+            return settings.early_exit_threshold_low_mid
+        if entry_price < 0.50:
+            return settings.early_exit_threshold_mid
+        return settings.early_exit_threshold_high
+
+    async def get_token_balance(self, token_id: str) -> float | None:
+        """Query actual conditional token balance from CLOB.
+
+        Returns the number of tokens we hold, or None on failure.
+        """
+        if not self._active or self._client is None:
+            return None
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=token_id,
+            )
+            result = await asyncio.to_thread(
+                self._client.get_balance_allowance, params
+            )
+            if isinstance(result, dict):
+                bal = result.get("balance", "0")
+                return float(bal) / 1e6  # conditional tokens use 6 decimals
+            return float(result) / 1e6
+        except Exception:
+            logger.exception("Failed to fetch token balance for %s", token_id[:16])
+            return None
+
     async def sell_early_exit(
         self,
         token_id: str,
@@ -526,7 +567,8 @@ class LiveTrader:
         Parameters
         ----------
         tokens : float
-            Exact token count from the buy (computed at buy time with fees).
+            Token count from the buy (computed at buy time — may overestimate
+            if CLOB fill price differed from signal entry price).
         best_bid : float
             Current best bid price on the order book.
         """
@@ -536,27 +578,49 @@ class LiveTrader:
             result["error"] = "LiveTrader not active"
             return result
 
-        # CLOB 5-token minimum applies to sells too
-        if tokens < 5:
-            result["error"] = f"Token count {tokens:.2f} below CLOB 5-token minimum"
+        # Query actual token balance — our computed token count may be wrong
+        # if the CLOB filled at a different price than the signal entry price.
+        actual_balance = await self.get_token_balance(token_id)
+        if actual_balance is not None:
+            if actual_balance < 5:
+                result["error"] = f"Actual token balance {actual_balance:.2f} below CLOB 5-token minimum"
+                logger.warning("Skipping early exit — %s", result["error"])
+                return result
+            if actual_balance < tokens:
+                logger.info(
+                    "Token balance correction: computed=%.2f actual=%.2f (diff=%.2f)",
+                    tokens, actual_balance, tokens - actual_balance,
+                )
+            # Use actual balance (floor to 2 decimal places for safety)
+            sell_tokens = math.floor(actual_balance * 100) / 100
+        else:
+            # Fallback: use computed tokens with a safety margin
+            sell_tokens = round(tokens * 0.95, 2)
+            logger.warning(
+                "Could not query token balance — using 95%% of computed: %.2f",
+                sell_tokens,
+            )
+
+        if sell_tokens < 5:
+            result["error"] = f"Token count {sell_tokens:.2f} below CLOB 5-token minimum"
             logger.warning("Skipping early exit — %s", result["error"])
             return result
 
         # For SELL MarketOrderArgs, amount = TOKEN COUNT (not USDC).
         # Pass our full token count so the CLOB sells the entire position.
         # Expected USDC proceeds = tokens × best_bid (for PnL tracking).
-        expected_usdc = round(tokens * best_bid, 2)
+        expected_usdc = round(sell_tokens * best_bid, 2)
         result["sell_amount"] = expected_usdc
 
         logger.info(
-            "Placing EARLY EXIT SELL: %s %.1f tokens @ bid $%.3f = ~$%.2f on %s",
-            token_id[:16], tokens, best_bid, expected_usdc, market_slug,
+            "Placing EARLY EXIT SELL: %s %.1f tokens (actual) @ bid $%.3f = ~$%.2f on %s",
+            token_id[:16], sell_tokens, best_bid, expected_usdc, market_slug,
         )
 
         try:
             order_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=round(tokens, 2),  # token count, not USDC
+                amount=round(sell_tokens, 2),  # token count, not USDC
                 side=SELL,
             )
             signed_order = await asyncio.to_thread(
