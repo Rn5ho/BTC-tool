@@ -112,6 +112,20 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_live_trades_ts ON live_trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_live_trades_slug ON live_trades(market_slug);
                 CREATE INDEX IF NOT EXISTS idx_live_trades_outcome ON live_trades(success, outcome);
+
+                CREATE TABLE IF NOT EXISTS skipped_windows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    market_slug TEXT NOT NULL,
+                    skip_reason TEXT NOT NULL,
+                    btc_price REAL,
+                    regime_state TEXT,
+                    regime_strength REAL,
+                    model_confidence REAL,
+                    entry_price REAL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_skipped_ts ON skipped_windows(timestamp);
                 """
             )
             await self._db.commit()
@@ -157,6 +171,16 @@ class Database:
             ("market_snapshots", "up_ask_size", "REAL"),
             ("market_snapshots", "down_bid_size", "REAL"),
             ("market_snapshots", "down_ask_size", "REAL"),
+            # extended data collection (2026-03-03)
+            ("live_trades", "btc_price_at_open", "REAL"),
+            ("live_trades", "settlement_price", "REAL"),
+            ("live_trades", "fill_price", "REAL"),
+            ("live_trades", "regime_direction_pct", "REAL"),
+            ("live_trades", "regime_momentum_score", "REAL"),
+            ("live_trades", "regime_ema_slope", "REAL"),
+            ("live_trades", "regime_price_vs_ema", "REAL"),
+            ("live_trades", "regime_ema_cross", "REAL"),
+            ("live_trades", "model_confidence", "REAL"),
         ]
         for table, column, col_type in alter_statements:
             try:
@@ -316,6 +340,33 @@ class Database:
             logger.exception("Failed to update paper trade %d", trade_id)
             raise
 
+    async def save_skipped_window(
+        self,
+        timestamp: int,
+        market_slug: str,
+        skip_reason: str,
+        btc_price: Optional[float] = None,
+        regime_state: Optional[str] = None,
+        regime_strength: Optional[float] = None,
+        model_confidence: Optional[float] = None,
+        entry_price: Optional[float] = None,
+    ) -> None:
+        """Record a skipped trading window with reason."""
+        try:
+            await self._db.execute(
+                """
+                INSERT INTO skipped_windows
+                    (timestamp, market_slug, skip_reason, btc_price,
+                     regime_state, regime_strength, model_confidence, entry_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (timestamp, market_slug, skip_reason, btc_price,
+                 regime_state, regime_strength, model_confidence, entry_price),
+            )
+            await self._db.commit()
+        except Exception:
+            logger.exception("Failed to save skipped window")
+
     async def save_live_trade(
         self,
         timestamp: int,
@@ -331,6 +382,14 @@ class Database:
         trade_tag: Optional[str] = None,
         regime_state: Optional[str] = None,
         regime_strength: Optional[float] = None,
+        btc_price_at_open: Optional[float] = None,
+        fill_price: Optional[float] = None,
+        regime_direction_pct: Optional[float] = None,
+        regime_momentum_score: Optional[float] = None,
+        regime_ema_slope: Optional[float] = None,
+        regime_price_vs_ema: Optional[float] = None,
+        regime_ema_cross: Optional[float] = None,
+        model_confidence: Optional[float] = None,
     ) -> Optional[int]:
         """Insert a live trade record. Returns the row id on success."""
         try:
@@ -339,8 +398,13 @@ class Database:
                 INSERT INTO live_trades
                     (timestamp, market_slug, side, token_id, amount_usdc,
                      order_id, status, success, response_json, entry_price,
-                     trade_tag, regime_state, regime_strength)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     trade_tag, regime_state, regime_strength,
+                     btc_price_at_open, fill_price,
+                     regime_direction_pct, regime_momentum_score,
+                     regime_ema_slope, regime_price_vs_ema, regime_ema_cross,
+                     model_confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -356,6 +420,14 @@ class Database:
                     trade_tag,
                     regime_state,
                     regime_strength,
+                    btc_price_at_open,
+                    fill_price,
+                    regime_direction_pct,
+                    regime_momentum_score,
+                    regime_ema_slope,
+                    regime_price_vs_ema,
+                    regime_ema_cross,
+                    model_confidence,
                 ),
             )
             await self._db.commit()
@@ -401,6 +473,7 @@ class Database:
         settled_at: int,
         max_bid_during_window: float | None = None,
         exit_threshold_used: float | None = None,
+        settlement_price: float | None = None,
     ) -> None:
         """Update a live trade with settlement data."""
         try:
@@ -408,11 +481,13 @@ class Database:
                 """
                 UPDATE live_trades
                 SET outcome = ?, pnl = ?, settled_at = ?,
-                    max_bid_during_window = ?, exit_threshold_used = ?
+                    max_bid_during_window = ?, exit_threshold_used = ?,
+                    settlement_price = ?
                 WHERE id = ?
                 """,
                 (outcome, pnl, settled_at,
-                 max_bid_during_window, exit_threshold_used, trade_id),
+                 max_bid_during_window, exit_threshold_used,
+                 settlement_price, trade_id),
             )
             await self._db.commit()
             logger.info(

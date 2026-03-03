@@ -269,7 +269,7 @@ Reverse-chronological log of deployed changes. Check timestamps to know what dat
 
 | Date (UTC) | Change | Design Doc |
 |------------|--------|------------|
-| 2026-03-03 ~21:00 | **Data collection upgrade**: `max_bid_during_window` + `exit_threshold_used` on live_trades, `bid_size`/`ask_size` on market_snapshots — enables ML-based exit prediction and adaptive sizing research | — |
+| 2026-03-03 ~21:00 | **Comprehensive data collection**: 9 new columns on live_trades (max_bid, exit_threshold, btc_at_open, settlement_price, fill_price, 5 regime sub-components, model_confidence), 4 new on market_snapshots (bid/ask sizes), new `skipped_windows` table. Enables ML exit prediction, slippage analysis, skip opportunity analysis | — |
 | 2026-03-03 ~20:30 | **4-tier early exit**: Split 3-tier into 4-tier thresholds based on 548-trade bid spike analysis. <0.35: 0.60->0.50, 0.35-0.40: 0.65->0.45, 0.40-0.50: 0.65 (unchanged), >=0.50: 0.95 (unchanged). Catches 87% of cheap losses vs 20% before | — |
 | 2026-03-03 ~21:30 | **Trend protection**: Chainlink price buffer for boundary-accurate settlement, live regime flip (strength >= 0.35), loss streak guard (3x LOSS pauses side for 2 windows) | `docs/plans/2026-03-03-trend-protection-design.md` |
 | 2026-03-02 ~18:00 | **Adaptive early exit**: Tiered thresholds by entry price (<0.35/0.35-0.50/>=0.50), full-window monitoring, retry logic, token balance query | `docs/plans/2026-03-02-adaptive-early-exit-design.md` |

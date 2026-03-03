@@ -1309,6 +1309,20 @@ class Orchestrator:
                     trade_tag = "regime_flip"
                 elif live_signal.get("_post_streak"):
                     trade_tag = "post_streak"
+                # Parse fill price from CLOB response if available
+                _fill_price = None
+                _resp = live_result.get("response")
+                if _resp and isinstance(_resp, dict):
+                    # GTC response has 'avg_price' or can be derived from fills
+                    _fill_price = _resp.get("avg_price")
+                    if _fill_price is not None:
+                        try:
+                            _fill_price = float(_fill_price)
+                        except (ValueError, TypeError):
+                            _fill_price = None
+
+                # Regime sub-components for data collection
+                _regime = self._current_regime
                 live_trade_id = await self.db.save_live_trade(
                     timestamp=int(time.time() * 1000),
                     market_slug=live_signal["market_slug"],
@@ -1318,12 +1332,19 @@ class Orchestrator:
                     order_id=live_result.get("order_id"),
                     status="filled" if live_result["success"] else "failed",
                     success=live_result["success"],
-                    response_json=json.dumps(live_result.get("response"))
-                    if live_result.get("response") else None,
+                    response_json=json.dumps(_resp) if _resp else None,
                     entry_price=live_signal["entry_price"],
                     trade_tag=trade_tag,
                     regime_state=live_signal.get("regime_state"),
                     regime_strength=live_signal.get("regime_strength"),
+                    btc_price_at_open=self._window_btc_start,
+                    fill_price=_fill_price,
+                    regime_direction_pct=_regime.direction_pct if _regime else None,
+                    regime_momentum_score=_regime.momentum_score if _regime else None,
+                    regime_ema_slope=_regime.ema_slope if _regime else None,
+                    regime_price_vs_ema=_regime.price_vs_ema if _regime else None,
+                    regime_ema_cross=_regime.ema_cross if _regime else None,
+                    model_confidence=live_signal.get("confidence"),
                 )
 
                 # Track token for settlement + early exit
@@ -1667,20 +1688,30 @@ class Orchestrator:
             settlement_source,
         )
 
-        # Notify on skipped windows (only if real-time skip wasn't already sent)
-        if not self._window_traded and not self._window_skip_notified and self.alerter:
+        # Log skipped windows to DB + Telegram
+        if not self._window_traded and slug:
             reason = self._window_skip_reason or "no signal from model"
-            try:
-                btc_start_str = f"${self._window_btc_start:,.2f}" if self._window_btc_start else "N/A"
-                btc_end_str = f"${btc_end:,.2f}" if btc_end else "N/A"
-                await self.alerter._send(
-                    f"SKIPPED {self._current_slug}\n"
-                    f"Reason: {reason}\n"
-                    f"BTC: {btc_start_str} to {btc_end_str} ({direction})",
-                    parse_mode=None,
-                )
-            except Exception:
-                logger.exception("Failed to send skip notification")
+            _r = self._current_regime
+            await self.db.save_skipped_window(
+                timestamp=int(time.time() * 1000),
+                market_slug=slug,
+                skip_reason=reason,
+                btc_price=btc_end,
+                regime_state=_r.regime if _r else None,
+                regime_strength=_r.strength if _r else None,
+            )
+            if not self._window_skip_notified and self.alerter:
+                try:
+                    btc_start_str = f"${self._window_btc_start:,.2f}" if self._window_btc_start else "N/A"
+                    btc_end_str = f"${btc_end:,.2f}" if btc_end else "N/A"
+                    await self.alerter._send(
+                        f"SKIPPED {self._current_slug}\n"
+                        f"Reason: {reason}\n"
+                        f"BTC: {btc_start_str} to {btc_end_str} ({direction})",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    logger.exception("Failed to send skip notification")
 
         if self.paper_trader and have_prices:
             await self.paper_trader.settle_all_pending(
@@ -1700,7 +1731,7 @@ class Orchestrator:
 
         # Settle live trades using Gamma resolution (or price fallback)
         if self.live_trader and self.live_trader.is_active:
-            await self._settle_live_trades_for_window(slug, btc_went_up)
+            await self._settle_live_trades_for_window(slug, btc_went_up, btc_end)
 
         # Telegram alerts for in-memory tracked positions
         if slug and slug in self._live_trade_tokens:
@@ -1727,7 +1758,7 @@ class Orchestrator:
                     )
 
     async def _settle_live_trades_for_window(
-        self, slug: str, btc_went_up: bool
+        self, slug: str, btc_went_up: bool, settlement_price: float | None = None
     ) -> None:
         """Settle unsettled live trades matching the given slug."""
         if not self.live_trader:
@@ -1758,7 +1789,7 @@ class Orchestrator:
             else:
                 pnl = -amount if not won else 0.0
 
-            # Update DB — include max bid and exit threshold for data collection
+            # Update DB — include max bid, exit threshold, settlement price
             settled_at = int(time.time() * 1000)
             live_pos = self._live_trade_tokens.get(slug)
             max_bid = live_pos.get("max_bid") if live_pos else None
@@ -1770,6 +1801,7 @@ class Orchestrator:
                 row["id"], outcome, pnl, settled_at,
                 max_bid_during_window=max_bid,
                 exit_threshold_used=exit_th,
+                settlement_price=settlement_price,
             )
 
             # Update live trader internal state
@@ -1884,7 +1916,12 @@ class Orchestrator:
                 pnl = -amount if not won else 0.0
 
             settled_at = int(time.time() * 1000)
-            await self.db.update_live_trade(row["id"], outcome, pnl, settled_at)
+            # For catchup: btc_end is only available in candle fallback path
+            _stale_settle_price = btc_end if not gamma_res else None
+            await self.db.update_live_trade(
+                row["id"], outcome, pnl, settled_at,
+                settlement_price=_stale_settle_price,
+            )
             self.live_trader.record_settlement(won, pnl)
 
             source = "Gamma" if gamma_res else "candle"
