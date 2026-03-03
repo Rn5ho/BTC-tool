@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from typing import Callable, Optional
 
 import aiohttp
@@ -102,6 +103,8 @@ class PolymarketClient:
         # Chainlink RTDS stream state
         self._chainlink_stream_price: Optional[float] = None
         self._chainlink_stream_ts: float = 0.0
+        # Rolling buffer of (unix_timestamp, price) for boundary-accurate settlement
+        self._chainlink_price_buffer: deque[tuple[float, float]] = deque(maxlen=120)
 
     async def start(self) -> None:
         """Create the aiohttp client session.
@@ -536,6 +539,19 @@ class PolymarketClient:
             return None
         return self._chainlink_stream_price
 
+    def get_chainlink_price_at(self, target_time: float) -> tuple[float | None, float]:
+        """Return the Chainlink price closest to target_time.
+
+        Returns (price, delta_seconds) where delta_seconds is how far the
+        sample was from target_time.  Returns (None, 0) if buffer is empty.
+        """
+        if not self._chainlink_price_buffer:
+            return None, 0.0
+        best_ts, best_price = min(
+            self._chainlink_price_buffer, key=lambda tp: abs(tp[0] - target_time)
+        )
+        return best_price, abs(best_ts - target_time)
+
     async def run_chainlink_stream(self) -> None:
         """Stream Chainlink BTC/USD prices from Polymarket RTDS WebSocket.
 
@@ -605,6 +621,9 @@ class PolymarketClient:
                                     if price is not None:
                                         self._chainlink_stream_price = float(price)
                                         self._chainlink_stream_ts = time.time()
+                                        self._chainlink_price_buffer.append(
+                                            (self._chainlink_stream_ts, self._chainlink_stream_price)
+                                        )
                                         if _msg_count <= 3 or _msg_count % 500 == 0:
                                             logger.info(
                                                 "Chainlink stream: BTC/USD $%.2f (msg #%d)",

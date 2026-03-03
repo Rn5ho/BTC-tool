@@ -1539,9 +1539,14 @@ class Orchestrator:
         For live trades: queries Gamma API for actual Polymarket resolution.
         For paper trades: uses Chainlink/Binance price comparison (best effort).
         """
-        # Get BTC end price for paper trading + logging
-        btc_end = self.polymarket.get_chainlink_stream_price()
-        price_source = "Chainlink Stream"
+        # Get BTC end price — prefer boundary-accurate buffer lookup
+        window_end_time = self._window_start_time + 300.0  # 5-min window
+        btc_end, price_delta = self.polymarket.get_chainlink_price_at(window_end_time)
+        if btc_end is not None:
+            price_source = f"Chainlink Buffer (delta={price_delta:.1f}s)"
+        else:
+            btc_end = self.polymarket.get_chainlink_stream_price()
+            price_source = "Chainlink Stream"
         if btc_end is None:
             btc_end = self.binance.get_latest_price()
             price_source = "Binance (fallback)"
@@ -1577,7 +1582,7 @@ class Orchestrator:
         else:
             logger.warning("Cannot settle %s — no Gamma resolution and no price data", slug)
             # Still send end-of-window skip summary even when settlement fails
-            if not self._window_traded and self.alerter:
+            if not self._window_traded and not self._window_skip_notified and self.alerter:
                 reason = self._window_skip_reason or "no signal from model"
                 try:
                     await self.alerter._send(
@@ -1607,8 +1612,8 @@ class Orchestrator:
             settlement_source,
         )
 
-        # Notify on skipped windows
-        if not self._window_traded and self.alerter:
+        # Notify on skipped windows (only if real-time skip wasn't already sent)
+        if not self._window_traded and not self._window_skip_notified and self.alerter:
             reason = self._window_skip_reason or "no signal from model"
             try:
                 btc_start_str = f"${self._window_btc_start:,.2f}" if self._window_btc_start else "N/A"
