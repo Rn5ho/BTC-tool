@@ -56,10 +56,30 @@ class Settings(BaseSettings):
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_url: str = "https://clob.polymarket.com"
 
+    # Regime detection — strength threshold for trending classification
+    regime_trend_threshold: float = 0.30
+    # Regime flip — flip paper signal to trend-following when |strength| >= this
+    # Higher than trend_threshold: 0.30-0.40 is classified trending but not flipped
+    regime_flip_threshold: float = 0.35
+
+    # Regime flip — applies to live trades (not just paper) when trending
+    regime_flip_live: bool = True         # enable regime flip for live trades
+
+    # Loss streak guard — pause a side after consecutive losses
+    streak_pause_threshold: int = 3       # consecutive same-side losses to trigger
+    streak_pause_windows: int = 2         # number of 5-min windows to pause (~10 min)
+
     # Confidence dampening — shrink P(up) toward 0.5 to counter model
     # overconfidence.  1.0 = no dampening, 0.0 = always 50%.
     # Calibration data shows ~10-20% overconfidence; 0.6 is a good fit.
     confidence_dampen: float = 0.6
+
+    # Adaptive early exit — tiered thresholds by entry price
+    # Lower entry prices have lower WR and benefit from aggressive exits.
+    # Data: 640 trades, validated on live + paper + CLOB ground truth.
+    early_exit_threshold_low: float = 0.60    # entry < 0.35 (~15% WR)
+    early_exit_threshold_mid: float = 0.65    # entry 0.35-0.50 (~25% WR)
+    early_exit_threshold_high: float = 0.95   # entry >= 0.50 (~55% WR)
 
     # Hour blacklist (UTC hours where model underperforms; skip trading)
     blacklist_hours: str = "2"  # comma-separated UTC hours, e.g. "2,11,19"
