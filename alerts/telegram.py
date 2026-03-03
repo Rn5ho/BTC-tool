@@ -122,16 +122,21 @@ class TelegramAlerter:
         order_id: str | None = None,
         success: bool = True,
         error_msg: str = "",
+        is_regime_flip: bool = False,
     ) -> None:
         """Send a combined trade placement notification (edge + order details)."""
         if success:
             side_emoji = "\U0001f7e2" if side == "UP" else "\U0001f534"
+            if is_regime_flip:
+                model_line = f"REGIME FLIP (strength: {confidence*100:.0f}%) | Edge: {edge:+.1%}"
+            else:
+                model_line = f"Model: {50 + confidence * 100:.0f}% {side} | Edge: {edge:+.1%}"
             text = (
                 f"{side_emoji} <b>LIVE TRADE PLACED</b>\n\n"
                 f"Market: {slug}\n"
                 f"Side: <b>{side}</b> @ {entry_price:.3f}\n"
                 f"Size: <b>${amount:.2f}</b>\n"
-                f"Model: {min(50 + confidence * 100, 99):.0f}% {side} | Edge: {edge:+.1%}\n"
+                f"{model_line}\n"
                 f"Order: {order_id or 'N/A'}"
             )
         else:

@@ -1377,6 +1377,7 @@ class Orchestrator:
                         order_id=live_result.get("order_id"),
                         success=live_result["success"],
                         error_msg=live_result.get("error", ""),
+                        is_regime_flip=bool(live_signal.get("regime_flip")),
                     )
 
 
