@@ -245,7 +245,9 @@ class PaperTrader:
             entry_price=signal["entry_price"],
             entry_spread=signal.get("spread"),
             midpoint_price=signal.get("midpoint_price"),
-            trade_tag="exploration" if signal.get("exploration") else None,
+            trade_tag=signal.get("trade_tag_override") or ("exploration" if signal.get("exploration") else None),
+            regime_state=signal.get("regime_state"),
+            regime_strength=signal.get("regime_strength"),
         )
 
         await self.db.save_paper_trade(trade)

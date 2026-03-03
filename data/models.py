@@ -76,6 +76,17 @@ class PolymarketMarket:
 
 
 @dataclass
+class RegimeState:
+    regime: str          # "trending_up", "trending_down", "ranging"
+    strength: float      # [-1, 1] composite score
+    direction_pct: float  # % of candles in dominant direction
+    momentum_score: float
+    ema_slope: float
+    price_vs_ema: float
+    ema_cross: float
+
+
+@dataclass
 class FeatureVector:
     timestamp: int
     obi: float = 0.0  # order book imbalance
@@ -107,3 +118,5 @@ class PaperTrade:
     entry_spread: Optional[float] = None  # bid-ask spread at entry
     midpoint_price: Optional[float] = None  # midpoint at entry (for comparison)
     trade_tag: Optional[str] = None  # "exploration" for low-entry-price data collection trades
+    regime_state: Optional[str] = None      # "trending_up", "trending_down", "ranging"
+    regime_strength: Optional[float] = None  # composite score [-1, 1]

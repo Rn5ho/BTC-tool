@@ -131,7 +131,7 @@ class TelegramAlerter:
                 f"Market: {slug}\n"
                 f"Side: <b>{side}</b> @ {entry_price:.3f}\n"
                 f"Size: <b>${amount:.2f}</b>\n"
-                f"Confidence: {confidence:.1%} | Edge: {edge:+.1%}\n"
+                f"Model: {50 + confidence * 100:.1f}% {side} | Edge: {edge:+.1%}\n"
                 f"Order: {order_id or 'N/A'}"
             )
         else:
