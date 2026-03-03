@@ -1143,10 +1143,10 @@ class Orchestrator:
                 logger.info("Skipping edge — %s", self._window_skip_reason)
                 return
 
-        # 6e2. Regime flip (paper only — live trades use model's original signal)
-        #   When a strong trend is detected, flip the paper signal to bet WITH
-        #   the trend instead of the model's counter-trend prediction.
-        paper_flip_signal = None  # None = use model's signal; dict = use flipped signal
+        # 6e2. Regime flip — when a strong trend is detected, flip the signal
+        #   to bet WITH the trend instead of the model's counter-trend prediction.
+        #   Applies to paper always; live when regime_flip_live=True.
+        flip_signal = None  # None = use model's signal; dict = use flipped signal
         if (self._current_regime
                 and self._current_regime.regime != "ranging"
                 and abs(self._current_regime.strength) >= settings.regime_flip_threshold):
@@ -1154,12 +1154,13 @@ class Orchestrator:
             if trend_side and trend_side != signal["side"]:
                 flipped = self._build_flipped_signal(signal, market, trend_side)
                 if flipped:
-                    paper_flip_signal = flipped
+                    flip_signal = flipped
                     logger.info(
-                        "Paper FLIP: %s -> %s (regime=%s, str=%.2f)",
+                        "REGIME FLIP: %s -> %s (regime=%s, str=%.2f, live=%s)",
                         signal["side"], trend_side,
                         self._current_regime.regime,
                         self._current_regime.strength,
+                        "yes" if settings.regime_flip_live else "paper-only",
                     )
 
         # 6f. Max edge cap — only for classic (non-always-trade) mode.
@@ -1204,7 +1205,7 @@ class Orchestrator:
         )
         fee_pct = signal.get("fee_factor", 0.0) * 100
         conf_pct = signal.get("confidence", 0.0) * 100
-        flip_tag = " [FLIP]" if paper_flip_signal else ""
+        flip_tag = " [FLIP]" if flip_signal else ""
         explore_tag = " [EXPLORE]" if signal.get("exploration") else ""
         model_tag = ("ML" if self._use_ml else "RB") + flip_tag + explore_tag
         spread_val = signal.get("spread")
@@ -1239,7 +1240,7 @@ class Orchestrator:
         # Paper trade (no Telegram — paper stats kept in DB/logs only)
         # Use flipped signal during strong trends, otherwise use model's signal
         if self.paper_trader:
-            paper_signal = paper_flip_signal if paper_flip_signal else signal
+            paper_signal = flip_signal if flip_signal else signal
             if paper_signal.get("exploration"):
                 paper_signal = {**paper_signal, "size_override": 1.00}
             elif paper_signal.get("regime_flip"):
@@ -1248,32 +1249,36 @@ class Orchestrator:
 
         # Live trade — place real order on Polymarket
         # Skip exploration trades (entry price 0.25-0.35) for live — paper-only data collection
-        if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused and not signal.get("exploration"):
+        live_signal = signal  # default: model's signal
+        if flip_signal and settings.regime_flip_live:
+            live_signal = flip_signal
+
+        if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused and not live_signal.get("exploration"):
             # Determine token ID from market
             if market:
                 token_id = (
-                    market.up_token_id if signal["side"] == "UP"
+                    market.up_token_id if live_signal["side"] == "UP"
                     else market.down_token_id
                 )
                 # Use live trader's own adaptive sizing (based on live bankroll)
                 live_amount = self.live_trader.compute_bet_size(
-                    confidence=signal.get("confidence", 0.0),
+                    confidence=live_signal.get("confidence", 0.0),
                 )
 
                 live_result = await self.live_trader.place_order(
                     token_id=token_id,
                     amount_usdc=live_amount,
-                    side=signal["side"],
-                    market_slug=signal["market_slug"],
-                    entry_price=signal["entry_price"],
+                    side=live_signal["side"],
+                    market_slug=live_signal["market_slug"],
+                    entry_price=live_signal["entry_price"],
                 )
 
                 # Persist to DB first (to get row ID for early exit tracking)
-                trade_tag = None
+                trade_tag = "regime_flip" if (flip_signal and settings.regime_flip_live) else None
                 live_trade_id = await self.db.save_live_trade(
                     timestamp=int(time.time() * 1000),
-                    market_slug=signal["market_slug"],
-                    side=signal["side"],
+                    market_slug=live_signal["market_slug"],
+                    side=live_signal["side"],
                     token_id=token_id,
                     amount_usdc=live_result["amount"],
                     order_id=live_result.get("order_id"),
@@ -1281,26 +1286,26 @@ class Orchestrator:
                     success=live_result["success"],
                     response_json=json.dumps(live_result.get("response"))
                     if live_result.get("response") else None,
-                    entry_price=signal["entry_price"],
+                    entry_price=live_signal["entry_price"],
                     trade_tag=trade_tag,
-                    regime_state=signal.get("regime_state"),
-                    regime_strength=signal.get("regime_strength"),
+                    regime_state=live_signal.get("regime_state"),
+                    regime_strength=live_signal.get("regime_strength"),
                 )
 
                 # Track token for settlement + early exit
                 if live_result["success"]:
                     from data.polymarket import compute_fee_factor
                     fee_factor = compute_fee_factor(
-                        signal["entry_price"],
+                        live_signal["entry_price"],
                         settings.polymarket_fee_rate,
                         settings.polymarket_fee_exponent,
                     )
-                    tokens = (live_result["amount"] / signal["entry_price"]) * (1.0 - fee_factor)
-                    self._live_trade_tokens[signal["market_slug"]] = {
-                        "side": signal["side"],
+                    tokens = (live_result["amount"] / live_signal["entry_price"]) * (1.0 - fee_factor)
+                    self._live_trade_tokens[live_signal["market_slug"]] = {
+                        "side": live_signal["side"],
                         "token_id": token_id,
                         "amount": live_result["amount"],
-                        "entry_price": signal["entry_price"],
+                        "entry_price": live_signal["entry_price"],
                         "tokens": tokens,
                         "db_id": live_trade_id,
                     }
@@ -1308,12 +1313,12 @@ class Orchestrator:
                 # Telegram alert — combined trade + signal info
                 if self.alerter:
                     await self.alerter.send_trade_placed_alert(
-                        side=signal["side"],
-                        slug=signal["market_slug"],
+                        side=live_signal["side"],
+                        slug=live_signal["market_slug"],
                         amount=live_result["amount"],
-                        entry_price=signal["entry_price"],
-                        confidence=signal.get("confidence", 0.0),
-                        edge=signal.get("edge", 0.0),
+                        entry_price=live_signal["entry_price"],
+                        confidence=live_signal.get("confidence", 0.0),
+                        edge=live_signal.get("edge", 0.0),
                         order_id=live_result.get("order_id"),
                         success=live_result["success"],
                         error_msg=live_result.get("error", ""),
