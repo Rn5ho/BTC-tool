@@ -117,6 +117,31 @@ ssh root@65.21.178.90 "tail -c 20000 /home/btcedge/BTC-tool/btc_edge.log | strin
 ssh root@65.21.178.90 "cd /home/btcedge/BTC-tool && source venv/bin/activate && python -c \"import sqlite3; c=sqlite3.connect('btc_edge.db'); c.execute('DELETE FROM paper_trades'); c.commit(); print('Cleared', c.total_changes)\""
 ```
 
+### Deploy Workflow
+
+```bash
+# Full deploy sequence (run from BTC-tool directory):
+
+# 1. Ensure working tree is clean — never deploy uncommitted changes
+git status
+
+# 2. Commit (CLAUDE.md changelog must be in the same commit as code changes)
+git add <changed-files> CLAUDE.md
+git commit -m "feat/fix: short description of what and why"
+
+# 3. Deploy to VPS (adjust scp lines to only the files that changed)
+scp <changed-files> root@65.21.178.90:/home/btcedge/BTC-tool/
+
+# 4. Restart service
+ssh root@65.21.178.90 "systemctl kill -s SIGKILL btc-edge; systemctl reset-failed btc-edge; systemctl start btc-edge"
+
+# 5. Verify it's running
+ssh root@65.21.178.90 "sleep 3 && systemctl is-active btc-edge && tail -20 /home/btcedge/BTC-tool/btc_edge.log"
+
+# 6. Tag the deploy
+git tag -a deploy-$(date -u +%Y-%m-%d-%H%M) -m "deployed: short description"
+```
+
 ## Telegram Bot Commands
 
 The bot (`@BTC5mBot`) supports interactive commands:
@@ -241,6 +266,15 @@ These three bugs will silently break live trading if the workarounds are removed
 2. **SELL amount = token count, NOT USDC**: `MarketOrderArgs(amount, side=SELL)` expects token count. For BUY, amount = USDC. Passing USDC value for SELL causes partial fills leaving tokens behind.
 
 3. **5-token minimum**: ALL CLOB markets require `minimum_order_size: 5` (tokens, not USDC). `place_order()` auto-bumps to `max(5.5 × price, $3.50)`. Hard floor `$1.00` for any marketable order.
+
+## Version Control
+
+- **Every code change MUST be committed before deploying to VPS** — never scp uncommitted changes, even for hotfixes. If it's urgent, commit with a messy message; you can always clean up later.
+- **Commit messages must say what changed and why** — e.g. `fix: EE depth check using best_bid_size instead of total_deep_size` not `update stuff`.
+- **CLAUDE.md changelog and code go in the same commit** — the changelog entry documents the deploy, so it must travel with the code. Never commit code now and update the changelog later.
+- **Tag every deploy**: After scp + restart + verify, run `git tag -a deploy-YYYY-MM-DD-HHMM -m "deployed: short description"`. This creates a permanent record of exactly what code is running on the VPS.
+- **Deploy workflow**: code change → update CLAUDE.md changelog → commit → scp to VPS → restart → verify logs → tag.
+- **No orphan deploys**: If you find untagged deploys (code on VPS that doesn't match any tag), create a retroactive tag at the best-guess commit.
 
 ## Conventions
 
