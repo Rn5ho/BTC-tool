@@ -121,6 +121,9 @@ class Orchestrator:
         self._running = False
         self._paused = False  # when True, analysis loop skips trading
         self._current_regime = None  # RegimeState from last classification
+        self._regime_trend_count = 0        # consecutive windows above flip threshold
+        self._regime_trend_direction = None  # "UP" or "DOWN" — must be consistent
+        self._regime_last_counted_slug = None  # only count once per window
         self._window_btc_start: float | None = None
         self._current_slug: str | None = None
         self._window_start_time: float = 0.0  # unix timestamp of window start (from slug)
@@ -154,6 +157,8 @@ class Orchestrator:
         self._window_skip_reason: str | None = None
         self._window_skip_notified: bool = False
         self._window_traded: bool = False
+        # Cache data at skip time for enriched skipped_windows recording
+        self._window_skip_data: dict | None = None
 
         # Loss streak guard — pause a side after consecutive same-side losses
         # Only tracks our taker trades (not maker_fills) for accuracy
@@ -229,7 +234,7 @@ class Orchestrator:
             "confidence": abs(self._current_regime.strength),
             "signals": original.get("signals", {}),
             "market_slug": original["market_slug"],
-            "exploration": entry_price < 0.35,
+            "exploration": entry_price < 0.40,
             "regime_state": original.get("regime_state"),
             "regime_strength": original.get("regime_strength"),
             "regime_flip": True,
@@ -390,6 +395,7 @@ class Orchestrator:
         self.alerter.register_command("resume", self._cmd_resume)
         self.alerter.register_command("weights", self._cmd_weights)
         self.alerter.register_command("regime", self._cmd_regime)
+        self.alerter.register_command("ee", self._cmd_ee)
         self.alerter.register_command("analyze", self._cmd_analyze)
         self.alerter.register_command("spread", self._cmd_spread)
 
@@ -512,13 +518,17 @@ class Orchestrator:
             )
 
         lines = [f"\U0001f4dd <b>PENDING POSITIONS</b>\n"]
+        from strategy.live_trader import LiveTrader
         for slug, info in pending.items():
             status = ""
             if info.get("exited"):
                 status = " [EXITED]"
+            entry = info.get('entry_price', 0)
+            threshold = LiveTrader.get_exit_threshold(entry, trade_tag=info.get("trade_tag"))
             lines.append(
                 f"  {info['side']} {slug}{status}\n"
-                f"  Entry: {info.get('entry_price', 0):.3f} | "
+                f"  Entry: {entry:.3f} | "
+                f"EE: ${threshold:.2f} | "
                 f"Size: ${info.get('amount', 0):.2f} | "
                 f"Tokens: {info.get('tokens', 0):.1f}"
             )
@@ -631,12 +641,35 @@ class Orchestrator:
     async def _cmd_weights(self, args: str = "") -> str:
         """Handle /weights — show current probability model weights."""
         if self._use_ml:
+            from strategy.live_trader import LiveTrader
+            ee_lines = (
+                f"\n\n<b>Early Exit Thresholds:</b>\n"
+                f"  &lt;$0.35  exit @ ${settings.early_exit_threshold_low:.2f} (paper-only)\n"
+                f"  $0.35-0.40  exit @ ${settings.early_exit_threshold_low_mid:.2f} (paper-only)\n"
+                f"  $0.40-0.50  exit @ ${settings.early_exit_threshold_mid:.2f}\n"
+                f"  &gt;=$0.50  exit @ ${settings.early_exit_threshold_high:.2f}"
+            )
+            # Show active positions with their EE status
+            if self._live_trade_tokens:
+                ee_lines += f"\n\n<b>Active EE monitoring:</b>"
+                for slug, info in self._live_trade_tokens.items():
+                    if info.get("exited"):
+                        continue
+                    entry = info.get("entry_price", 0)
+                    threshold = LiveTrader.get_exit_threshold(entry, trade_tag=info.get("trade_tag"))
+                    ee_lines += (
+                        f"\n  {info['side']} @ ${entry:.3f}"
+                        f" -> exits @ ${threshold:.2f}"
+                    )
             return (
                 "\u2696 <b>ML MODEL</b>\n\n"
                 f"Type: {type(self.model._model).__name__}\n"
                 f"Features: 44\n"
                 f"Mode: {'always-trade' if settings.always_trade else 'edge-threshold'}\n"
-                f"Sizing: {settings.sizing_strategy}"
+                f"Sizing: {settings.sizing_strategy}\n"
+                f"Dampening: {settings.confidence_dampen}\n"
+                f"Min confidence: {settings.min_confidence}"
+                f"{ee_lines}"
             )
         w = self.model.weights
         lines = ["\u2696 <b>MODEL WEIGHTS</b>\n"]
@@ -695,7 +728,7 @@ class Orchestrator:
             f"\U0001f30d <b>MARKET REGIME</b>\n\n"
             f"Regime: <b>{label}</b> (strength: {regime.strength:+.2f})\n"
             f"[{bar}]\n"
-            f"  BEAR {'<' * 10} {'>' * 10} BULL\n\n"
+            f"  BEAR {'&lt;' * 10} {'&gt;' * 10} BULL\n\n"
             f"<b>Components:</b>\n"
             f"  Direction (20c):  {dir_detail} ({regime.direction_pct:+.2f})\n"
             f"  Momentum 10/20m:  {mom_agree} ({regime.momentum_score:+.2f})\n"
@@ -704,8 +737,86 @@ class Orchestrator:
             f"  EMA cross:        {regime.ema_cross:+.2f}\n\n"
             f"BTC: ${btc:,.2f} | EMA9: ${ema9:,.0f} | EMA21: ${ema21:,.0f}\n"
             f"Threshold: {self.regime_detector.trend_threshold:.2f} | "
-            f"Paper filter: {'ACTIVE' if regime.regime != 'ranging' else 'off'}"
+            f"Flip: {settings.regime_flip_threshold:.2f}\n"
+            f"Trend count: {self._regime_trend_count}/{settings.regime_flip_confirm_windows}"
+            f"{' -- CONFIRMED' if self._regime_trend_count >= settings.regime_flip_confirm_windows else ' -- not yet'}"
         )
+
+    async def _cmd_ee(self, args: str = "") -> str:
+        """Handle /ee [1h|24h] — early exit tier performance."""
+        import time as _time
+
+        # Parse time filter
+        since_ms = None
+        label = "ALL TIME"
+        arg = args.strip().lower()
+        if arg in ("1h", "1hr"):
+            since_ms = int((_time.time() - 3600) * 1000)
+            label = "LAST 1H"
+        elif arg in ("24h", "24hr", "1d"):
+            since_ms = int((_time.time() - 86400) * 1000)
+            label = "LAST 24H"
+        elif arg:
+            return "\u26a0 Usage: /ee [1h|24h]"
+
+        rows = await self.db.get_early_exit_tier_stats(since_ms=since_ms)
+        if not rows:
+            return f"\u26a0 No early exit data ({label})."
+
+        # Group by tier
+        tier_defs = [
+            ("<0.35", 0.0, 0.35),
+            ("0.35-0.40", 0.35, 0.40),
+            ("0.40-0.50", 0.40, 0.50),
+            (">=0.50", 0.50, 999.0),
+        ]
+        tiers: dict[str, list[dict]] = {name: [] for name, _, _ in tier_defs}
+        for r in rows:
+            ep = r.get("entry_price") or 0
+            for name, lo, hi in tier_defs:
+                if lo <= ep < hi:
+                    tiers[name].append(r)
+                    break
+
+        lines = [f"<b>EARLY EXIT TIERS ({label})</b>\n"]
+
+        for name, _, _ in tier_defs:
+            trades = tiers[name]
+            if not trades:
+                continue
+            n = len(trades)
+            rescues = sum(1 for t in trades if not t["would_have_won"])
+            regrets = n - rescues
+            ee_pnl = sum(t["pnl"] or 0 for t in trades)
+
+            # Hypothetical settlement P&L
+            settle_pnl = 0.0
+            for t in trades:
+                ep = t["entry_price"]
+                amt = t["amount_usdc"]
+                if not ep or ep <= 0:
+                    continue
+                if t["would_have_won"]:
+                    settle_pnl += (amt / ep) - amt
+                else:
+                    settle_pnl -= amt
+
+            advantage = ee_pnl - settle_pnl
+            thresholds = sorted(set(
+                t["exit_threshold_used"] for t in trades if t["exit_threshold_used"]
+            ))
+            th_str = "/".join(f"{t:.2f}" for t in thresholds)
+
+            sign = "+" if advantage >= 0 else ""
+            lines.append(
+                f"<b>{name}</b> (th={th_str}): {n} trades\n"
+                f"  Rescue: {rescues} ({rescues*100//n}%) | "
+                f"Regret: {regrets} ({regrets*100//n}%)\n"
+                f"  EE: ${ee_pnl:+.2f} | Settle: ${settle_pnl:+.2f} | "
+                f"Adv: <b>${sign}{advantage:.2f}</b>"
+            )
+
+        return "\n".join(lines)
 
     async def _cmd_analyze(self, args: str = "") -> str:
         """Handle /analyze — run trade analysis on live trades (incl. maker fills)."""
@@ -946,6 +1057,7 @@ class Orchestrator:
             self._window_skip_reason = None
             self._window_skip_notified = False
             self._window_traded = False
+            self._window_skip_data = None
             # Prefer Chainlink RTDS stream (Polymarket's resolution source)
             self._window_btc_start = self.polymarket.get_chainlink_stream_price()
             price_source = "Chainlink Stream"
@@ -1035,6 +1147,11 @@ class Orchestrator:
         else:
             p_up = self.model.predict(feature_vec)
 
+        # Apply confidence dampening to shrink P(up) toward 0.5.
+        # Counters known ML model overconfidence (~10-20%).
+        if settings.confidence_dampen < 1.0:
+            p_up = 0.5 + settings.confidence_dampen * (p_up - 0.5)
+
         # Save feature snapshot
         await self.db.save_feature_snapshot(
             features=feature_vec,
@@ -1044,6 +1161,39 @@ class Orchestrator:
 
         # 4b. Compute market regime
         self._current_regime = self.regime_detector.classify(candles)
+
+        # 4c. Track consecutive trending windows for flip confirmation.
+        #   A real trend sustains 3+ windows (15 min).  Brief flickers
+        #   spike for 1-2 windows then drop back — these should NOT flip.
+        #   Only count once per 5-min window (not every 3s loop iteration).
+        current_slug = self._current_slug
+        if current_slug and current_slug != self._regime_last_counted_slug:
+            self._regime_last_counted_slug = current_slug
+            if (self._current_regime.regime != "ranging"
+                    and abs(self._current_regime.strength) >= settings.regime_flip_threshold):
+                new_dir = "UP" if self._current_regime.strength > 0 else "DOWN"
+                if new_dir == self._regime_trend_direction:
+                    self._regime_trend_count += 1
+                else:
+                    self._regime_trend_direction = new_dir
+                    self._regime_trend_count = 1
+                logger.info(
+                    "REGIME trending %s (count=%d/%d, str=%.2f)%s",
+                    new_dir, self._regime_trend_count,
+                    settings.regime_flip_confirm_windows,
+                    self._current_regime.strength,
+                    "" if self._regime_trend_count >= settings.regime_flip_confirm_windows
+                    else " -- waiting for confirmation",
+                )
+            else:
+                if self._regime_trend_count > 0:
+                    logger.info(
+                        "REGIME trend broke (was %s x%d, now str=%.2f) -- reset",
+                        self._regime_trend_direction, self._regime_trend_count,
+                        self._current_regime.strength,
+                    )
+                self._regime_trend_count = 0
+                self._regime_trend_direction = None
 
         # 5. Detect edge (pass p_up_override so edge detector uses ML prediction)
         self._cycle_count += 1
@@ -1055,6 +1205,15 @@ class Orchestrator:
             # Capture skip reason from edge detector
             if not self._window_skip_reason and self.edge_detector.last_skip_reason:
                 self._window_skip_reason = self.edge_detector.last_skip_reason
+                # Cache data at skip time (pre-edge: no signal, but p_up + features available)
+                if not self._window_skip_data:
+                    _model_side = "UP" if p_up > 0.5 else "DOWN"
+                    self._window_skip_data = {
+                        "model_confidence": abs(p_up - 0.5),
+                        "entry_price": market.up_best_ask if _model_side == "UP" else market.down_best_ask,
+                        "model_side": _model_side,
+                        "feature_vec": feature_vec,
+                    }
             # Real-time skip notification — tell user immediately when window is skipped
             if self._window_skip_reason and not self._window_skip_notified and not self._window_traded and self.alerter:
                 self._window_skip_notified = True
@@ -1106,9 +1265,21 @@ class Orchestrator:
 
         # 6. Edge found — apply safety filters before trading.
 
+        # Helper: cache signal data when skipping a window (post-edge)
+        def _cache_skip_data() -> None:
+            if self._window_skip_data:
+                return
+            self._window_skip_data = {
+                "model_confidence": signal.get("confidence"),
+                "entry_price": signal.get("entry_price"),
+                "model_side": signal.get("side"),
+                "feature_vec": feature_vec,
+            }
+
         # 6a. Skip if trading is paused.
         if self._paused:
             self._window_skip_reason = "paused"
+            _cache_skip_data()
             return
 
         # 6b. Skip if we already have a pending trade on this market.
@@ -1128,6 +1299,7 @@ class Orchestrator:
         if seconds_in_window > self._MAX_ENTRY_SECONDS:
             if not self._window_skip_reason:
                 self._window_skip_reason = "time gate (>60s)"
+                _cache_skip_data()
             return
 
         # 6d. Hour blacklist — skip hours with historically poor performance.
@@ -1135,51 +1307,19 @@ class Orchestrator:
         current_hour = datetime.now(_tz.utc).hour
         if current_hour in self._blacklist_hours:
             self._window_skip_reason = f"blacklisted hour ({current_hour:02d}:00 UTC)"
+            _cache_skip_data()
             return
 
-        # 6d2. Loss streak guard — pause a side after consecutive losses.
-        #      Acts as early warning for potential trend onset before regime
-        #      detector has enough data (~20 min lag).
-        flip_signal = None  # initialized early so streak guard can check it
-        trade_side = signal["side"]
-        if flip_signal and settings.regime_flip_live:
-            trade_side = flip_signal["side"]
-        if trade_side in self._side_paused:
-            if time.time() < self._side_paused[trade_side]:
-                self._window_skip_reason = (
-                    f"streak guard ({settings.streak_pause_threshold}x {trade_side} LOSS)"
-                )
-                logger.info("Skipping edge — %s", self._window_skip_reason)
-                return
-            else:
-                # Pause expired — clear it, tag next trade
-                del self._side_paused[trade_side]
-                logger.info("Streak guard expired for %s — resuming", trade_side)
-                signal["_post_streak"] = True
-
-        # 6e. Trend-conflict filter — don't bet against a strong intra-window
-        #     price move.  If BTC has already moved more than TREND_CONFLICT_PCT
-        #     in one direction this window and our signal is the opposite, the
-        #     market odds already reflect reality and our "edge" is an artefact.
-        if self._window_btc_start and btc_now:
-            window_move_pct = (btc_now - self._window_btc_start) / self._window_btc_start * 100
-            btc_trending_up = window_move_pct > self._TREND_CONFLICT_PCT
-            btc_trending_down = window_move_pct < -self._TREND_CONFLICT_PCT
-            if (signal["side"] == "UP" and btc_trending_down) or \
-               (signal["side"] == "DOWN" and btc_trending_up):
-                self._window_skip_reason = (
-                    f"trend conflict ({signal['side']} vs BTC {window_move_pct:+.2f}%)"
-                )
-                logger.info("Skipping edge — %s", self._window_skip_reason)
-                return
-
-        # 6e2. Regime flip — when a strong trend is detected, flip the signal
+        # 6d2. Regime flip — when a strong trend is detected, flip the signal
         #   to bet WITH the trend instead of the model's counter-trend prediction.
         #   Applies to paper always; live when regime_flip_live=True.
-        # (flip_signal initialized before streak guard above)
+        #   Must run BEFORE streak guard and trend filter so they check the
+        #   post-flip side (the side we'll actually trade).
+        flip_signal = None
         if (self._current_regime
                 and self._current_regime.regime != "ranging"
-                and abs(self._current_regime.strength) >= settings.regime_flip_threshold):
+                and abs(self._current_regime.strength) >= settings.regime_flip_threshold
+                and self._regime_trend_count >= settings.regime_flip_confirm_windows):
             trend_side = self.regime_detector.get_trend_side(self._current_regime)
             if trend_side and trend_side != signal["side"]:
                 flipped = self._build_flipped_signal(signal, market, trend_side)
@@ -1192,6 +1332,43 @@ class Orchestrator:
                         self._current_regime.strength,
                         "yes" if settings.regime_flip_live else "paper-only",
                     )
+
+        # 6d3. Trend-conflict filter — don't bet against a strong intra-window
+        #     price move.  Uses the post-flip side so regime-flipped trades
+        #     (which align with the trend) are not incorrectly blocked.
+        effective_side = signal["side"]
+        if flip_signal and settings.regime_flip_live:
+            effective_side = flip_signal["side"]
+        if self._window_btc_start and btc_now:
+            window_move_pct = (btc_now - self._window_btc_start) / self._window_btc_start * 100
+            btc_trending_up = window_move_pct > self._TREND_CONFLICT_PCT
+            btc_trending_down = window_move_pct < -self._TREND_CONFLICT_PCT
+            if (effective_side == "UP" and btc_trending_down) or \
+               (effective_side == "DOWN" and btc_trending_up):
+                self._window_skip_reason = (
+                    f"trend conflict ({effective_side} vs BTC {window_move_pct:+.2f}%)"
+                )
+                logger.info("Skipping edge — %s", self._window_skip_reason)
+                _cache_skip_data()
+                return
+
+        # 6d4. Loss streak guard — pause a side after consecutive losses.
+        #      Uses post-flip side so the guard protects the actually-traded
+        #      direction, not the model's original prediction.
+        trade_side = effective_side
+        if trade_side in self._side_paused:
+            if time.time() < self._side_paused[trade_side]:
+                self._window_skip_reason = (
+                    f"streak guard ({settings.streak_pause_threshold}x {trade_side} LOSS)"
+                )
+                logger.info("Skipping edge — %s", self._window_skip_reason)
+                _cache_skip_data()
+                return
+            else:
+                # Pause expired — clear it, tag next trade
+                del self._side_paused[trade_side]
+                logger.info("Streak guard expired for %s — resuming", trade_side)
+                signal["_post_streak"] = True
 
         # 6f. Max edge cap — only for classic (non-always-trade) mode.
         #     In always-trade mode the edge is just model-vs-market gap, not
@@ -1303,6 +1480,20 @@ class Orchestrator:
                     entry_price=live_signal["entry_price"],
                 )
 
+                # FOK rejection — treat as skipped window for tracking
+                if live_result.get("fok_rejected"):
+                    self._window_skip_reason = (
+                        f"FOK rejected (insufficient liquidity) "
+                        f"${live_amount:.2f} @ ${live_signal['entry_price']:.2f}"
+                    )
+                    self._window_traded = False  # no trade actually placed
+                    logger.info("FOK rejected — %s", self._window_skip_reason)
+
+                # Safety: cancel any lingering orders (shouldn't exist with FOK,
+                # but kept as a belt-and-suspenders check)
+                if live_result["success"]:
+                    await self.live_trader.cancel_all_orders()
+
                 # Persist to DB first (to get row ID for early exit tracking)
                 trade_tag = None
                 if flip_signal and settings.regime_flip_live:
@@ -1313,16 +1504,22 @@ class Orchestrator:
                 _fill_price = None
                 _resp = live_result.get("response")
                 if _resp and isinstance(_resp, dict):
-                    # GTC response has 'avg_price' or can be derived from fills
-                    _fill_price = _resp.get("avg_price")
-                    if _fill_price is not None:
+                    # GTC response: fill price lives at takerOrder.price
+                    taker_order = _resp.get("takerOrder")
+                    if taker_order and isinstance(taker_order, dict):
                         try:
-                            _fill_price = float(_fill_price)
+                            _fill_price = float(taker_order.get("price", 0))
+                            if _fill_price <= 0:
+                                _fill_price = None
                         except (ValueError, TypeError):
                             _fill_price = None
 
                 # Regime sub-components for data collection
                 _regime = self._current_regime
+                # Entry-time orderbook: pick the book matching our side
+                _token_book = (
+                    up_book if live_signal["side"] == "UP" else down_book
+                ) if (up_book or down_book) else None
                 live_trade_id = await self.db.save_live_trade(
                     timestamp=int(time.time() * 1000),
                     market_slug=live_signal["market_slug"],
@@ -1345,6 +1542,23 @@ class Orchestrator:
                     regime_price_vs_ema=_regime.price_vs_ema if _regime else None,
                     regime_ema_cross=_regime.ema_cross if _regime else None,
                     model_confidence=live_signal.get("confidence"),
+                    # Entry-time Binance features (for exit-probability ML)
+                    entry_obi=feature_vec.obi if feature_vec else None,
+                    entry_taker_ratio=feature_vec.taker_ratio if feature_vec else None,
+                    entry_momentum_1m=feature_vec.momentum_1m if feature_vec else None,
+                    entry_momentum_5m=feature_vec.momentum_5m if feature_vec else None,
+                    entry_rsi=feature_vec.rsi if feature_vec else None,
+                    entry_vwap_dev=feature_vec.vwap_deviation if feature_vec else None,
+                    entry_bb_position=feature_vec.bb_position if feature_vec else None,
+                    entry_ema_cross=feature_vec.ema_cross if feature_vec else None,
+                    entry_funding_zscore=feature_vec.funding_rate if feature_vec else None,
+                    entry_volume_zscore=feature_vec.volume_zscore if feature_vec else None,
+                    entry_atr=feature_vec.atr if feature_vec else None,
+                    # Entry-time Polymarket orderbook state
+                    entry_up_spread=market.up_spread,
+                    entry_down_spread=market.down_spread,
+                    entry_token_bid_size=_token_book.bid_size if _token_book else None,
+                    entry_token_ask_size=_token_book.ask_size if _token_book else None,
                 )
 
                 # Track token for settlement + early exit
@@ -1363,6 +1577,7 @@ class Orchestrator:
                         "entry_price": live_signal["entry_price"],
                         "tokens": tokens,
                         "db_id": live_trade_id,
+                        "trade_tag": trade_tag,
                     }
 
                 # Telegram alert — combined trade + signal info
@@ -1404,10 +1619,7 @@ class Orchestrator:
         if seconds_in < 10:
             return
 
-        # Rate-limit logging
         now = time.time()
-        if now - self._last_early_exit_log < self._EARLY_EXIT_LOG_INTERVAL:
-            return
 
         # Check if we have an active position (live or paper) on this window
         slug = self._current_slug
@@ -1432,60 +1644,60 @@ class Orchestrator:
         if not book_data:
             return
 
-        self._last_early_exit_log = now
-
         # Parse bids (buyers willing to buy our token).
         # CLOB API returns bids sorted ascending — best bid is LAST.
         bids = book_data.get("bids", [])
         if not bids:
-            logger.info(
-                "[EARLY-EXIT] %s %s | %.0fs left | NO BIDS | entry=%.3f",
-                side, slug[-15:], 300 - seconds_in, entry_price,
-            )
             return
 
         # Best bid = highest price (last element in ascending sort)
         best_bid = float(bids[-1].get("price", 0))
         best_bid_size = float(bids[-1].get("size", 0))
 
-        # Track max bid during this window for data collection
+        # Track max/min bid during this window for data collection
         if live_pos:
             prev_max = live_pos.get("max_bid", 0)
             if best_bid > prev_max:
                 live_pos["max_bid"] = best_bid
+            prev_min = live_pos.get("min_bid", 999)
+            if best_bid < prev_min:
+                live_pos["min_bid"] = best_bid
 
         # Total bid depth above 0.85
         deep_bids = [(float(b["price"]), float(b["size"])) for b in bids if float(b["price"]) >= 0.85]
         total_deep_size = sum(s for _, s in deep_bids)
 
-        # Current BTC price for context
-        btc = self.binance.get_latest_price()
-        btc_move = ""
-        if btc and self._window_btc_start:
-            delta = btc - self._window_btc_start
-            btc_move = f" | BTC {'+' if delta >= 0 else ''}{delta:.2f}"
-
-        # Would we profit by selling at best_bid?
-        profit_pct = ((best_bid / entry_price) - 1) * 100 if entry_price > 0 else 0
-
         seconds_left = 300 - seconds_in
 
-        logger.info(
-            "[EARLY-EXIT] %s %s | %.0fs left | bid=%.3f x%.0f | depth>=0.85: %.0f tokens | "
-            "entry=%.3f profit=%.1f%%%s",
-            side, slug[-15:], seconds_left,
-            best_bid, best_bid_size,
-            total_deep_size,
-            entry_price, profit_pct, btc_move,
-        )
+        # Rate-limit logging only (exit trigger still runs every 1s)
+        if now - self._last_early_exit_log >= self._EARLY_EXIT_LOG_INTERVAL:
+            self._last_early_exit_log = now
+            btc = self.binance.get_latest_price()
+            btc_move = ""
+            if btc and self._window_btc_start:
+                delta = btc - self._window_btc_start
+                btc_move = f" | BTC {'+' if delta >= 0 else ''}{delta:.2f}"
+            profit_pct = ((best_bid / entry_price) - 1) * 100 if entry_price > 0 else 0
+            logger.info(
+                "[EARLY-EXIT] %s %s | %.0fs left | bid=%.3f x%.0f | depth>=0.85: %.0f tokens | "
+                "entry=%.3f profit=%.1f%%%s",
+                side, slug[-15:], seconds_left,
+                best_bid, best_bid_size,
+                total_deep_size,
+                entry_price, profit_pct, btc_move,
+            )
 
         # ---- EARLY EXIT TRIGGER ----
         # Tiered thresholds by entry price. Cheap entries (<0.50) have
         # low WR (13-25%) and benefit from aggressive exits. Expensive
         # entries keep the conservative 0.95 threshold.
         # Data: 640 trades, validated on live + paper + CLOB ground truth.
-        exit_threshold = self.live_trader.get_exit_threshold(entry_price) if self.live_trader else 0.95
-        available_depth = best_bid_size + total_deep_size
+        trade_tag = live_pos.get("trade_tag") if live_pos else None
+        exit_threshold = self.live_trader.get_exit_threshold(entry_price, trade_tag=trade_tag) if self.live_trader else 0.95
+        # Use best_bid_size (depth at the actual best bid price) — not
+        # total_deep_size (depth >= 0.85) which is meaningless when the
+        # exit threshold is 0.45-0.65 and bids are nowhere near 0.85.
+        available_depth = best_bid_size
         # Retry logic: allow up to 3 attempts with 5s cooldown between each
         exit_attempts = live_pos.get("exit_attempts", 0) if live_pos else 0
         last_attempt = live_pos.get("last_exit_attempt", 0) if live_pos else 0
@@ -1508,11 +1720,28 @@ class Orchestrator:
                 market_slug=slug,
             )
 
+            # Cancel any remaining open orders after sell attempt
+            await self.live_trader.cancel_all_orders()
+
             if not result["success"]:
-                logger.warning(
-                    "[EARLY-EXIT] Sell failed for %s (attempt %d/3) — will retry after 5s cooldown",
-                    slug[-15:], live_pos["exit_attempts"],
-                )
+                # Check if tokens were actually sold despite API error
+                remaining = await self.live_trader.get_token_balance(token_id)
+                if remaining is not None and remaining < 1.0:
+                    # Tokens are gone — sell succeeded silently on-chain
+                    logger.warning(
+                        "[EARLY-EXIT] API reported failure but tokens are GONE (balance=%.2f) "
+                        "— treating as successful sell for %s",
+                        remaining, slug[-15:],
+                    )
+                    result["success"] = True
+                    result["sell_amount"] = best_bid * live_pos["tokens"]
+                else:
+                    logger.warning(
+                        "[EARLY-EXIT] Sell failed for %s (attempt %d/3, balance=%.1f) "
+                        "— will retry after 5s cooldown",
+                        slug[-15:], live_pos["exit_attempts"],
+                        remaining if remaining is not None else -1,
+                    )
 
             if result["success"]:
                 sell_amount = result["sell_amount"]
@@ -1522,6 +1751,7 @@ class Orchestrator:
                 await self.db.update_live_trade(
                     live_pos["db_id"], "EARLY_EXIT", pnl, int(time.time() * 1000),
                     max_bid_during_window=live_pos.get("max_bid"),
+                    min_bid_during_window=live_pos.get("min_bid"),
                     exit_threshold_used=exit_threshold,
                 )
                 self.live_trader.record_settlement(pnl > 0, pnl)
@@ -1693,6 +1923,8 @@ class Orchestrator:
         if not self._window_traded and slug:
             reason = self._window_skip_reason or "no signal from model"
             _r = self._current_regime
+            _sd = self._window_skip_data or {}
+            _fv = _sd.get("feature_vec")
             await self.db.save_skipped_window(
                 timestamp=int(time.time() * 1000),
                 market_slug=slug,
@@ -1700,6 +1932,20 @@ class Orchestrator:
                 btc_price=btc_end,
                 regime_state=_r.regime if _r else None,
                 regime_strength=_r.strength if _r else None,
+                model_confidence=_sd.get("model_confidence"),
+                entry_price=_sd.get("entry_price"),
+                model_side=_sd.get("model_side"),
+                entry_obi=_fv.obi if _fv else None,
+                entry_taker_ratio=_fv.taker_ratio if _fv else None,
+                entry_momentum_1m=_fv.momentum_1m if _fv else None,
+                entry_momentum_5m=_fv.momentum_5m if _fv else None,
+                entry_rsi=_fv.rsi if _fv else None,
+                entry_vwap_dev=_fv.vwap_deviation if _fv else None,
+                entry_bb_position=_fv.bb_position if _fv else None,
+                entry_ema_cross=_fv.ema_cross if _fv else None,
+                entry_funding_zscore=_fv.funding_rate if _fv else None,
+                entry_volume_zscore=_fv.volume_zscore if _fv else None,
+                entry_atr=_fv.atr if _fv else None,
             )
             if not self._window_skip_notified and self.alerter:
                 try:
@@ -1733,6 +1979,10 @@ class Orchestrator:
         # Settle live trades using Gamma resolution (or price fallback)
         if self.live_trader and self.live_trader.is_active:
             await self._settle_live_trades_for_window(slug, btc_went_up, btc_end)
+
+        # Backfill settlement data on any EARLY_EXIT trades for this window
+        if slug:
+            await self.db.backfill_early_exit_settlement(slug, btc_end, btc_went_up)
 
         # Telegram alerts for in-memory tracked positions
         if slug and slug in self._live_trade_tokens:
@@ -1794,13 +2044,15 @@ class Orchestrator:
             settled_at = int(time.time() * 1000)
             live_pos = self._live_trade_tokens.get(slug)
             max_bid = live_pos.get("max_bid") if live_pos else None
+            min_bid = live_pos.get("min_bid") if live_pos else None
             exit_th = (
-                self.live_trader.get_exit_threshold(entry_price)
+                self.live_trader.get_exit_threshold(entry_price, trade_tag=live_pos.get("trade_tag") if live_pos else None)
                 if entry_price > 0 else None
             )
             await self.db.update_live_trade(
                 row["id"], outcome, pnl, settled_at,
                 max_bid_during_window=max_bid,
+                min_bid_during_window=min_bid,
                 exit_threshold_used=exit_th,
                 settlement_price=settlement_price,
             )
@@ -1865,6 +2117,7 @@ class Orchestrator:
 
         for row in stale:
             slug = row["market_slug"]
+            btc_end = None  # init before branches to avoid UnboundLocalError
 
             # Try Gamma API first (source of truth)
             if slug not in gamma_cache:
@@ -1929,6 +2182,11 @@ class Orchestrator:
             logger.info(
                 "Settled stale live trade: %s %s -> %s | pnl=$%+.2f [%s]",
                 side, slug, outcome, pnl, source,
+            )
+
+            # Backfill settlement data on EARLY_EXIT trades for same slug
+            await self.db.backfill_early_exit_settlement(
+                slug, btc_end, btc_went_up,
             )
 
     async def _sync_maker_fills(self) -> None:
@@ -2021,7 +2279,16 @@ class Orchestrator:
                 return
 
             # Insert new maker fills into DB
+            # Post-FOK switch: new maker fills should not appear.
+            # If they do, FOK is not working as expected.
+            logger.warning(
+                "UNEXPECTED: %d new maker fills found after FOK switch! "
+                "FOK should prevent all maker fills. Investigate.",
+                len(new_fills),
+            )
             for fill in new_fills:
+                # Best-effort BTC price lookup from candles at fill time
+                _btc_open = await self.db.get_btc_price_at(fill["timestamp"])
                 await self.db.save_live_trade(
                     timestamp=fill["timestamp"],
                     market_slug=fill["market_slug"],
@@ -2033,6 +2300,8 @@ class Orchestrator:
                     success=True,
                     entry_price=fill["entry_price"],
                     trade_tag="maker_fill",
+                    fill_price=fill["entry_price"],  # maker fills at limit price
+                    btc_price_at_open=_btc_open,
                 )
 
             logger.info(
@@ -2144,36 +2413,6 @@ class Orchestrator:
             "session": session,
             "bankroll": self.live_trader.bankroll,
         }
-
-    async def _delayed_auto_sell(self, slug: str, live_info: dict) -> None:
-        """Background task: wait for matching engine, then auto-sell winning tokens.
-
-        Waits 10 seconds before the first attempt to give the matching engine
-        time to restart after market resolution. The sell_winning_tokens method
-        itself has retry logic with exponential backoff.
-        """
-        await asyncio.sleep(10)
-        logger.info(
-            "Auto-selling winning tokens for %s (%s)",
-            slug, live_info["side"],
-        )
-        sell_result = await self.live_trader.sell_winning_tokens(
-            token_id=live_info["token_id"],
-            market_slug=slug,
-            buy_amount_usdc=live_info.get("amount", 0.0),
-            buy_price=live_info.get("entry_price", 0.0),
-        )
-        if sell_result["success"]:
-            logger.info("Auto-sell successful — USDC reclaimed for %s", slug)
-        else:
-            logger.warning(
-                "Auto-sell failed for %s: %s — claim on polymarket.com",
-                slug, sell_result["error"],
-            )
-            if self.alerter:
-                await self.alerter.send_error_alert(
-                    f"Auto-sell failed for {slug} — claim manually on polymarket.com"
-                )
 
     async def _settle_stale_trades(self) -> None:
         """Settle any unsettled trades from previous sessions whose windows have ended.

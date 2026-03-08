@@ -41,3 +41,13 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Old/backup env files
+.env.*
+
+# Historical data downloads
+historical_data/
+
+# ML model artifacts (large binaries)
+models/*.pkl
+models/*.npz

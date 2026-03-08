@@ -10,7 +10,7 @@ BTC Polymarket 5-Minute Edge Finder — monitors Binance BTC price data, uses a 
 - Binance WebSocket (spot klines + depth + aggTrades, futures funding rate)
 - Polymarket Gamma/CLOB API (market discovery, live prices, no auth needed)
 - Polymarket RTDS WebSocket for Chainlink BTC/USD stream (settlement price — matches Polymarket's resolution source)
-- py-clob-client (Polymarket CLOB trading — real orders via GTC market buys)
+- py-clob-client (Polymarket CLOB trading — real orders via FOK market buys)
 - scikit-learn (ML model inference — RandomForestClassifier loaded from pickle)
 - SQLite via aiosqlite (persistence)
 - python-telegram-bot v21+ (interactive bot with commands)
@@ -163,7 +163,7 @@ MIN_CONFIDENCE=0.015           # min |P(up)-0.5| to trade (backtested sweet spot
 LIVE_TRADING=true
 POLYMARKET_PRIVATE_KEY=...     # EOA private key (hex, no 0x prefix) from Rabby
 POLYMARKET_FUNDER_ADDRESS=...  # Proxy wallet from polymarket.com deposit settings
-MAX_LIVE_BET_USDC=5.0         # Hard safety cap (must accommodate 5-token CLOB minimum)
+MAX_LIVE_BET_USDC=10.0        # Hard safety cap (must accommodate 5-token CLOB minimum)
 # CLOB_PROXY=socks5://127.0.0.1:1080  # Not needed from Finland (no geoblock)
 
 # Polymarket fees
@@ -174,13 +174,14 @@ POLYMARKET_FEE_EXPONENT=2
 REGIME_TREND_THRESHOLD=0.30    # strength threshold for trending classification
 REGIME_FLIP_THRESHOLD=0.35     # flip signal to trend-following when |strength| >= this
 REGIME_FLIP_LIVE=true          # enable regime flip for live trades (not just paper)
+REGIME_FLIP_CONFIRM_WINDOWS=1  # consecutive trending windows before flip fires (was 3, reverted 2026-03-05)
 
 # Loss streak guard
 STREAK_PAUSE_THRESHOLD=3       # consecutive same-side losses to trigger pause
 STREAK_PAUSE_WINDOWS=2         # number of 5-min windows to pause (~10 min)
 
 # Confidence dampening — shrink P(up) toward 0.5 to counter model overconfidence
-CONFIDENCE_DAMPEN=0.6          # 1.0 = no dampening, 0.0 = always 50%
+CONFIDENCE_DAMPEN=1.0          # 1.0 = no dampening (current), 0.6 = original. Disabled 2026-03-04.
 
 # Adaptive early exit — 4-tier thresholds by entry price
 EARLY_EXIT_THRESHOLD_LOW=0.50      # entry < 0.35: lottery tickets, exit on any spike
@@ -197,12 +198,12 @@ BLACKLIST_HOURS=2              # comma-separated, e.g. "2,3,4"
 Applied in `strategy/edge.py` and `main.py` before every trade:
 
 1. **Min confidence** (`MIN_CONFIDENCE=0.015`): Skip when |P(up) - 0.5| below threshold
-2. **Entry price filter**: Hard reject outside 0.25-0.65. Exploration range 0.25-0.35 uses minimum size, tagged `trade_tag="exploration"`
+2. **Entry price filter**: Hard reject outside 0.25-0.65. Exploration range 0.25-0.40 is paper-only (bad R:R — EE profit ~$1 vs $5 risk), tagged `trade_tag="exploration"`
 3. **Time gate** (`_MAX_ENTRY_SECONDS=60`): Only enter in first 60 seconds of 5-min window *(deployed 2026-03-02)*
 4. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
 5. **Loss streak guard** (`STREAK_PAUSE_THRESHOLD=3`): After 3 consecutive LOSS on the same side, pause that side for 2 windows (~10 min). Early exits break the chain. Only tracks taker trades. Sends Telegram alert on trigger. First trade after pause tagged `post_streak`. *(deployed 2026-03-03 ~21:30 UTC)*
 6. **Trend-conflict filter** (`_TREND_CONFLICT_PCT=0.15`): Skip if BTC moved >0.15% against signal direction
-7. **Regime flip** (`REGIME_FLIP_THRESHOLD=0.35`): When regime strength >= 0.35 (trending), flip both paper and live trades to bet WITH the trend. Tagged `trade_tag='regime_flip'`. Data: 82-100% trend continuation at this threshold. Controlled by `REGIME_FLIP_LIVE`. *(deployed 2026-03-03 ~21:30 UTC)*
+7. **Regime flip** (`REGIME_FLIP_THRESHOLD=0.35`): When regime strength >= 0.35 (trending), flip both paper and live trades to bet WITH the trend. Tagged `trade_tag='regime_flip'`. 1-window confirmation (`REGIME_FLIP_CONFIRM_WINDOWS=1`). Was briefly 3-window (2026-03-04 ~15:20 to 2026-03-05 ~03:00) but reverted — 3-window let 10 against-trend trades through for -$24 overnight. Controlled by `REGIME_FLIP_LIVE`. *(deployed 2026-03-03 ~21:30 UTC)*
 8. **One trade per window**: No duplicate bets on same market slug
 9. **Pause**: `/pause` stops new trades while data collection continues
 10. **Flat close = DOWN**: Polymarket resolves ties as DOWN. Uses strict `>` (not `>=`)
@@ -269,6 +270,16 @@ Reverse-chronological log of deployed changes. Check timestamps to know what dat
 
 | Date (UTC) | Change | Design Doc |
 |------------|--------|------------|
+| 2026-03-08 ~18:50 | **FOK orders**: Switched buy + EE sell from GTC to FOK. Eliminates maker fill drag (358 all-time, -$12 and worsening at -$40/wk). FOK = fill entire order immediately or cancel, no resting orders on book. Auto-sell stays GTC. FOK rejections logged to skipped_windows. Maker fill sync kept as canary. Rounding patch updated: maker (USDC) at 2 dec, taker (tokens) at 4 dec (FOK requires opposite of GTC). | `docs/plans/2026-03-08-fok-orders-design.md` |
+| 2026-03-05 ~07:20 | **Overnight audit fixes**: (1) Regime flip confirmation reverted from 3 windows back to 1 — 3-window let 10 against-trend trades through for -$24 overnight while BTC trended down. (2) Hour 02 UTC re-blacklisted. Overnight bled -$47 (98 trades, 23% WR). Maker fills contributed -$23 (no EE protection, bet both sides). UP trades: 14% WR, -$53. EE saved +$85. | — |
+| 2026-03-05 ~04:00 | **EE depth check fix**: `available_depth` now uses `best_bid_size` (tokens at best bid) instead of `total_deep_size` (tokens at bids >= $0.85). Old check blocked all cheap-entry exits — when threshold is $0.45 and bid hits $0.54, there's obviously no depth at $0.85. Low/mid tier exits were only triggering by luck when bid happened to reach 0.85+ | — |
+| 2026-03-04 ~17:44 | **Data collection gaps fixed**: (1) `fill_price` now extracted from `takerOrder.price` (was looking at nonexistent `avg_price`), (2) `skipped_windows` enriched with `model_side`, `model_confidence`, `entry_price`, and 11 Binance features, (3) Maker fills now include `fill_price` and `btc_price_at_open` | — |
+| 2026-03-04 ~16:02 | **Dampening removed**: `CONFIDENCE_DAMPEN` 0.6 -> 1.0. Was killing ~57% of windows as "low confidence" but analysis shows EE makes even coin-flip trades profitable (+$1.55/trade). 127 skipped windows would have made +$235. Now trades every window with raw confidence >= 1.5% | — |
+| 2026-03-04 ~15:20 | **Regime flip confirmation window**: Require 3 consecutive trending windows (15 min) before triggering a flip. Fixes flickering — detector was briefly spiking past 0.35 threshold during ranging markets then dropping back, causing false flip trades. New config: `REGIME_FLIP_CONFIRM_WINDOWS=3`. `/regime` command shows trend count. | — |
+| 2026-03-04 ~10:12 | **Max bet raised**: $5 → $10. Bankroll grew to ~$123 (deposits + P&L). At $128, $10 = 7.8% of bankroll — more conservative than $5 was at $53 (9.4%). All guardrails stay (adaptive sizing, streak guard, early exit, regime flip) | — |
+| 2026-03-04 ~07:45 | **Exploration threshold raised**: 0.35 → 0.40. Entries <$0.40 now paper-only. Bad R:R in that tier (EE profit ~$1 vs $5 risk, overnight data: -$6.34 net on 7 trades) | — |
+| 2026-03-03 ~22:30 | **Audit bug fixes (Tier 1)**: (1) Early exit monitor now checks bids every 1s (was throttled to 10s by misplaced rate limiter), (2) ML confidence dampening now applied (was no-op for ML path), (3) Regime flip runs before streak guard + trend filter (were checking wrong side). Also fixes trend filter blocking regime-flip opportunities. | `docs/audit-2026-03-03.md` |
+| 2026-03-03 ~22:00 | **Entry-time feature persistence**: 15 new columns on live_trades — 11 Binance features at entry (OBI, taker ratio, momentum, RSI, VWAP dev, BB position, EMA cross, funding z-score, volume z-score, ATR) + 4 Polymarket orderbook state (up/down spread, token bid/ask sizes). Enables future exit-probability ML model training | — |
 | 2026-03-03 ~21:00 | **Comprehensive data collection**: 9 new columns on live_trades (max_bid, exit_threshold, btc_at_open, settlement_price, fill_price, 5 regime sub-components, model_confidence), 4 new on market_snapshots (bid/ask sizes), new `skipped_windows` table. Enables ML exit prediction, slippage analysis, skip opportunity analysis | — |
 | 2026-03-03 ~20:30 | **4-tier early exit**: Split 3-tier into 4-tier thresholds based on 548-trade bid spike analysis. <0.35: 0.60->0.50, 0.35-0.40: 0.65->0.45, 0.40-0.50: 0.65 (unchanged), >=0.50: 0.95 (unchanged). Catches 87% of cheap losses vs 20% before | — |
 | 2026-03-03 ~21:30 | **Trend protection**: Chainlink price buffer for boundary-accurate settlement, live regime flip (strength >= 0.35), loss streak guard (3x LOSS pauses side for 2 windows) | `docs/plans/2026-03-03-trend-protection-design.md` |

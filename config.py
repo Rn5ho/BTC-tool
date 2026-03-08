@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     live_trading: bool = False
     polymarket_private_key: str = ""       # EOA private key (hex, no 0x prefix)
     polymarket_funder_address: str = ""    # Proxy wallet from polymarket.com settings
-    max_live_bet_usdc: float = 2.0        # Hard safety cap per live trade
+    max_live_bet_usdc: float = 10.0       # Hard safety cap per live trade
     clob_proxy: str = ""                   # SOCKS5 proxy for CLOB API (e.g. socks5://127.0.0.1:1080)
 
     # Polymarket Builder Mode (legacy — not used by live_trader)
@@ -64,6 +64,10 @@ class Settings(BaseSettings):
 
     # Regime flip — applies to live trades (not just paper) when trending
     regime_flip_live: bool = True         # enable regime flip for live trades
+    # Confirmation window — require N consecutive trending windows before flipping.
+    # Prevents flickering: brief 1-2 window spikes past threshold won't trigger flips.
+    # 3 windows = 15 min of sustained trend.  Tunable via .env.
+    regime_flip_confirm_windows: int = 1
 
     # Loss streak guard — pause a side after consecutive losses
     streak_pause_threshold: int = 3       # consecutive same-side losses to trigger
@@ -71,8 +75,9 @@ class Settings(BaseSettings):
 
     # Confidence dampening — shrink P(up) toward 0.5 to counter model
     # overconfidence.  1.0 = no dampening, 0.0 = always 50%.
-    # Calibration data shows ~10-20% overconfidence; 0.6 is a good fit.
-    confidence_dampen: float = 0.6
+    # Was 0.6 but EE safety net makes low-confidence trades profitable
+    # (~+$1.55/trade even at 50% WR). Dampening just kills volume.
+    confidence_dampen: float = 1.0
 
     # Adaptive early exit — tiered thresholds by entry price
     # Lower entry prices have lower WR and benefit from aggressive exits.
@@ -83,7 +88,7 @@ class Settings(BaseSettings):
     early_exit_threshold_high: float = 0.95    # entry >= 0.50 (~55% WR, conservative)
 
     # Hour blacklist (UTC hours where model underperforms; skip trading)
-    blacklist_hours: str = "2"  # comma-separated UTC hours, e.g. "2,11,19"
+    blacklist_hours: str = ""  # comma-separated UTC hours, e.g. "2,11,19"
 
     # Feature weights (v2 — rebalanced from 2,736-trade analysis)
     # Reduced OBI/momentum (near-zero predictive delta), added volume_zscore

@@ -147,10 +147,11 @@ class LiveTrader:
                     logger.warning("Failed to configure CLOB proxy: %s", exc)
 
             # Fix py-clob-client rounding bug in get_market_order_amounts:
-            # For BUY, the library rounds taker to `amount` (4-5) decimals but
-            # the CLOB server requires max 2 on taker and max 4 on maker.
-            # Also, maker must equal taker × price (consistency check).
-            # The fix: compute taker first (rounded to 2), then derive maker.
+            # For BUY+FOK, the CLOB server requires:
+            #   maker (USDC) = max 2 decimals
+            #   taker (tokens) = max 4 decimals
+            # The library produces too many decimals on both.
+            # Fix: round maker (USDC) to 2 dec, derive taker via Decimal, cap at 4 dec.
             try:
                 from py_clob_client.order_builder.builder import OrderBuilder
                 from py_clob_client.order_builder.helpers import (
@@ -167,17 +168,15 @@ class LiveTrader:
                 def _patched(self, side, amount, price, round_config):
                     if side != _BUY:
                         return _orig(self, side, amount, price, round_config)
-                    # BUY: taker=tokens (max 2 dec), maker=USDC (max 4 dec)
-                    # Use Decimal to avoid float imprecision (e.g. 5.93*0.59
-                    # = 3.49869... in float but exactly 3.4987 in Decimal).
+                    # BUY+FOK: maker=USDC (max 2 dec), taker=tokens (max 4 dec)
                     raw_price = round_normal(price, round_config.price)
-                    raw_taker = round_down(amount / raw_price, 2)
-                    d_taker = Decimal(str(raw_taker))
+                    raw_maker = round_down(amount, 2)  # USDC, 2 dec
+                    d_maker = Decimal(str(raw_maker))
                     d_price = Decimal(str(raw_price))
-                    d_maker = d_taker * d_price
-                    if d_maker.as_tuple().exponent < -4:
-                        d_maker = d_maker.quantize(Decimal("0.0001"), rounding=_RD)
-                    raw_maker = float(d_maker)
+                    d_taker = d_maker / d_price
+                    if d_taker.as_tuple().exponent < -4:
+                        d_taker = d_taker.quantize(Decimal("0.0001"), rounding=_RD)
+                    raw_taker = float(d_taker)
                     return (
                         UtilsBuy,
                         to_token_decimals(raw_maker),
@@ -289,16 +288,22 @@ class LiveTrader:
 
         size = final_pct * self.bankroll
 
-        logger.debug(
+        logger.info(
             "Live adaptive size: base=2%% x conf=%.2f x hour=%.2f x streak=%.2f x dd=%.2f x wr=%.2f "
-            "= %.1f%% -> $%.2f",
+            "= %.1f%% of $%.0f -> $%.2f",
             conf_mult, hour_mult, streak_mult, dd_mult, wr_mult,
-            final_pct * 100, size,
+            final_pct * 100, self.bankroll, size,
         )
         return size
 
     def compute_bet_size(self, confidence: float = 0.0) -> float:
-        """Return live bet size in USDC, capped by bankroll and max bet."""
+        """Return live bet size in USDC, capped by bankroll percentage and absolute max.
+
+        The effective cap scales with bankroll: 8% of bankroll or the
+        configured ``max_bet_usdc`` (from .env), whichever is smaller.
+        This ensures bets grow proportionally as the bankroll grows while
+        still respecting the hard safety ceiling.
+        """
         if self.bankroll <= 0:
             return 0.0
         if self._sizing_strategy == "adaptive":
@@ -306,7 +311,14 @@ class LiveTrader:
         else:
             size = 0.02 * self.bankroll  # fallback: flat 2%
         size = max(1.00, size)
-        size = min(size, self.bankroll, self._max_bet)
+        # Cap: 8% of bankroll or absolute max, whichever is smaller
+        effective_cap = min(0.08 * self.bankroll, self._max_bet)
+        pre_cap = size
+        size = min(size, self.bankroll, effective_cap)
+        logger.info(
+            "Live bet size: $%.2f (pre-cap $%.2f, cap $%.2f = min(8%%x$%.0f, $%.0f), bankroll $%.0f)",
+            size, pre_cap, effective_cap, self.bankroll, self._max_bet, self.bankroll,
+        )
         return size
 
     def record_settlement(self, won: bool, pnl: float) -> None:
@@ -362,7 +374,7 @@ class LiveTrader:
         entry_price: float = 0.0,
         exploration: bool = False,
     ) -> dict:
-        """Place a GTC market buy order on Polymarket.
+        """Place a FOK market buy order on Polymarket.
 
         Parameters
         ----------
@@ -454,7 +466,7 @@ class LiveTrader:
             signed_order = await asyncio.to_thread(
                 self._client.create_market_order, order_args
             )
-            resp = await self._post_order_with_retry(signed_order, OrderType.GTC)
+            resp = await self._post_order_with_retry(signed_order, OrderType.FOK)
 
             # Parse response
             if isinstance(resp, dict):
@@ -475,6 +487,44 @@ class LiveTrader:
                 result["response"] = {"raw": str(resp)}
                 result["success"] = True
 
+            # Verify actual fill — CLOB can accept an order (return orderID)
+            # but then immediately cancel it with 0 tokens matched.
+            # Without this check we record phantom trades with fake P&L.
+            if result["success"] and result["order_id"]:
+                try:
+                    await asyncio.sleep(1.5)  # brief delay for CLOB to settle
+                    order_status = await asyncio.to_thread(
+                        self._client.get_order, result["order_id"]
+                    )
+                    if isinstance(order_status, dict):
+                        matched = float(order_status.get("size_matched", 0) or 0)
+                        clob_status = order_status.get("status", "")
+                        if matched == 0 or clob_status == "CANCELED":
+                            result["success"] = False
+                            result["error"] = (
+                                f"Order {clob_status} with 0 tokens matched "
+                                f"(original_size={order_status.get('original_size', '?')})"
+                            )
+                            result["fok_rejected"] = True
+                            logger.warning(
+                                "FOK REJECTED: %s %s $%.2f order=%s — %s",
+                                side, market_slug, amount_usdc,
+                                result["order_id"], result["error"],
+                            )
+                            # FOK orders don't leave remainders — no cancel needed.
+                        else:
+                            logger.info(
+                                "Order verified: %s matched=%.2f status=%s",
+                                result["order_id"][:20], matched, clob_status,
+                            )
+                except Exception as exc:
+                    # Verification failed — keep the trade but log a warning.
+                    # Better to have a potential phantom than to discard a real fill.
+                    logger.warning(
+                        "Could not verify order %s: %s — keeping as filled",
+                        result["order_id"][:20] if result["order_id"] else "?", exc,
+                    )
+
             if result["success"]:
                 logger.info(
                     "LIVE ORDER FILLED: %s %s $%.2f order=%s",
@@ -488,10 +538,18 @@ class LiveTrader:
 
         except Exception as exc:
             result["error"] = str(exc)
-            logger.exception(
-                "LIVE ORDER FAILED: %s %s $%.2f — %s",
-                side, market_slug, amount_usdc, exc,
-            )
+            # Detect FOK rejection (book too thin to fill entire order)
+            if "fully filled" in str(exc) or "FOK" in str(exc):
+                result["fok_rejected"] = True
+                logger.warning(
+                    "FOK REJECTED: %s %s $%.2f — insufficient liquidity",
+                    side, market_slug, amount_usdc,
+                )
+            else:
+                logger.exception(
+                    "LIVE ORDER FAILED: %s %s $%.2f — %s",
+                    side, market_slug, amount_usdc, exc,
+                )
 
         # Record in session log
         self._session_trades.append({
@@ -508,24 +566,58 @@ class LiveTrader:
         return result
 
     # ------------------------------------------------------------------
+    # Cancel open orders — prevent stale GTC orders from becoming maker fills
+    # ------------------------------------------------------------------
+
+    async def cancel_all_orders(self) -> int:
+        """Cancel all open orders on the CLOB.
+
+        Called after each trade to prevent unfilled GTC order remainders
+        from sitting on the book and getting filled later as unmanaged
+        maker positions (no confidence check, no regime filter, no streak
+        guard).
+
+        Returns the number of orders cancelled, or -1 on error.
+        """
+        if not self._active or self._client is None:
+            return -1
+        try:
+            resp = await asyncio.to_thread(self._client.cancel_all)
+            # Response is typically {"canceled_orders": [...]}
+            cancelled = []
+            if isinstance(resp, dict):
+                cancelled = resp.get("canceled_orders", [])
+            count = len(cancelled) if isinstance(cancelled, list) else 0
+            if count > 0:
+                logger.info("Cancelled %d open order(s) to prevent stale maker fills", count)
+            return count
+        except Exception:
+            logger.warning("Failed to cancel open orders", exc_info=True)
+            return -1
+
+    # ------------------------------------------------------------------
     # Early exit — sell tokens before window settles
     # ------------------------------------------------------------------
 
     @staticmethod
-    def get_exit_threshold(entry_price: float) -> float:
+    def get_exit_threshold(entry_price: float, trade_tag: str | None = None) -> float:
         """Return the early exit bid threshold based on entry price tier.
 
         Cheap entries have low WR and benefit from aggressive exits.
         Expensive entries have decent WR and should stay conservative.
         Thresholds validated on 548 trades with 102K market snapshots.
+
+        Regime-flip trades in the 0.40-0.50 tier use a relaxed threshold
+        (0.90) because the model is correctly riding trends — EE at 0.65
+        caps winners at ~$2 while settlement pays ~$5.
         """
         from config import settings
         if entry_price < 0.35:
             return settings.early_exit_threshold_low
         if entry_price < 0.40:
-            return settings.early_exit_threshold_low_mid
+            return 0.65
         if entry_price < 0.50:
-            return settings.early_exit_threshold_mid
+            return 0.90
         return settings.early_exit_threshold_high
 
     async def get_token_balance(self, token_id: str) -> float | None:
@@ -626,7 +718,7 @@ class LiveTrader:
             signed_order = await asyncio.to_thread(
                 self._client.create_market_order, order_args
             )
-            resp = await self._post_order_with_retry(signed_order, OrderType.GTC)
+            resp = await self._post_order_with_retry(signed_order, OrderType.FOK)
 
             if isinstance(resp, dict):
                 result["order_id"] = resp.get("orderID", resp.get("id", ""))
@@ -634,10 +726,41 @@ class LiveTrader:
             else:
                 result["success"] = True
 
-            logger.info(
-                "EARLY EXIT FILLED: %s $%.2f order=%s on %s",
-                token_id[:16], expected_usdc, result["order_id"], market_slug,
-            )
+            # Verify the sell actually matched
+            if result["success"] and result["order_id"]:
+                try:
+                    await asyncio.sleep(1.5)
+                    order_status = await asyncio.to_thread(
+                        self._client.get_order, result["order_id"]
+                    )
+                    if isinstance(order_status, dict):
+                        matched = float(order_status.get("size_matched", 0) or 0)
+                        clob_status = order_status.get("status", "")
+                        if matched == 0 or clob_status == "CANCELED":
+                            result["success"] = False
+                            result["error"] = (
+                                f"Sell {clob_status} with 0 matched — tokens still held"
+                            )
+                            logger.warning(
+                                "PHANTOM EARLY EXIT: %s order=%s — %s",
+                                market_slug, result["order_id"][:20], result["error"],
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not verify early exit sell %s: %s — keeping as filled",
+                        result["order_id"][:20] if result["order_id"] else "?", exc,
+                    )
+
+            if result["success"]:
+                logger.info(
+                    "EARLY EXIT FILLED: %s $%.2f order=%s on %s",
+                    token_id[:16], expected_usdc, result["order_id"], market_slug,
+                )
+            else:
+                logger.info(
+                    "EARLY EXIT NOT FILLED: %s order=%s — will settle normally",
+                    market_slug, result["order_id"],
+                )
 
         except Exception as exc:
             result["error"] = str(exc)

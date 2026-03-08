@@ -27,7 +27,9 @@ class Database:
         try:
             self._db = await aiosqlite.connect(self.db_path)
             self._db.row_factory = aiosqlite.Row
-            logger.info("Connected to SQLite database at %s", self.db_path)
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA synchronous=NORMAL")
+            logger.info("Connected to SQLite database at %s (WAL mode)", self.db_path)
 
             await self._db.executescript(
                 """
@@ -112,6 +114,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_live_trades_ts ON live_trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_live_trades_slug ON live_trades(market_slug);
                 CREATE INDEX IF NOT EXISTS idx_live_trades_outcome ON live_trades(success, outcome);
+                CREATE INDEX IF NOT EXISTS idx_live_trades_success_ts ON live_trades(success, timestamp);
 
                 CREATE TABLE IF NOT EXISTS skipped_windows (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,6 +168,7 @@ class Database:
             ("live_trades", "regime_strength", "REAL"),
             # early exit data collection (2026-03-03)
             ("live_trades", "max_bid_during_window", "REAL"),
+            ("live_trades", "min_bid_during_window", "REAL"),
             ("live_trades", "exit_threshold_used", "REAL"),
             # order book depth sizes (2026-03-03)
             ("market_snapshots", "up_bid_size", "REAL"),
@@ -181,6 +185,38 @@ class Database:
             ("live_trades", "regime_price_vs_ema", "REAL"),
             ("live_trades", "regime_ema_cross", "REAL"),
             ("live_trades", "model_confidence", "REAL"),
+            # entry-time Binance features for exit-probability ML (2026-03-03)
+            ("live_trades", "entry_obi", "REAL"),
+            ("live_trades", "entry_taker_ratio", "REAL"),
+            ("live_trades", "entry_momentum_1m", "REAL"),
+            ("live_trades", "entry_momentum_5m", "REAL"),
+            ("live_trades", "entry_rsi", "REAL"),
+            ("live_trades", "entry_vwap_dev", "REAL"),
+            ("live_trades", "entry_bb_position", "REAL"),
+            ("live_trades", "entry_ema_cross", "REAL"),
+            ("live_trades", "entry_funding_zscore", "REAL"),
+            ("live_trades", "entry_volume_zscore", "REAL"),
+            ("live_trades", "entry_atr", "REAL"),
+            # entry-time Polymarket orderbook state
+            ("live_trades", "entry_up_spread", "REAL"),
+            ("live_trades", "entry_down_spread", "REAL"),
+            ("live_trades", "entry_token_bid_size", "REAL"),
+            ("live_trades", "entry_token_ask_size", "REAL"),
+            # early exit settlement backfill (2026-03-05)
+            ("live_trades", "would_have_won", "INTEGER"),
+            # skipped_windows enrichment (2026-03-04)
+            ("skipped_windows", "model_side", "TEXT"),
+            ("skipped_windows", "entry_obi", "REAL"),
+            ("skipped_windows", "entry_taker_ratio", "REAL"),
+            ("skipped_windows", "entry_momentum_1m", "REAL"),
+            ("skipped_windows", "entry_momentum_5m", "REAL"),
+            ("skipped_windows", "entry_rsi", "REAL"),
+            ("skipped_windows", "entry_vwap_dev", "REAL"),
+            ("skipped_windows", "entry_bb_position", "REAL"),
+            ("skipped_windows", "entry_ema_cross", "REAL"),
+            ("skipped_windows", "entry_funding_zscore", "REAL"),
+            ("skipped_windows", "entry_volume_zscore", "REAL"),
+            ("skipped_windows", "entry_atr", "REAL"),
         ]
         for table, column, col_type in alter_statements:
             try:
@@ -350,6 +386,18 @@ class Database:
         regime_strength: Optional[float] = None,
         model_confidence: Optional[float] = None,
         entry_price: Optional[float] = None,
+        model_side: Optional[str] = None,
+        entry_obi: Optional[float] = None,
+        entry_taker_ratio: Optional[float] = None,
+        entry_momentum_1m: Optional[float] = None,
+        entry_momentum_5m: Optional[float] = None,
+        entry_rsi: Optional[float] = None,
+        entry_vwap_dev: Optional[float] = None,
+        entry_bb_position: Optional[float] = None,
+        entry_ema_cross: Optional[float] = None,
+        entry_funding_zscore: Optional[float] = None,
+        entry_volume_zscore: Optional[float] = None,
+        entry_atr: Optional[float] = None,
     ) -> None:
         """Record a skipped trading window with reason."""
         try:
@@ -357,11 +405,23 @@ class Database:
                 """
                 INSERT INTO skipped_windows
                     (timestamp, market_slug, skip_reason, btc_price,
-                     regime_state, regime_strength, model_confidence, entry_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     regime_state, regime_strength, model_confidence, entry_price,
+                     model_side,
+                     entry_obi, entry_taker_ratio,
+                     entry_momentum_1m, entry_momentum_5m,
+                     entry_rsi, entry_vwap_dev, entry_bb_position,
+                     entry_ema_cross, entry_funding_zscore,
+                     entry_volume_zscore, entry_atr)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (timestamp, market_slug, skip_reason, btc_price,
-                 regime_state, regime_strength, model_confidence, entry_price),
+                 regime_state, regime_strength, model_confidence, entry_price,
+                 model_side,
+                 entry_obi, entry_taker_ratio,
+                 entry_momentum_1m, entry_momentum_5m,
+                 entry_rsi, entry_vwap_dev, entry_bb_position,
+                 entry_ema_cross, entry_funding_zscore,
+                 entry_volume_zscore, entry_atr),
             )
             await self._db.commit()
         except Exception:
@@ -390,6 +450,21 @@ class Database:
         regime_price_vs_ema: Optional[float] = None,
         regime_ema_cross: Optional[float] = None,
         model_confidence: Optional[float] = None,
+        entry_obi: Optional[float] = None,
+        entry_taker_ratio: Optional[float] = None,
+        entry_momentum_1m: Optional[float] = None,
+        entry_momentum_5m: Optional[float] = None,
+        entry_rsi: Optional[float] = None,
+        entry_vwap_dev: Optional[float] = None,
+        entry_bb_position: Optional[float] = None,
+        entry_ema_cross: Optional[float] = None,
+        entry_funding_zscore: Optional[float] = None,
+        entry_volume_zscore: Optional[float] = None,
+        entry_atr: Optional[float] = None,
+        entry_up_spread: Optional[float] = None,
+        entry_down_spread: Optional[float] = None,
+        entry_token_bid_size: Optional[float] = None,
+        entry_token_ask_size: Optional[float] = None,
     ) -> Optional[int]:
         """Insert a live trade record. Returns the row id on success."""
         try:
@@ -402,9 +477,18 @@ class Database:
                      btc_price_at_open, fill_price,
                      regime_direction_pct, regime_momentum_score,
                      regime_ema_slope, regime_price_vs_ema, regime_ema_cross,
-                     model_confidence)
+                     model_confidence,
+                     entry_obi, entry_taker_ratio,
+                     entry_momentum_1m, entry_momentum_5m,
+                     entry_rsi, entry_vwap_dev, entry_bb_position,
+                     entry_ema_cross, entry_funding_zscore,
+                     entry_volume_zscore, entry_atr,
+                     entry_up_spread, entry_down_spread,
+                     entry_token_bid_size, entry_token_ask_size)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -428,6 +512,21 @@ class Database:
                     regime_price_vs_ema,
                     regime_ema_cross,
                     model_confidence,
+                    entry_obi,
+                    entry_taker_ratio,
+                    entry_momentum_1m,
+                    entry_momentum_5m,
+                    entry_rsi,
+                    entry_vwap_dev,
+                    entry_bb_position,
+                    entry_ema_cross,
+                    entry_funding_zscore,
+                    entry_volume_zscore,
+                    entry_atr,
+                    entry_up_spread,
+                    entry_down_spread,
+                    entry_token_bid_size,
+                    entry_token_ask_size,
                 ),
             )
             await self._db.commit()
@@ -472,6 +571,7 @@ class Database:
         pnl: float,
         settled_at: int,
         max_bid_during_window: float | None = None,
+        min_bid_during_window: float | None = None,
         exit_threshold_used: float | None = None,
         settlement_price: float | None = None,
     ) -> None:
@@ -481,12 +581,14 @@ class Database:
                 """
                 UPDATE live_trades
                 SET outcome = ?, pnl = ?, settled_at = ?,
-                    max_bid_during_window = ?, exit_threshold_used = ?,
+                    max_bid_during_window = ?, min_bid_during_window = ?,
+                    exit_threshold_used = ?,
                     settlement_price = ?
                 WHERE id = ?
                 """,
                 (outcome, pnl, settled_at,
-                 max_bid_during_window, exit_threshold_used,
+                 max_bid_during_window, min_bid_during_window,
+                 exit_threshold_used,
                  settlement_price, trade_id),
             )
             await self._db.commit()
@@ -496,6 +598,88 @@ class Database:
             )
         except Exception:
             logger.exception("Failed to update live trade %d", trade_id)
+
+    async def backfill_early_exit_settlement(
+        self,
+        market_slug: str,
+        settlement_price: float | None,
+        btc_went_up: bool,
+    ) -> int:
+        """Backfill settlement data on EARLY_EXIT trades for a given slug.
+
+        Called after a window settles so we know what *would* have happened.
+        Returns the number of rows updated.
+        """
+        try:
+            cursor = await self._db.execute(
+                """
+                SELECT id, side FROM live_trades
+                WHERE market_slug = ? AND outcome = 'EARLY_EXIT'
+                  AND would_have_won IS NULL
+                """,
+                (market_slug,),
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return 0
+
+            updated = 0
+            for row in rows:
+                won = (row["side"] == "UP" and btc_went_up) or \
+                      (row["side"] == "DOWN" and not btc_went_up)
+                await self._db.execute(
+                    """
+                    UPDATE live_trades
+                    SET settlement_price = ?, would_have_won = ?
+                    WHERE id = ?
+                    """,
+                    (settlement_price, 1 if won else 0, row["id"]),
+                )
+                updated += 1
+
+            await self._db.commit()
+            if updated:
+                logger.info(
+                    "Backfilled %d EARLY_EXIT trades for %s (would_have_won based on %s)",
+                    updated, market_slug, "UP" if btc_went_up else "DOWN",
+                )
+            return updated
+        except Exception:
+            logger.exception("Failed to backfill early exit settlement for %s", market_slug)
+            return 0
+
+    async def get_early_exit_tier_stats(self, since_ms: int | None = None) -> list[dict]:
+        """Return per-tier early exit stats for the /ee command.
+
+        Each row: entry_price, exit_threshold_used, would_have_won, pnl, amount_usdc.
+        Optionally filtered to trades after *since_ms* (epoch millis).
+        """
+        try:
+            if since_ms is not None:
+                cursor = await self._db.execute(
+                    """
+                    SELECT entry_price, exit_threshold_used, would_have_won, pnl, amount_usdc
+                    FROM live_trades
+                    WHERE outcome = 'EARLY_EXIT' AND would_have_won IS NOT NULL
+                      AND timestamp >= ?
+                    ORDER BY timestamp
+                    """,
+                    (since_ms,),
+                )
+            else:
+                cursor = await self._db.execute(
+                    """
+                    SELECT entry_price, exit_threshold_used, would_have_won, pnl, amount_usdc
+                    FROM live_trades
+                    WHERE outcome = 'EARLY_EXIT' AND would_have_won IS NOT NULL
+                    ORDER BY timestamp
+                    """
+                )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch early exit tier stats")
+            return []
 
     async def get_unsettled_live_trades(self) -> list[dict]:
         """Return all successful live trades that have not yet been settled."""
@@ -578,7 +762,7 @@ class Database:
         """Return cumulative live P&L from DB (for bankroll restoration)."""
         try:
             cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(pnl), 0.0) FROM live_trades WHERE pnl IS NOT NULL"
+                "SELECT COALESCE(SUM(pnl), 0.0) FROM live_trades WHERE success = 1 AND pnl IS NOT NULL"
             )
             row = await cursor.fetchone()
             return row[0]
