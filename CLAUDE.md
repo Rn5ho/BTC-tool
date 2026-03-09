@@ -69,10 +69,13 @@ deploy/         → Hetzner VPS deployment
   btc-edge.service → systemd service file (runs as btcedge user, auto-restart)
   setup.sh      → Automated server setup script (Ubuntu/Debian)
 
+scripts/
+  analysis/   → 27 one-off analysis scripts (bid spikes, exits, regimes, P&L gaps, etc.)
+  simulation/ → 8 Monte Carlo / historical replay scripts
+
 ml_pipeline.py       → ML training pipeline (downloads Binance history, builds dataset, trains models)
-simulate_compounding.py → Monte Carlo simulation for bet sizing strategies
-analyze_clob.py      → CLOB API analysis utility (real trade data, P&L from wallet)
-backfill_outcomes.py → One-off script to correct historical trade outcomes using Gamma API resolutions
+backfill_outcomes.py → Correct historical trade outcomes using Gamma API resolutions
+backfill_gamma_resolution.py → Backfill gamma_resolution + gamma_winner_matches for EE ground truth
 config.py            → Pydantic Settings loaded from .env
 main.py              → Async orchestrator wiring all components, Telegram command handlers, console output, maker fill sync, Gamma settlement
 
@@ -176,6 +179,7 @@ The bot (`@BTC5mBot`) supports interactive commands:
 | `/regime` | Show market regime (EMA cross + BB position analysis) |
 | `/analyze` | Run live trade analysis: breakdown by side, hour, taker/maker/early-exit, and entry price buckets |
 | `/spread` | Show live order book spreads (bid/ask/spread/sizes) for current market |
+| `/ee` | Early exit tier stats (thresholds, trigger rates, P&L by entry price bucket) |
 
 Periodic stats (every 60 min) include live trading info. Trade placement sends one combined alert (side, entry price, confidence, edge, order ID) — only for live trades, not paper/exploration. Live trade WIN/LOSS/EARLY_EXIT settlement alerts sent via Telegram. Skip notifications sent when a window is skipped (with reason). Paper trade notifications excluded from Telegram.
 
@@ -227,8 +231,8 @@ CONFIDENCE_DAMPEN=1.0          # 1.0 = no dampening (current), 0.6 = original. D
 
 # Adaptive early exit — 4-tier thresholds by entry price
 EARLY_EXIT_THRESHOLD_LOW=0.50      # entry < 0.35: lottery tickets, exit on any spike
-EARLY_EXIT_THRESHOLD_LOW_MID=0.45  # entry 0.35-0.40: brief spikes, grab profit fast
-EARLY_EXIT_THRESHOLD_MID=0.65      # entry 0.40-0.50: decent exit rate
+EARLY_EXIT_THRESHOLD_LOW_MID=0.65  # entry 0.35-0.40: raised from 0.45 on 2026-03-05
+EARLY_EXIT_THRESHOLD_MID=0.90      # entry 0.40-0.50: raised from 0.65 on 2026-03-05
 EARLY_EXIT_THRESHOLD_HIGH=0.95     # entry >= 0.50 (~55% WR, conservative)
 
 # Hour blacklist (UTC hours to skip trading)
@@ -259,8 +263,8 @@ Dedicated 1-second monitoring loop (`_early_exit_loop()` → `_monitor_early_exi
 | Entry Price | Exit Threshold | Losses Caught | Rationale |
 |-------------|---------------|--------------|-----------|
 | < 0.35 | 0.50 | 87% (13/15) | Lottery tickets — spike briefly, grab any profit |
-| 0.35 - 0.40 | 0.45 | 88% (22/25) | Brief spikes rarely reach 0.65, exit fast |
-| 0.40 - 0.50 | 0.65 | 55% (37/67) | Decent exit rate at current threshold |
+| 0.35 - 0.40 | 0.65 | 88% (22/25) | Raised from 0.45 (2026-03-05) — old threshold gave ~$0.50 margin |
+| 0.40 - 0.50 | 0.90 | ~70% | Raised from 0.65 (2026-03-05) — 76% would-win rate, stop clipping winners |
 | >= 0.50 | 0.95 | 12% (16/131) | High WR, conservative — let winners run |
 
 - **First touch**: Sell immediately when `bid >= threshold` (no hold-confirmation — bid spikes on losers last only 5-8 seconds)
@@ -321,6 +325,7 @@ Reverse-chronological log of deployed changes. Check timestamps to know what dat
 
 | Date (UTC) | Change | Design Doc |
 |------------|--------|------------|
+| 2026-03-09 | **Cleanup & EE northern star**: (1) Fixed shadow tracking bug — `fv.funding_zscore` → `fv.funding_rate` (was crashing every window since 2026-03-08, 0 rows collected). (2) Wired EE thresholds to config (mid tiers were hardcoded, config defaults stale). (3) Moved 35 analysis/simulation scripts to `scripts/`. (4) Updated .env.example with all 30+ settings. (5) Fixed stale CLAUDE.md (EE table, commands, architecture). | `docs/plans/2026-03-09-cleanup-and-ee-northern-star.md` |
 | 2026-03-08 ~18:50 | **FOK orders**: Switched buy + EE sell from GTC to FOK. Eliminates maker fill drag (358 all-time, -$12 and worsening at -$40/wk). FOK = fill entire order immediately or cancel, no resting orders on book. Auto-sell stays GTC. FOK rejections logged to skipped_windows. Maker fill sync kept as canary. Rounding patch updated: maker (USDC) at 2 dec, taker (tokens) at 4 dec (FOK requires opposite of GTC). | `docs/plans/2026-03-08-fok-orders-design.md` |
 | 2026-03-05 ~07:20 | **Overnight audit fixes**: (1) Regime flip confirmation reverted from 3 windows back to 1 — 3-window let 10 against-trend trades through for -$24 overnight while BTC trended down. (2) Hour 02 UTC re-blacklisted. Overnight bled -$47 (98 trades, 23% WR). Maker fills contributed -$23 (no EE protection, bet both sides). UP trades: 14% WR, -$53. EE saved +$85. | — |
 | 2026-03-05 ~04:00 | **EE depth check fix**: `available_depth` now uses `best_bid_size` (tokens at best bid) instead of `total_deep_size` (tokens at bids >= $0.85). Old check blocked all cheap-entry exits — when threshold is $0.45 and bid hits $0.54, there's obviously no depth at $0.85. Low/mid tier exits were only triggering by luck when bid happened to reach 0.85+ | — |

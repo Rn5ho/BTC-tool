@@ -615,9 +615,9 @@ class LiveTrader:
         if entry_price < 0.35:
             return settings.early_exit_threshold_low
         if entry_price < 0.40:
-            return 0.65
+            return settings.early_exit_threshold_low_mid
         if entry_price < 0.50:
-            return 0.90
+            return settings.early_exit_threshold_mid
         return settings.early_exit_threshold_high
 
     async def get_token_balance(self, token_id: str) -> float | None:

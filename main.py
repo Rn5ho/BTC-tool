@@ -1160,7 +1160,7 @@ class Orchestrator:
             entry_vwap_dev=fv.vwap_deviation if fv else None,
             entry_bb_position=fv.bb_position if fv else None,
             entry_ema_cross=fv.ema_cross if fv else None,
-            entry_funding_zscore=fv.funding_zscore if fv else None,
+            entry_funding_zscore=fv.funding_rate if fv else None,
             entry_volume_zscore=fv.volume_zscore if fv else None,
             entry_atr=fv.atr if fv else None,
         )
