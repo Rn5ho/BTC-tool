@@ -1581,7 +1581,16 @@ class Orchestrator:
         # Skip exploration trades (entry price 0.25-0.35) for live — paper-only data collection
         live_signal = signal  # default: model's signal
         if flip_signal and settings.regime_flip_live:
-            live_signal = flip_signal
+            # Cap flip entries at 0.50 — expensive flips (>=0.50) lose -$0.85/trade
+            # on 64 trades.  Cheap flip entries (<0.45) make +$0.94/trade.
+            flip_entry = flip_signal.get("entry_price", 1.0)
+            if flip_entry < 0.50:
+                live_signal = flip_signal
+            else:
+                logger.info(
+                    "FLIP ENTRY CAP: skipping live flip (entry=%.3f >= 0.50)",
+                    flip_entry,
+                )
 
         if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused and not live_signal.get("exploration"):
             # Determine token ID from market
