@@ -4,6 +4,23 @@
 
 BTC Polymarket 5-Minute Edge Finder — monitors Binance BTC price data, uses a trained ML model (RandomForestClassifier, 53.9% accuracy) to predict 5-minute BTC direction, and trades on Polymarket's binary UP/DOWN markets. Deployed on Hetzner VPS in Helsinki (65.21.178.90) running 24/7. Live trading enabled via py-clob-client with adaptive tiered early exit selling.
 
+## Win Rate Metrics — How to Read Performance
+
+Early Exit (EE) is an intentional profit-locking mechanism, not a rescue system. It secures wins that might flip in the last seconds before settlement. Most EE trades are **regrets** (would have won at settlement anyway) — that's by design. Three metrics matter:
+
+| Metric | Formula | What it measures | All-time |
+|--------|---------|-----------------|----------|
+| **True Model WR** | `(W + EE_regrets) / (W + L + EE)` | Model's directional accuracy — did we call the right side? Uses Gamma resolution ground truth to check if EE trades would have won. | ~47% |
+| **Settlement WR** | `W / (W + L)` | Trades that went to settlement only. **Misleading low** — excludes EE trades which are mostly correct calls exited early. Do NOT use this to judge model quality. | ~38% |
+| **Effective WR** | `(W + EE) / (W + L + EE)` | Treats all EE as wins. **Misleading high** — a small fraction of EE were saves (would have lost). Best proxy when Gamma data is unavailable. | ~59% |
+
+**Key insight**: The system profits by harvesting bid spikes on correct predictions (EE) rather than waiting for settlement. EE trades earn ~$4 avg vs ~$9 for full settlement wins, but avoid the ~$5 loss risk. This is a deliberate R:R tradeoff, not a deficiency.
+
+**Gamma resolution** (`gamma_winner_matches` column) is the ground truth for EE classification:
+- `gamma_winner_matches = 1` → REGRET (model was right, exited early for less profit)
+- `gamma_winner_matches = 0` → SAVE (model was wrong, EE avoided a loss)
+- Run `backfill_gamma_resolution.py --apply` to backfill recent trades
+
 ## Tech Stack
 
 - Python 3.11+, asyncio throughout
@@ -235,7 +252,7 @@ Applied in `strategy/edge.py` and `main.py` before every trade:
 
 ## Adaptive Early Exit
 
-Dedicated 1-second monitoring loop (`_early_exit_loop()` → `_monitor_early_exit()`) sells live positions when the bid price reaches a threshold, locking in profit before settlement risk.
+Dedicated 1-second monitoring loop (`_early_exit_loop()` → `_monitor_early_exit()`) sells live positions when the bid price reaches a threshold, locking in profit before settlement. This is a deliberate profit-locking strategy — ~86% of EE trades are regrets (model called correct side), not rescues. See "Win Rate Metrics" section for correct interpretation.
 
 **4-tier thresholds by entry price** *(updated 2026-03-03 from 548-trade bid spike analysis)*:
 
@@ -252,7 +269,7 @@ Dedicated 1-second monitoring loop (`_early_exit_loop()` → `_monitor_early_exi
 - **Token balance query**: Before selling, `get_token_balance()` queries actual CLOB conditional token balance (avoids "not enough balance" errors from computed vs actual token count mismatch)
 - **Retry logic**: Up to 3 attempts with 5-second cooldown between each (replaces old permanent `exit_failed` flag that blocked all retries after one failure)
 - **DB outcome**: `"EARLY_EXIT"` — skipped by unsettled trade queries
-- **Asymmetric payoff**: Each rescue saves avg +$4.44, each regretted exit costs avg -$0.61 (7:1 ratio)
+- **Asymmetric payoff**: EE earns avg ~$4/trade. Regrets (86% of EE) forgo ~$5 extra settlement profit. Saves (14%) avoid ~$5 loss. Net positive tradeoff.
 - **`get_exit_threshold(entry_price)`** in `LiveTrader` returns the appropriate threshold
 - **Data collection**: Each settled trade stores `max_bid_during_window` and `exit_threshold_used` for future ML modeling of exit probability
 - **Data**: Validated on 548 trades with 102K market snapshots (bid spike analysis)

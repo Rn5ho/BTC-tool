@@ -723,6 +723,7 @@ class LiveTrader:
             if isinstance(resp, dict):
                 result["order_id"] = resp.get("orderID", resp.get("id", ""))
                 result["success"] = True
+                result["response"] = resp
             else:
                 result["success"] = True
 

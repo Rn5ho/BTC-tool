@@ -165,6 +165,19 @@ class Orchestrator:
         self._side_outcomes: dict[str, list[str]] = {"UP": [], "DOWN": []}  # last N outcomes per side
         self._side_paused: dict[str, float] = {}  # side -> pause expiry timestamp
 
+        # Shadow tracking — monitor order books on every window (traded or not)
+        # to collect bid spike data for exit probability model training.
+        self._shadow_slug: str | None = None
+        self._shadow_up_max_bid: float = 0.0
+        self._shadow_down_max_bid: float = 0.0
+        self._shadow_up_min_bid: float = 1.0
+        self._shadow_down_min_bid: float = 1.0
+        self._shadow_up_open_ask: float | None = None
+        self._shadow_down_open_ask: float | None = None
+        self._shadow_btc_start: float | None = None
+        self._shadow_poll_count: int = 0
+        self._shadow_features: object | None = None  # FeatureVector snapshot
+
         # Hour blacklist — UTC hours where the model underperforms.
         # Parsed once from config; empty set = no blacklist.
         self._blacklist_hours: set[int] = set()
@@ -350,6 +363,7 @@ class Orchestrator:
                 self.alerter.run_command_listener(), name="telegram_cmds"
             ),
             asyncio.create_task(self._proxy_watchdog(), name="proxy_watchdog"),
+            asyncio.create_task(self._shadow_book_loop(), name="shadow_book"),
         ]
 
         logger.info("All tasks launched — entering main loop")
@@ -1042,6 +1056,115 @@ class Orchestrator:
                 logger.exception("Error in early exit loop")
             await asyncio.sleep(1)
 
+    async def _shadow_book_loop(self) -> None:
+        """Background loop that polls order books every 10s on ALL windows.
+
+        Tracks max/min bids for both UP and DOWN tokens regardless of whether
+        we trade.  At window transition, saves one summary row to shadow_windows.
+        This data feeds the future exit probability model.
+        """
+        logger.info("Shadow book tracking started")
+        while self._running:
+            try:
+                market = self.polymarket._current_market
+                if market is None:
+                    await asyncio.sleep(10)
+                    continue
+
+                slug = market.slug
+                up_token = market.up_token_id
+                down_token = market.down_token_id
+
+                # --- Window transition: save previous, reset state ---
+                if slug != self._shadow_slug:
+                    if self._shadow_slug and self._shadow_poll_count > 0:
+                        await self._save_shadow_data()
+                    # Reset for new window
+                    self._shadow_slug = slug
+                    self._shadow_up_max_bid = 0.0
+                    self._shadow_down_max_bid = 0.0
+                    self._shadow_up_min_bid = 1.0
+                    self._shadow_down_min_bid = 1.0
+                    self._shadow_poll_count = 0
+                    self._shadow_btc_start = self.binance.get_latest_price()
+                    self._shadow_features = None
+                    # Capture open asks (entry prices at window start)
+                    self._shadow_up_open_ask = market.up_price
+                    self._shadow_down_open_ask = market.down_price
+                    # Snapshot Binance features once at window open
+                    candles = self.binance.get_candles(n=50)
+                    if len(candles) >= 5:
+                        self._shadow_features = self.features.compute_features(
+                            candles=candles,
+                            orderbook=self.binance.orderbook,
+                            trades=list(self.binance.recent_trades),
+                            funding=self.binance.funding,
+                        )
+
+                # --- Poll both order books ---
+                up_book = await self.polymarket.get_orderbook(up_token)
+                down_book = await self.polymarket.get_orderbook(down_token)
+
+                if up_book and up_book.get("bids"):
+                    best_bid = float(up_book["bids"][0]["price"])
+                    self._shadow_up_max_bid = max(self._shadow_up_max_bid, best_bid)
+                    self._shadow_up_min_bid = min(self._shadow_up_min_bid, best_bid)
+
+                if down_book and down_book.get("bids"):
+                    best_bid = float(down_book["bids"][0]["price"])
+                    self._shadow_down_max_bid = max(self._shadow_down_max_bid, best_bid)
+                    self._shadow_down_min_bid = min(self._shadow_down_min_bid, best_bid)
+
+                self._shadow_poll_count += 1
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error in shadow book loop")
+            await asyncio.sleep(10)
+
+    async def _save_shadow_data(self) -> None:
+        """Persist accumulated shadow tracking data for the completed window."""
+        btc_end = self.binance.get_latest_price()
+        regime = self._current_regime
+
+        # What did we trade this window (if anything)?
+        traded_side = None
+        traded_tag = None
+        if self._shadow_slug in self._live_trade_tokens:
+            info = self._live_trade_tokens[self._shadow_slug]
+            traded_side = info.get("side")
+            traded_tag = info.get("trade_tag")
+
+        fv = self._shadow_features
+        await self.db.save_shadow_window(
+            market_slug=self._shadow_slug,
+            up_open_ask=self._shadow_up_open_ask,
+            down_open_ask=self._shadow_down_open_ask,
+            up_max_bid=self._shadow_up_max_bid,
+            down_max_bid=self._shadow_down_max_bid,
+            up_min_bid=self._shadow_up_min_bid if self._shadow_up_min_bid < 1.0 else None,
+            down_min_bid=self._shadow_down_min_bid if self._shadow_down_min_bid < 1.0 else None,
+            btc_price_start=self._shadow_btc_start,
+            btc_price_end=btc_end,
+            regime_state=regime.regime if regime else None,
+            regime_strength=regime.strength if regime else None,
+            traded_side=traded_side,
+            traded_tag=traded_tag,
+            poll_count=self._shadow_poll_count,
+            entry_obi=fv.obi if fv else None,
+            entry_taker_ratio=fv.taker_ratio if fv else None,
+            entry_momentum_1m=fv.momentum_1m if fv else None,
+            entry_momentum_5m=fv.momentum_5m if fv else None,
+            entry_rsi=fv.rsi if fv else None,
+            entry_vwap_dev=fv.vwap_deviation if fv else None,
+            entry_bb_position=fv.bb_position if fv else None,
+            entry_ema_cross=fv.ema_cross if fv else None,
+            entry_funding_zscore=fv.funding_zscore if fv else None,
+            entry_volume_zscore=fv.volume_zscore if fv else None,
+            entry_atr=fv.atr if fv else None,
+        )
+
     async def _run_one_cycle(self) -> None:
         """Single iteration of the analysis pipeline."""
 
@@ -1504,15 +1627,21 @@ class Orchestrator:
                 _fill_price = None
                 _resp = live_result.get("response")
                 if _resp and isinstance(_resp, dict):
-                    # GTC response: fill price lives at takerOrder.price
-                    taker_order = _resp.get("takerOrder")
-                    if taker_order and isinstance(taker_order, dict):
-                        try:
-                            _fill_price = float(taker_order.get("price", 0))
-                            if _fill_price <= 0:
-                                _fill_price = None
-                        except (ValueError, TypeError):
-                            _fill_price = None
+                    try:
+                        # FOK response: takingAmount (tokens) / makingAmount (USDC)
+                        taking = float(_resp.get("takingAmount", 0))
+                        making = float(_resp.get("makingAmount", 0))
+                        if taking > 0 and making > 0:
+                            _fill_price = round(making / taking, 4)
+                        else:
+                            # GTC fallback: fill price at takerOrder.price
+                            taker_order = _resp.get("takerOrder")
+                            if taker_order and isinstance(taker_order, dict):
+                                _fill_price = float(taker_order.get("price", 0))
+                                if _fill_price <= 0:
+                                    _fill_price = None
+                    except (ValueError, TypeError):
+                        _fill_price = None
 
                 # Regime sub-components for data collection
                 _regime = self._current_regime
@@ -1563,13 +1692,29 @@ class Orchestrator:
 
                 # Track token for settlement + early exit
                 if live_result["success"]:
-                    from data.polymarket import compute_fee_factor
-                    fee_factor = compute_fee_factor(
-                        live_signal["entry_price"],
-                        settings.polymarket_fee_rate,
-                        settings.polymarket_fee_exponent,
-                    )
-                    tokens = (live_result["amount"] / live_signal["entry_price"]) * (1.0 - fee_factor)
+                    # Use actual token count from CLOB response (takingAmount)
+                    # instead of formula estimate.  The CLOB already deducts fees.
+                    resp_data = live_result.get("response") or {}
+                    taking_str = resp_data.get("takingAmount", "")
+                    if taking_str and str(taking_str).strip():
+                        tokens = float(taking_str)
+                        logger.info(
+                            "Actual tokens from CLOB: %.4f (entry=%.3f, USDC=%.2f)",
+                            tokens, live_signal["entry_price"], live_result["amount"],
+                        )
+                    else:
+                        # Fallback to formula if response missing
+                        from data.polymarket import compute_fee_factor
+                        fee_factor = compute_fee_factor(
+                            live_signal["entry_price"],
+                            settings.polymarket_fee_rate,
+                            settings.polymarket_fee_exponent,
+                        )
+                        tokens = (live_result["amount"] / live_signal["entry_price"]) * (1.0 - fee_factor)
+                        logger.warning(
+                            "No takingAmount in response — using formula estimate: %.4f tokens",
+                            tokens,
+                        )
                     self._live_trade_tokens[live_signal["market_slug"]] = {
                         "side": live_signal["side"],
                         "token_id": token_id,
@@ -1744,8 +1889,23 @@ class Orchestrator:
                     )
 
             if result["success"]:
-                sell_amount = result["sell_amount"]
                 buy_amount = live_pos["amount"]
+                # Use actual USDC received from CLOB (takingAmount) for
+                # accurate P&L.  Falls back to estimated sell_amount.
+                resp_data = result.get("response") or {}
+                taking_str = resp_data.get("takingAmount", "")
+                if taking_str and str(taking_str).strip():
+                    sell_amount = float(taking_str)
+                    logger.info(
+                        "EE actual USDC received: $%.2f (estimated: $%.2f)",
+                        sell_amount, result["sell_amount"],
+                    )
+                else:
+                    sell_amount = result["sell_amount"]
+                    logger.warning(
+                        "No takingAmount in EE sell response — using estimate $%.2f",
+                        sell_amount,
+                    )
                 pnl = sell_amount - buy_amount
 
                 await self.db.update_live_trade(
@@ -2025,8 +2185,13 @@ class Orchestrator:
             won = (side == "UP" and btc_went_up) or (side == "DOWN" and not btc_went_up)
             outcome = "WIN" if won else "LOSS"
 
-            # PnL calculation (same as paper trader)
-            if entry_price > 0:
+            # PnL calculation — use actual token count from buy response
+            # when available, otherwise fall back to fee-adjusted formula.
+            live_pos = self._live_trade_tokens.get(slug)
+            if live_pos and live_pos.get("tokens"):
+                shares = live_pos["tokens"]
+                pnl = (shares - amount) if won else -amount
+            elif entry_price > 0:
                 fee_factor = 0.0
                 if self.live_trader._fee_rate > 0:
                     from data.polymarket import compute_fee_factor
@@ -2155,7 +2320,22 @@ class Orchestrator:
             won = (side == "UP" and btc_went_up) or (side == "DOWN" and not btc_went_up)
             outcome = "WIN" if won else "LOSS"
 
-            if entry_price > 0:
+            # Try actual token count from buy response_json
+            actual_tokens = None
+            resp_json_str = row.get("response_json")
+            if resp_json_str:
+                try:
+                    resp_d = json.loads(resp_json_str)
+                    ts = resp_d.get("takingAmount", "")
+                    if ts and str(ts).strip():
+                        actual_tokens = float(ts)
+                except Exception:
+                    pass
+
+            if actual_tokens is not None:
+                shares = actual_tokens
+                pnl = (shares - amount) if won else -amount
+            elif entry_price > 0:
                 fee_factor = 0.0
                 if self.live_trader._fee_rate > 0:
                     from data.polymarket import compute_fee_factor

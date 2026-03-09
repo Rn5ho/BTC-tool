@@ -129,6 +129,37 @@ class Database:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_skipped_ts ON skipped_windows(timestamp);
+
+                CREATE TABLE IF NOT EXISTS shadow_windows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_slug TEXT NOT NULL UNIQUE,
+                    up_open_ask REAL,
+                    down_open_ask REAL,
+                    up_max_bid REAL,
+                    down_max_bid REAL,
+                    up_min_bid REAL,
+                    down_min_bid REAL,
+                    btc_price_start REAL,
+                    btc_price_end REAL,
+                    regime_state TEXT,
+                    regime_strength REAL,
+                    traded_side TEXT,
+                    traded_tag TEXT,
+                    poll_count INTEGER DEFAULT 0,
+                    entry_obi REAL,
+                    entry_taker_ratio REAL,
+                    entry_momentum_1m REAL,
+                    entry_momentum_5m REAL,
+                    entry_rsi REAL,
+                    entry_vwap_dev REAL,
+                    entry_bb_position REAL,
+                    entry_ema_cross REAL,
+                    entry_funding_zscore REAL,
+                    entry_volume_zscore REAL,
+                    entry_atr REAL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_shadow_slug ON shadow_windows(market_slug);
                 """
             )
             await self._db.commit()
@@ -426,6 +457,67 @@ class Database:
             await self._db.commit()
         except Exception:
             logger.exception("Failed to save skipped window")
+
+    async def save_shadow_window(
+        self,
+        market_slug: str,
+        up_open_ask: Optional[float] = None,
+        down_open_ask: Optional[float] = None,
+        up_max_bid: Optional[float] = None,
+        down_max_bid: Optional[float] = None,
+        up_min_bid: Optional[float] = None,
+        down_min_bid: Optional[float] = None,
+        btc_price_start: Optional[float] = None,
+        btc_price_end: Optional[float] = None,
+        regime_state: Optional[str] = None,
+        regime_strength: Optional[float] = None,
+        traded_side: Optional[str] = None,
+        traded_tag: Optional[str] = None,
+        poll_count: int = 0,
+        entry_obi: Optional[float] = None,
+        entry_taker_ratio: Optional[float] = None,
+        entry_momentum_1m: Optional[float] = None,
+        entry_momentum_5m: Optional[float] = None,
+        entry_rsi: Optional[float] = None,
+        entry_vwap_dev: Optional[float] = None,
+        entry_bb_position: Optional[float] = None,
+        entry_ema_cross: Optional[float] = None,
+        entry_funding_zscore: Optional[float] = None,
+        entry_volume_zscore: Optional[float] = None,
+        entry_atr: Optional[float] = None,
+    ) -> None:
+        """Save a shadow window observation (bid tracking for all windows)."""
+        try:
+            await self._db.execute(
+                """
+                INSERT OR REPLACE INTO shadow_windows
+                    (market_slug, up_open_ask, down_open_ask,
+                     up_max_bid, down_max_bid, up_min_bid, down_min_bid,
+                     btc_price_start, btc_price_end,
+                     regime_state, regime_strength,
+                     traded_side, traded_tag, poll_count,
+                     entry_obi, entry_taker_ratio,
+                     entry_momentum_1m, entry_momentum_5m,
+                     entry_rsi, entry_vwap_dev, entry_bb_position,
+                     entry_ema_cross, entry_funding_zscore,
+                     entry_volume_zscore, entry_atr)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (market_slug, up_open_ask, down_open_ask,
+                 up_max_bid, down_max_bid, up_min_bid, down_min_bid,
+                 btc_price_start, btc_price_end,
+                 regime_state, regime_strength,
+                 traded_side, traded_tag, poll_count,
+                 entry_obi, entry_taker_ratio,
+                 entry_momentum_1m, entry_momentum_5m,
+                 entry_rsi, entry_vwap_dev, entry_bb_position,
+                 entry_ema_cross, entry_funding_zscore,
+                 entry_volume_zscore, entry_atr),
+            )
+            await self._db.commit()
+            logger.info("Saved shadow window: %s (polls=%d)", market_slug, poll_count)
+        except Exception:
+            logger.exception("Failed to save shadow window %s", market_slug)
 
     async def save_live_trade(
         self,
