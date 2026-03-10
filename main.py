@@ -1862,10 +1862,17 @@ class Orchestrator:
         # total_deep_size (depth >= 0.85) which is meaningless when the
         # exit threshold is 0.45-0.65 and bids are nowhere near 0.85.
         available_depth = best_bid_size
-        # Retry logic: allow up to 3 attempts with 5s cooldown between each
+        # Retry logic: up to 3 rapid attempts with 5s cooldown, then
+        # reset every 30s so we keep trying as long as bid stays above threshold.
+        # Previously hard-capped at 3 total — missed a $0.99 bid for 90+ seconds.
         exit_attempts = live_pos.get("exit_attempts", 0) if live_pos else 0
         last_attempt = live_pos.get("last_exit_attempt", 0) if live_pos else 0
         cooldown_ok = (now - last_attempt) >= 5
+        # Reset attempt counter after 30s — gives CLOB API time to recover
+        if exit_attempts >= 3 and (now - last_attempt) >= 30:
+            exit_attempts = 0
+            if live_pos:
+                live_pos["exit_attempts"] = 0
         if (live_pos
                 and not live_pos.get("exited")
                 and exit_attempts < 3
@@ -1902,7 +1909,7 @@ class Orchestrator:
                 else:
                     logger.warning(
                         "[EARLY-EXIT] Sell failed for %s (attempt %d/3, balance=%.1f) "
-                        "— will retry after 5s cooldown",
+                        "— will retry after 5s cooldown (resets after 30s)",
                         slug[-15:], live_pos["exit_attempts"],
                         remaining if remaining is not None else -1,
                     )
