@@ -294,7 +294,8 @@ These three bugs will silently break live trading if the workarounds are removed
 - **Commit messages must say what changed and why** — e.g. `fix: EE depth check using best_bid_size instead of total_deep_size` not `update stuff`.
 - **CLAUDE.md changelog and code go in the same commit** — the changelog entry documents the deploy, so it must travel with the code. Never commit code now and update the changelog later.
 - **Tag every deploy**: After scp + restart + verify, run `git tag -a deploy-YYYY-MM-DD-HHMM -m "deployed: short description"`. This creates a permanent record of exactly what code is running on the VPS.
-- **Deploy workflow**: code change → update CLAUDE.md changelog → commit → scp to VPS → restart → verify logs → tag.
+- **Always push to GitHub**: Every commit must be pushed to `origin` before the session ends. The user accesses the repo remotely — unpushed commits are invisible and effectively lost. Push after every commit or batch of commits, never leave commits local-only.
+- **Deploy workflow**: code change → update CLAUDE.md changelog → commit → push to GitHub → scp to VPS → restart → verify logs → tag.
 - **No orphan deploys**: If you find untagged deploys (code on VPS that doesn't match any tag), create a retroactive tag at the best-guess commit.
 
 ## Conventions
