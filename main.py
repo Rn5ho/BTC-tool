@@ -247,7 +247,7 @@ class Orchestrator:
             "confidence": abs(self._current_regime.strength),
             "signals": original.get("signals", {}),
             "market_slug": original["market_slug"],
-            "exploration": entry_price < 0.40,
+            "exploration": entry_price < 0.50,
             "regime_state": original.get("regime_state"),
             "regime_strength": original.get("regime_strength"),
             "regime_flip": True,

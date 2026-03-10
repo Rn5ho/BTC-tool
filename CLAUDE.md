@@ -243,7 +243,7 @@ BLACKLIST_HOURS=2              # comma-separated, e.g. "2,3,4"
 
 Applied in `strategy/edge.py` and `main.py` before every trade:
 
-1. **Min confidence** (`MIN_CONFIDENCE=0.015`): Skip when |P(up) - 0.5| below threshold
+1. **Min confidence** (`MIN_CONFIDENCE=0.020`): Skip when |P(up) - 0.5| below threshold
 2. **Entry price filter**: Hard reject outside 0.25-0.65. Exploration range 0.25-0.50 is paper-only (normal trades below 0.50 lose money per deep analysis), tagged `trade_tag="exploration"`
 3. **Time gate** (`_MAX_ENTRY_SECONDS=60`): Only enter in first 60 seconds of 5-min window *(deployed 2026-03-02)*
 4. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
@@ -253,6 +253,7 @@ Applied in `strategy/edge.py` and `main.py` before every trade:
 8. **One trade per window**: No duplicate bets on same market slug
 9. **Pause**: `/pause` stops new trades while data collection continues
 10. **Flat close = DOWN**: Polymarket resolves ties as DOWN. Uses strict `>` (not `>=`)
+11. **Spread filter** (`> 0.03`): Skip live trade when bid-ask spread exceeds $0.03 (routes to paper-only). Wide spreads predict -$1.15/trade EE outcomes
 
 ## Adaptive Early Exit
 

@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     always_trade: bool = True
 
     # Minimum ML confidence (|P(up) - 0.5|) required to place a trade.
-    # Backtested sweet spot: 0.015 gives 56.9% WR on 53% of windows ($59/day).
+    # Raised from 0.015 to 0.020: 1.5-2% band averaged -$0.16/trade.
     min_confidence: float = 0.020
 
     # Sizing strategy: "fixed", "kelly", "adaptive"
