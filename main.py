@@ -247,7 +247,7 @@ class Orchestrator:
             "confidence": abs(self._current_regime.strength),
             "signals": original.get("signals", {}),
             "market_slug": original["market_slug"],
-            "exploration": entry_price < 0.50,
+            "exploration": entry_price < 0.40 or entry_price >= 0.55,
             "regime_state": original.get("regime_state"),
             "regime_strength": original.get("regime_strength"),
             "regime_flip": True,
@@ -1578,16 +1578,14 @@ class Orchestrator:
             await self.paper_trader.place_trade(paper_signal)
 
         # Live trade — place real order on Polymarket
-        # Skip exploration trades (entry price 0.25-0.50) for live — paper-only data collection
+        # Live range: 0.40-0.55 (EE sweet spot). Outside = paper-only exploration.
         live_signal = signal  # default: model's signal
         if flip_signal and settings.regime_flip_live:
-            # Cap flip entries at 0.55 — flips at 0.50-0.55 are profitable,
+            # Cap flip entries at 0.55 — flips at 0.40-0.55 are profitable,
             # but >=0.55 lose -$0.85/trade on 64 trades.
             flip_entry = flip_signal.get("entry_price", 1.0)
             if flip_entry < 0.55:
-                # Clear exploration flag — flips at 0.40-0.55 should go live
-                # (exploration=True is set in edge.py for entry <0.50, but flips
-                # at cheap entries are profitable and should not be paper-only)
+                # Ensure exploration flag is cleared for flips in live range
                 live_signal = {**flip_signal, "exploration": False}
             else:
                 logger.info(

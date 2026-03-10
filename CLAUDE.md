@@ -244,7 +244,7 @@ BLACKLIST_HOURS=2              # comma-separated, e.g. "2,3,4"
 Applied in `strategy/edge.py` and `main.py` before every trade:
 
 1. **Min confidence** (`MIN_CONFIDENCE=0.020`): Skip when |P(up) - 0.5| below threshold
-2. **Entry price filter**: Hard reject outside 0.25-0.65. Exploration range 0.25-0.50 is paper-only (normal trades below 0.50 lose money per deep analysis), tagged `trade_tag="exploration"`
+2. **Entry price filter**: Hard reject outside 0.25-0.65. Live range 0.40-0.55 (EE sweet spot). Exploration 0.25-0.40 and 0.55-0.65 are paper-only, tagged `trade_tag="exploration"`
 3. **Time gate** (`_MAX_ENTRY_SECONDS=60`): Only enter in first 60 seconds of 5-min window *(deployed 2026-03-02)*
 4. **Hour blacklist** (`BLACKLIST_HOURS`): Skip configured UTC hours (default: 02:00)
 5. **Loss streak guard** (`STREAK_PAUSE_THRESHOLD=3`): After 3 consecutive LOSS on the same side, pause that side for 2 windows (~10 min). Early exits break the chain. Only tracks taker trades. Sends Telegram alert on trigger. First trade after pause tagged `post_streak`. *(deployed 2026-03-03 ~21:30 UTC)*
@@ -327,6 +327,7 @@ Reverse-chronological log of deployed changes. Check timestamps to know what dat
 
 | Date (UTC) | Change | Design Doc |
 |------------|--------|------------|
+| 2026-03-10 ~21:00 | **Live range refocused to 0.40-0.55**: Data showed 0.40-0.50 tier is profitable (+$0.21/trade, EE avg $3.89) while 0.55-0.65 is near-zero (+$0.02-0.05/trade). Reversed the earlier exploration change: restored 0.40-0.50 to live, moved 0.55-0.65 to paper-only. Live range is now the EE sweet spot where bid spikes are wild and saves are frequent. | — |
 | 2026-03-10 ~17:00 | **Quick wins from deep analysis**: (1) MIN_CONFIDENCE raised 0.015->0.020 (1.5-2% band averaged -$0.16/trade). (2) Normal trades below entry $0.50 now paper-only (lost -$66 on 214 trades). (3) Regime flip cap raised 0.50->0.55 (flips at 0.50-0.55 are profitable). (4) EE mid-tier comment updated to reflect 0.90 revert (flat 0.90 outperforms tiered). (5) Spread filter: skip live when spread > $0.03 (-$1.15/trade at wide spreads). | `docs/plans/2026-03-10-deep-analysis-report.md` |
 | 2026-03-10 ~16:35 | **Shadow bid fix**: `bids[0]` → `bids[-1]` in shadow tracking. CLOB returns bids ascending; shadow was reading floor bid ($0.01) instead of best bid. All 237 shadow windows from 2026-03-09/10 have garbage bid data. Data collection effectively restarted. | — |
 | 2026-03-10 | **Gamma verification system**: 3-layer fix for phantom WINs (12.7% error rate, $234 discrepancy). Layer 1: delayed 5-min Gamma verification after every Chainlink settlement. Layer 2: hourly reconciliation catches anything Layer 1 missed. Layer 3: balance sanity check alerts on $5+ DB/actual divergence. Corrections update outcome, PnL, bankroll, and streak guard state. Config: reverted `early_exit_threshold_mid` 0.70 -> 0.90 (VPS had 0.90 hardcoded anyway, data confirms 0.90 earns more). | `docs/plans/2026-03-10-gamma-verification-design.md` |
