@@ -235,6 +235,9 @@ class Database:
             ("live_trades", "entry_token_ask_size", "REAL"),
             # early exit settlement backfill (2026-03-05)
             ("live_trades", "would_have_won", "INTEGER"),
+            # Gamma verification (2026-03-10)
+            ("live_trades", "gamma_resolution", "TEXT"),
+            ("live_trades", "gamma_winner_matches", "INTEGER"),
             # skipped_windows enrichment (2026-03-04)
             ("skipped_windows", "model_side", "TEXT"),
             ("skipped_windows", "entry_obi", "REAL"),
@@ -783,6 +786,125 @@ class Database:
             return [dict(row) for row in rows]
         except Exception:
             logger.exception("Failed to fetch unsettled live trades")
+            return []
+
+    async def get_live_trade_by_id(self, trade_id: int) -> dict | None:
+        """Fetch a single live trade by ID."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM live_trades WHERE id = ?", (trade_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            logger.exception("Failed to fetch live trade %d", trade_id)
+            return None
+
+    async def get_unverified_trades(self, min_age_seconds: int = 600) -> list[dict]:
+        """Return settled trades that lack Gamma verification.
+
+        Only returns trades older than min_age_seconds (default 10 min)
+        to avoid re-checking trades that Layer 1 is about to verify.
+        Excludes EARLY_EXIT (settled by CLOB sell, not by resolution).
+        """
+        try:
+            cutoff_ms = int((time.time() - min_age_seconds) * 1000)
+            cursor = await self._db.execute(
+                """
+                SELECT * FROM live_trades
+                WHERE success = 1
+                  AND outcome IN ('WIN', 'LOSS')
+                  AND gamma_resolution IS NULL
+                  AND settled_at IS NOT NULL
+                  AND settled_at < ?
+                """,
+                (cutoff_ms,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            logger.exception("Failed to fetch unverified trades")
+            return []
+
+    async def correct_trade_outcome(
+        self,
+        trade_id: int,
+        new_outcome: str,
+        new_pnl: float,
+        gamma_resolution: str,
+        gamma_winner_matches: int,
+    ) -> None:
+        """Correct a trade's outcome after Gamma verification.
+
+        Updates outcome, pnl, and stamps gamma verification fields.
+        Used when Gamma API disagrees with the original Chainlink-based settlement.
+        """
+        try:
+            await self._db.execute(
+                """
+                UPDATE live_trades
+                SET outcome = ?, pnl = ?,
+                    gamma_resolution = ?, gamma_winner_matches = ?
+                WHERE id = ?
+                """,
+                (new_outcome, new_pnl, gamma_resolution, gamma_winner_matches, trade_id),
+            )
+            await self._db.commit()
+            logger.warning(
+                "CORRECTED live trade %d: outcome=%s pnl=%.4f gamma=%s",
+                trade_id, new_outcome, new_pnl, gamma_resolution,
+            )
+        except Exception:
+            logger.exception("Failed to correct trade %d", trade_id)
+
+    async def stamp_gamma_verification(
+        self,
+        trade_id: int,
+        gamma_resolution: str,
+        gamma_winner_matches: int,
+    ) -> None:
+        """Stamp Gamma verification on a trade without changing outcome/pnl.
+
+        Used when Gamma confirms the existing outcome is correct.
+        """
+        try:
+            await self._db.execute(
+                """
+                UPDATE live_trades
+                SET gamma_resolution = ?, gamma_winner_matches = ?
+                WHERE id = ?
+                """,
+                (gamma_resolution, gamma_winner_matches, trade_id),
+            )
+            await self._db.commit()
+        except Exception:
+            logger.exception("Failed to stamp gamma on trade %d", trade_id)
+
+    async def get_recent_outcomes(self, side: str, limit: int = 10) -> list[dict]:
+        """Return the last N settled live trades for a given side.
+
+        Used to rebuild streak guard state after a correction.
+        Excludes maker_fill trades (same as streak guard logic in main.py).
+        Orders by settled_at DESC so most recent is first.
+        """
+        try:
+            cursor = await self._db.execute(
+                """
+                SELECT outcome FROM live_trades
+                WHERE success = 1
+                  AND side = ?
+                  AND outcome IN ('WIN', 'LOSS', 'EARLY_EXIT')
+                  AND (trade_tag IS NULL OR trade_tag != 'maker_fill')
+                ORDER BY settled_at DESC
+                LIMIT ?
+                """,
+                (side, limit),
+            )
+            rows = await cursor.fetchall()
+            # Reverse so index 0 = oldest, matching _side_outcomes order
+            return [dict(row) for row in reversed(rows)]
+        except Exception:
+            logger.exception("Failed to fetch recent outcomes for %s", side)
             return []
 
     async def get_live_trading_stats_full(self) -> dict:

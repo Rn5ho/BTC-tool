@@ -2146,12 +2146,20 @@ class Orchestrator:
             )
 
         # Settle live trades using Gamma resolution (or price fallback)
+        settled_ids: list[int] = []
         if self.live_trader and self.live_trader.is_active:
-            await self._settle_live_trades_for_window(slug, btc_went_up, btc_end)
+            settled_ids = await self._settle_live_trades_for_window(slug, btc_went_up, btc_end)
 
         # Backfill settlement data on any EARLY_EXIT trades for this window
         if slug:
             await self.db.backfill_early_exit_settlement(slug, btc_end, btc_went_up)
+
+        # Layer 1: Schedule delayed Gamma verification if we used Chainlink fallback
+        if settled_ids and settlement_source != "Gamma API":
+            asyncio.create_task(
+                self._verify_settlement_gamma(slug, settled_ids),
+                name=f"gamma_verify_{slug}",
+            )
 
         # Telegram alerts for in-memory tracked positions
         if slug and slug in self._live_trade_tokens:
@@ -2179,10 +2187,14 @@ class Orchestrator:
 
     async def _settle_live_trades_for_window(
         self, slug: str, btc_went_up: bool, settlement_price: float | None = None
-    ) -> None:
-        """Settle unsettled live trades matching the given slug."""
+    ) -> list[int]:
+        """Settle unsettled live trades matching the given slug.
+
+        Returns list of settled trade IDs (for Gamma verification scheduling).
+        """
+        settled_ids: list[int] = []
         if not self.live_trader:
-            return
+            return settled_ids
         unsettled = await self.db.get_unsettled_live_trades()
         for row in unsettled:
             if row["market_slug"] != slug:
@@ -2230,6 +2242,7 @@ class Orchestrator:
                 exit_threshold_used=exit_th,
                 settlement_price=settlement_price,
             )
+            settled_ids.append(row["id"])
 
             # Update live trader internal state
             self.live_trader.record_settlement(won, pnl)
@@ -2266,6 +2279,309 @@ class Orchestrator:
                 "Settled live trade: %s %s -> %s | pnl=$%+.2f | live bankroll=$%.2f",
                 side, slug, outcome, pnl, self.live_trader.bankroll,
             )
+
+        return settled_ids
+
+    # ------------------------------------------------------------------
+    # Gamma verification (3-layer system)
+    # ------------------------------------------------------------------
+
+    async def _db_fetch_trade(self, trade_id: int) -> dict | None:
+        """Fetch a live trade by ID (thin wrapper for verification code)."""
+        return await self.db.get_live_trade_by_id(trade_id)
+
+    def _compute_pnl(
+        self, won: bool, amount: float, entry_price: float,
+        response_json: str | None = None,
+    ) -> float:
+        """Compute PnL for a trade given outcome, amount, and entry price.
+
+        Tries actual token count from response_json first, then falls back
+        to fee-adjusted formula.
+        """
+        # Try actual tokens from FOK response (matches _settle_stale_live_trades pattern)
+        actual_tokens = None
+        if response_json:
+            try:
+                resp_d = json.loads(response_json)
+                ts = resp_d.get("takingAmount", "")
+                if ts and str(ts).strip():
+                    actual_tokens = float(ts)
+            except Exception:
+                pass
+
+        if actual_tokens is not None:
+            return (actual_tokens - amount) if won else -amount
+
+        if entry_price > 0 and self.live_trader:
+            fee_factor = 0.0
+            if self.live_trader._fee_rate > 0:
+                from data.polymarket import compute_fee_factor
+                fee_factor = compute_fee_factor(
+                    entry_price,
+                    self.live_trader._fee_rate,
+                    self.live_trader._fee_exponent,
+                )
+            shares = (amount / entry_price) * (1.0 - fee_factor)
+            return (shares - amount) if won else -amount
+
+        return -amount if not won else 0.0
+
+    async def _rebuild_streak_state(self, side: str) -> None:
+        """Rebuild _side_outcomes from last 10 DB trades for a given side.
+
+        Called after Gamma corrections to ensure streak guard reflects
+        corrected outcomes rather than stale in-memory state.
+        """
+        recent = await self.db.get_recent_outcomes(side, limit=10)
+        self._side_outcomes[side] = [r["outcome"] for r in recent]
+        logger.info(
+            "Rebuilt streak state for %s: %s",
+            side, self._side_outcomes[side][-3:] if self._side_outcomes[side] else "[]",
+        )
+
+    async def _verify_settlement_gamma(
+        self, slug: str, settled_trade_ids: list[int]
+    ) -> None:
+        """Layer 1: Delayed Gamma verification of Chainlink-settled trades.
+
+        Waits gamma_verify_delay_seconds (default 5 min) for Gamma resolution
+        to become available, then checks if our Chainlink-based settlement was
+        correct. Corrects phantom WINs/missed WINs in DB.
+        """
+        delay = settings.gamma_verify_delay_seconds
+        logger.info(
+            "Gamma verify scheduled for %s (%d trades) in %ds",
+            slug, len(settled_trade_ids), delay,
+        )
+        await asyncio.sleep(delay)
+
+        # Query Gamma
+        gamma_resolution = await self._query_gamma_resolution(slug, max_retries=3)
+        if not gamma_resolution:
+            logger.warning(
+                "Gamma verify: no resolution for %s after %ds — Layer 2 will catch it",
+                slug, delay,
+            )
+            return
+
+        # Check each settled trade against Gamma truth
+        corrections = 0
+        for trade_id in settled_trade_ids:
+            try:
+                row = await self._db_fetch_trade(trade_id)
+                if not row:
+                    continue
+                # Skip trades that were already corrected or are EE/VOID
+                if row.get("gamma_resolution") is not None:
+                    continue
+                if row["outcome"] not in ("WIN", "LOSS"):
+                    continue
+
+                side = row["side"]
+                amount = row["amount_usdc"]
+                entry_price = row.get("entry_price") or 0.0
+
+                # What Gamma says should have happened
+                side_would_win = (side == gamma_resolution)
+                expected_outcome = "WIN" if side_would_win else "LOSS"
+                matches = 1 if row["outcome"] == expected_outcome else 0
+
+                if matches:
+                    # Outcome is correct — just stamp verification
+                    await self.db.stamp_gamma_verification(
+                        trade_id, gamma_resolution, 1
+                    )
+                else:
+                    # WRONG — correct it
+                    corrections += 1
+                    old_outcome = row["outcome"]
+
+                    # Recalculate PnL from scratch
+                    new_pnl = self._compute_pnl(
+                        won=side_would_win,
+                        amount=amount,
+                        entry_price=entry_price,
+                        response_json=row.get("response_json"),
+                    )
+
+                    await self.db.correct_trade_outcome(
+                        trade_id, expected_outcome, new_pnl,
+                        gamma_resolution, 0,
+                    )
+
+                    # Update live trader bankroll (reverse old PnL, apply new)
+                    if self.live_trader:
+                        old_pnl = row.get("pnl", 0.0)
+                        pnl_delta = new_pnl - old_pnl
+                        self.live_trader.bankroll += pnl_delta
+
+                    logger.warning(
+                        "GAMMA CORRECTION: trade %d %s %s: %s -> %s (pnl $%+.2f -> $%+.2f)",
+                        trade_id, side, slug, old_outcome, expected_outcome,
+                        row.get("pnl", 0), new_pnl,
+                    )
+
+                    # Telegram alert
+                    if self.alerter:
+                        try:
+                            await self.alerter._send(
+                                f"CORRECTION: {slug}\n"
+                                f"{side} {old_outcome} -> {expected_outcome}\n"
+                                f"PnL: ${row.get('pnl', 0):+.2f} -> ${new_pnl:+.2f}\n"
+                                f"(Gamma verified)",
+                                parse_mode=None,
+                            )
+                        except Exception:
+                            pass
+
+            except Exception:
+                logger.exception("Gamma verify failed for trade %d", trade_id)
+
+        if corrections:
+            # Rebuild streak state from corrected DB data
+            for side in ("UP", "DOWN"):
+                await self._rebuild_streak_state(side)
+            logger.warning(
+                "Gamma verify %s: %d correction(s) applied, streak state rebuilt",
+                slug, corrections,
+            )
+        else:
+            logger.info("Gamma verify %s: all %d trades confirmed correct", slug, len(settled_trade_ids))
+
+    async def _gamma_reconciliation(self) -> None:
+        """Layer 2: Hourly reconciliation of trades missing Gamma verification.
+
+        Catches anything Layer 1 missed (e.g., task cancelled on restart,
+        Gamma was slow). Re-checks all settled trades without gamma_resolution.
+        """
+        unverified = await self.db.get_unverified_trades(min_age_seconds=600)
+        if not unverified:
+            return
+
+        logger.info("Gamma reconciliation: %d unverified trades", len(unverified))
+
+        # Group by slug for efficient API calls
+        by_slug: dict[str, list[dict]] = {}
+        for row in unverified:
+            by_slug.setdefault(row["market_slug"], []).append(row)
+
+        corrections = 0
+        verified = 0
+        for slug, trades in by_slug.items():
+            gamma_resolution = await self._query_gamma_resolution(slug, max_retries=2)
+            if not gamma_resolution:
+                continue  # Still not resolved — try next hour
+
+            for row in trades:
+                side = row["side"]
+                side_would_win = (side == gamma_resolution)
+                expected_outcome = "WIN" if side_would_win else "LOSS"
+                matches = 1 if row["outcome"] == expected_outcome else 0
+
+                if matches:
+                    await self.db.stamp_gamma_verification(
+                        row["id"], gamma_resolution, 1
+                    )
+                    verified += 1
+                else:
+                    # Correction needed
+                    amount = row["amount_usdc"]
+                    entry_price = row.get("entry_price") or 0.0
+                    new_pnl = self._compute_pnl(
+                        won=side_would_win,
+                        amount=amount,
+                        entry_price=entry_price,
+                        response_json=row.get("response_json"),
+                    )
+                    await self.db.correct_trade_outcome(
+                        row["id"], expected_outcome, new_pnl,
+                        gamma_resolution, 0,
+                    )
+
+                    # Adjust bankroll
+                    if self.live_trader:
+                        old_pnl = row.get("pnl", 0.0)
+                        self.live_trader.bankroll += (new_pnl - old_pnl)
+
+                    corrections += 1
+                    logger.warning(
+                        "RECONCILIATION: trade %d %s %s: %s -> %s",
+                        row["id"], side, slug, row["outcome"], expected_outcome,
+                    )
+
+            await asyncio.sleep(0.3)  # Rate limit Gamma API
+
+        if corrections:
+            for side in ("UP", "DOWN"):
+                await self._rebuild_streak_state(side)
+
+            if self.alerter:
+                try:
+                    await self.alerter._send(
+                        f"RECONCILIATION: {corrections} correction(s), {verified} confirmed\n"
+                        f"Streak state rebuilt",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    pass
+
+        if verified or corrections:
+            logger.info(
+                "Gamma reconciliation done: %d verified, %d corrected",
+                verified, corrections,
+            )
+
+    async def _balance_sanity_check(self) -> None:
+        """Layer 3: Compare DB-calculated bankroll to actual Polymarket balance.
+
+        Alerts if discrepancy exceeds $5. This catches systematic errors
+        (phantom WINs, missed settlements, fee miscalculations) that
+        individual trade verification might miss.
+        """
+        if not self.live_trader or not self.live_trader.is_active:
+            return
+
+        actual = await self.live_trader.get_balance()
+        if actual is None:
+            return
+
+        # Count tokens in open positions (pending trades have value)
+        unsettled = await self.db.get_unsettled_live_trades()
+        open_value = sum(r.get("amount_usdc", 0) for r in unsettled)
+
+        db_bankroll = self.live_trader.bankroll
+        # Actual portfolio = USDC cash + value of open positions
+        # DB bankroll tracks cash only (positions are subtracted at entry, added at settlement)
+        expected_cash = db_bankroll
+        discrepancy = actual - expected_cash
+
+        logger.info(
+            "Balance check: actual=$%.2f, DB bankroll=$%.2f, "
+            "open positions=%d ($%.2f), discrepancy=$%+.2f",
+            actual, db_bankroll, len(unsettled), open_value, discrepancy,
+        )
+
+        # Alert if discrepancy exceeds threshold (accounting for open positions)
+        # Open positions are expected to cause ~$5-10 gap during active trading
+        adjusted_discrepancy = abs(discrepancy) - open_value
+        if adjusted_discrepancy > 5.0:
+            logger.warning(
+                "BALANCE DISCREPANCY: $%.2f (adjusted for %d open positions: $%.2f)",
+                discrepancy, len(unsettled), adjusted_discrepancy,
+            )
+            if self.alerter:
+                try:
+                    await self.alerter._send(
+                        f"BALANCE WARNING\n"
+                        f"Actual: ${actual:.2f}\n"
+                        f"DB bankroll: ${db_bankroll:.2f}\n"
+                        f"Open positions: {len(unsettled)} (${open_value:.2f})\n"
+                        f"Gap: ${discrepancy:+.2f}",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    pass
 
     async def _settle_stale_live_trades(self) -> None:
         """Settle stale unsettled live trades from previous sessions.
@@ -2693,6 +3009,10 @@ class Orchestrator:
                     report = self.paper_trader.format_stats_report(stats)
                     logger.info("\n%s", report)
 
+                    # Layer 3: Balance sanity check (must run BEFORE bankroll sync)
+                    if self.live_trader and self.live_trader.is_active:
+                        await self._balance_sanity_check()
+
                     # Sync bankroll from real CLOB balance
                     if self.live_trader and self.live_trader.is_active:
                         real_bal = await self.live_trader.get_balance()
@@ -2709,6 +3029,10 @@ class Orchestrator:
                     # Settle any stale unsettled live trades (Gamma API)
                     if self.live_trader and self.live_trader.is_active:
                         await self._settle_stale_live_trades()
+
+                    # Layer 2: Gamma reconciliation for already-settled trades
+                    if self.live_trader and self.live_trader.is_active:
+                        await self._gamma_reconciliation()
 
                     # Sync maker fills from CLOB API
                     if self.live_trader and self.live_trader.is_active:

@@ -84,8 +84,11 @@ class Settings(BaseSettings):
     # Data: 548 trades with 102K market snapshots (bid spike analysis).
     early_exit_threshold_low: float = 0.50     # entry < 0.35: lottery tickets, exit on any spike
     early_exit_threshold_low_mid: float = 0.65 # entry 0.35-0.40: raised from 0.45 on 2026-03-05
-    early_exit_threshold_mid: float = 0.70     # entry 0.40-0.50: lowered from 0.90 — 51% EE rate vs 37%
+    early_exit_threshold_mid: float = 0.90     # entry 0.40-0.50: 0.70 tested but VPS had 0.90 hardcoded; data shows 0.90 earns more
     early_exit_threshold_high: float = 0.95    # entry >= 0.50 (~55% WR, conservative)
+
+    # Gamma verification — delay before re-querying Gamma after Chainlink settlement
+    gamma_verify_delay_seconds: int = 300  # 5 minutes — markets resolve in 2-6 min
 
     # Hour blacklist (UTC hours where model underperforms; skip trading)
     blacklist_hours: str = ""  # comma-separated UTC hours, e.g. "2,11,19"
