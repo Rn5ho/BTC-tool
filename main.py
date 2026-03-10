@@ -1106,12 +1106,12 @@ class Orchestrator:
                 down_book = await self.polymarket.get_orderbook(down_token)
 
                 if up_book and up_book.get("bids"):
-                    best_bid = float(up_book["bids"][0]["price"])
+                    best_bid = float(up_book["bids"][-1]["price"])
                     self._shadow_up_max_bid = max(self._shadow_up_max_bid, best_bid)
                     self._shadow_up_min_bid = min(self._shadow_up_min_bid, best_bid)
 
                 if down_book and down_book.get("bids"):
-                    best_bid = float(down_book["bids"][0]["price"])
+                    best_bid = float(down_book["bids"][-1]["price"])
                     self._shadow_down_max_bid = max(self._shadow_down_max_bid, best_bid)
                     self._shadow_down_min_bid = min(self._shadow_down_min_bid, best_bid)
 
