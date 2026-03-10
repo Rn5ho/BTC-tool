@@ -1578,19 +1578,31 @@ class Orchestrator:
             await self.paper_trader.place_trade(paper_signal)
 
         # Live trade — place real order on Polymarket
-        # Skip exploration trades (entry price 0.25-0.35) for live — paper-only data collection
+        # Skip exploration trades (entry price 0.25-0.50) for live — paper-only data collection
         live_signal = signal  # default: model's signal
         if flip_signal and settings.regime_flip_live:
-            # Cap flip entries at 0.50 — expensive flips (>=0.50) lose -$0.85/trade
-            # on 64 trades.  Cheap flip entries (<0.45) make +$0.94/trade.
+            # Cap flip entries at 0.55 — flips at 0.50-0.55 are profitable,
+            # but >=0.55 lose -$0.85/trade on 64 trades.
             flip_entry = flip_signal.get("entry_price", 1.0)
-            if flip_entry < 0.50:
-                live_signal = flip_signal
+            if flip_entry < 0.55:
+                # Clear exploration flag — flips at 0.40-0.55 should go live
+                # (exploration=True is set in edge.py for entry <0.50, but flips
+                # at cheap entries are profitable and should not be paper-only)
+                live_signal = {**flip_signal, "exploration": False}
             else:
                 logger.info(
-                    "FLIP ENTRY CAP: skipping live flip (entry=%.3f >= 0.50)",
+                    "FLIP ENTRY CAP: skipping live flip (entry=%.3f >= 0.55)",
                     flip_entry,
                 )
+
+        # Spread filter — wide spreads predict poor EE outcomes
+        live_spread = live_signal.get("spread") or 0.0
+        if live_spread > 0.03:
+            logger.info(
+                "SPREAD FILTER: skipping live trade (spread=%.3f > 0.03) on %s %s",
+                live_spread, live_signal["side"], live_signal["market_slug"],
+            )
+            live_signal = {**live_signal, "exploration": True}  # route to paper-only
 
         if self.live_trader and self.live_trader.is_active and not self.live_trader.is_paused and not live_signal.get("exploration"):
             # Determine token ID from market

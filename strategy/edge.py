@@ -180,8 +180,8 @@ class EdgeDetector:
             spread = market.down_spread
 
         # Reject entry prices outside the tradeable range.
-        # Core range 0.40-0.65: live trades with full sizing.
-        # Exploration range 0.25-0.40: paper-only (bad R:R — EE profit ~$1 vs $5 risk).
+        # Core range 0.50-0.65: live trades with full sizing.
+        # Exploration range 0.25-0.50: paper-only (normal trades below 0.50 lose money).
         # Below 0.25: too thin / too contrarian to be useful.
         if entry_price > 0.65 or entry_price < 0.25:
             self.last_skip_reason = (
@@ -193,10 +193,10 @@ class EdgeDetector:
             )
             return None
 
-        exploration = entry_price < 0.40
+        exploration = entry_price < 0.50
         if exploration:
             logger.info(
-                "Exploration signal — entry price %.3f in 0.25-0.40 range on %s %s",
+                "Exploration signal — entry price %.3f in 0.25-0.50 range on %s %s",
                 entry_price, best_side, market.slug,
             )
 

@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # Minimum ML confidence (|P(up) - 0.5|) required to place a trade.
     # Backtested sweet spot: 0.015 gives 56.9% WR on 53% of windows ($59/day).
-    min_confidence: float = 0.015
+    min_confidence: float = 0.020
 
     # Sizing strategy: "fixed", "kelly", "adaptive"
     # - fixed: flat bet_size_usdc every trade
@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     # Data: 548 trades with 102K market snapshots (bid spike analysis).
     early_exit_threshold_low: float = 0.50     # entry < 0.35: lottery tickets, exit on any spike
     early_exit_threshold_low_mid: float = 0.65 # entry 0.35-0.40: raised from 0.45 on 2026-03-05
-    early_exit_threshold_mid: float = 0.90     # entry 0.40-0.50: 0.70 tested but VPS had 0.90 hardcoded; data shows 0.90 earns more
+    early_exit_threshold_mid: float = 0.90     # entry 0.40-0.50: 0.70 tested 2026-03-09, reverted — flat 0.90 outperforms tiered
     early_exit_threshold_high: float = 0.95    # entry >= 0.50 (~55% WR, conservative)
 
     # Gamma verification — delay before re-querying Gamma after Chainlink settlement
