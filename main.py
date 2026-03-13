@@ -1618,15 +1618,15 @@ class Orchestrator:
         # Live range: LIVE_ENTRY_MIN to LIVE_ENTRY_MAX. Outside = paper-only exploration.
         live_signal = signal  # default: model's signal
         if flip_signal and settings.regime_flip_live:
-            # Cap flip entries at LIVE_ENTRY_MAX — flips above this range lose money.
+            # Only allow flips within the live entry range.
             flip_entry = flip_signal.get("entry_price", 1.0)
-            if flip_entry < settings.live_entry_max:
+            if settings.live_entry_min <= flip_entry < settings.live_entry_max:
                 # Ensure exploration flag is cleared for flips in live range
                 live_signal = {**flip_signal, "exploration": False}
             else:
                 logger.info(
-                    "FLIP ENTRY CAP: skipping live flip (entry=%.3f >= %.2f)",
-                    flip_entry, settings.live_entry_max,
+                    "FLIP ENTRY CAP: skipping live flip (entry=%.3f outside %.2f-%.2f)",
+                    flip_entry, settings.live_entry_min, settings.live_entry_max,
                 )
 
         # Spread filter — wide spreads predict poor EE outcomes
