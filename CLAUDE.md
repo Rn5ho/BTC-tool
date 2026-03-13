@@ -232,7 +232,7 @@ CONFIDENCE_DAMPEN=1.0          # 1.0 = no dampening (current), 0.6 = original. D
 # Adaptive early exit — 4-tier thresholds by entry price
 EARLY_EXIT_THRESHOLD_LOW=0.50      # entry < 0.35: lottery tickets, exit on any spike
 EARLY_EXIT_THRESHOLD_LOW_MID=0.65  # entry 0.35-0.40: raised from 0.45 on 2026-03-05
-EARLY_EXIT_THRESHOLD_MID=0.90      # entry 0.40-0.50: raised from 0.65 on 2026-03-05
+EARLY_EXIT_THRESHOLD_MID=0.96      # entry 0.40-0.50: raised from 0.90 on 2026-03-13
 EARLY_EXIT_THRESHOLD_HIGH=0.95     # entry >= 0.50 (~55% WR, conservative)
 
 # Hour blacklist (UTC hours to skip trading)
@@ -269,7 +269,7 @@ Dedicated 1-second monitoring loop (`_early_exit_loop()` → `_monitor_early_exi
 |-------------|---------------|--------------|-----------|
 | < 0.35 | 0.50 | 87% (13/15) | Lottery tickets — spike briefly, grab any profit |
 | 0.35 - 0.40 | 0.65 | 88% (22/25) | Raised from 0.45 (2026-03-05) — old threshold gave ~$0.50 margin |
-| 0.40 - 0.50 | 0.90 | ~70% | Raised from 0.65 (2026-03-05) — 76% would-win rate, stop clipping winners |
+| 0.40 - 0.50 | 0.96 | ~95% | Raised from 0.90 (2026-03-13) — 0.90 clipped 94% winners; 0.96 catches late-window 0.95-0.98 reversals |
 | >= 0.50 | 0.95 | 12% (16/131) | High WR, conservative — let winners run |
 
 - **First touch**: Sell immediately when `bid >= threshold` (no hold-confirmation — bid spikes on losers last only 5-8 seconds)
@@ -331,6 +331,7 @@ Reverse-chronological log of deployed changes. Check timestamps to know what dat
 
 | Date (UTC) | Change | Design Doc |
 |------------|--------|------------|
+| 2026-03-13 ~14:00 | **EE mid-tier threshold raised 0.90 → 0.96**: Analysis of 360 trades showed 0.90 was clipping 94% winners. Higher thresholds monotonically better. 0.96 catches late-window 0.95-0.98 bid spikes that reverse into full losses in final seconds. Lets most winners run to settlement while still catching dangerous reversals. | — |
 | 2026-03-13 | **Entry range tightened to 0.40-0.50 + pause persistence**: (1) Live range narrowed from 0.40-0.55 to 0.40-0.50 — cheap entries are profitable at current 47% WR (+$0.24/trade, ~69 trades/day). New config params LIVE_ENTRY_MIN/LIVE_ENTRY_MAX replace hardcoded values. (2) /pause state now persists to pause_state.json — survives service restarts (previously lost -$64 from 82 unwanted trades after restart). | `docs/plans/2026-03-13-ee-centric-redesign.md` |
 | 2026-03-10 ~21:00 | **Live range refocused to 0.40-0.55**: Data showed 0.40-0.50 tier is profitable (+$0.21/trade, EE avg $3.89) while 0.55-0.65 is near-zero (+$0.02-0.05/trade). Reversed the earlier exploration change: restored 0.40-0.50 to live, moved 0.55-0.65 to paper-only. Live range is now the EE sweet spot where bid spikes are wild and saves are frequent. | — |
 | 2026-03-10 ~17:00 | **Quick wins from deep analysis**: (1) MIN_CONFIDENCE raised 0.015->0.020 (1.5-2% band averaged -$0.16/trade). (2) Normal trades below entry $0.50 now paper-only (lost -$66 on 214 trades). (3) Regime flip cap raised 0.50->0.55 (flips at 0.50-0.55 are profitable). (4) EE mid-tier comment updated to reflect 0.90 revert (flat 0.90 outperforms tiered). (5) Spread filter: skip live when spread > $0.03 (-$1.15/trade at wide spreads). | `docs/plans/2026-03-10-deep-analysis-report.md` |

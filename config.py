@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     # Data: 548 trades with 102K market snapshots (bid spike analysis).
     early_exit_threshold_low: float = 0.50     # entry < 0.35: lottery tickets, exit on any spike
     early_exit_threshold_low_mid: float = 0.65 # entry 0.35-0.40: raised from 0.45 on 2026-03-05
-    early_exit_threshold_mid: float = 0.90     # entry 0.40-0.50: 0.70 tested 2026-03-09, reverted — flat 0.90 outperforms tiered
+    early_exit_threshold_mid: float = 0.96     # entry 0.40-0.50: raised from 0.90 on 2026-03-13 — 0.90 clipped 94% winners, 0.96 catches late reversals
     early_exit_threshold_high: float = 0.95    # entry >= 0.50 (~55% WR, conservative)
 
     # Live entry range — only place live trades when entry price is in this range.
