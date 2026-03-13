@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-BTC Polymarket 5-Minute Edge Finder — monitors Binance BTC price data, uses a trained ML model (RandomForestClassifier, 53.9% accuracy) to predict 5-minute BTC direction, and trades on Polymarket's binary UP/DOWN markets. Deployed on Hetzner VPS in Helsinki (65.21.178.90) running 24/7. Live trading enabled via py-clob-client with adaptive tiered early exit selling.
+BTC Polymarket 5-Minute Edge Finder — monitors Binance BTC price data, uses a trained ML model (GradientBoostingClassifier, 53.2% CV / 53.0% clean gamma eval) to predict 5-minute BTC direction, and trades on Polymarket's binary UP/DOWN markets. Deployed on Hetzner VPS in Helsinki (65.21.178.90) running 24/7. Live trading enabled via py-clob-client with adaptive tiered early exit selling.
 
 ## Win Rate Metrics — How to Read Performance
 
@@ -28,7 +28,7 @@ Early Exit (EE) is an intentional profit-locking mechanism, not a rescue system.
 - Polymarket Gamma/CLOB API (market discovery, live prices, no auth needed)
 - Polymarket RTDS WebSocket for Chainlink BTC/USD stream (settlement price — matches Polymarket's resolution source)
 - py-clob-client (Polymarket CLOB trading — real orders via FOK market buys)
-- scikit-learn (ML model inference — RandomForestClassifier loaded from pickle)
+- scikit-learn (ML model inference — GradientBoostingClassifier loaded from pickle)
 - SQLite via aiosqlite (persistence)
 - python-telegram-bot v21+ (interactive bot with commands)
 - pydantic-settings (config from .env)
@@ -46,7 +46,7 @@ signals/        → Signal generation
   indicators.py → Technical indicators (RSI-9/14, VWAP, BB-20, EMA 5/9/13/21, ATR-14, momentum, vol z-score)
   features.py   → Feature engineering (OBI, taker ratio, funding z-score → FeatureVector with 12 fields)
   probability.py→ Rule-based weighted ensemble model → P(up) in [0.05, 0.95] (LEGACY — still available as fallback)
-  ml_probability.py → ML model wrapper → P(up) in [0.05, 0.95] using trained RandomForestClassifier with 44 features (ACTIVE)
+  ml_probability.py → ML model wrapper → P(up) in [0.05, 0.95] using trained GradientBoostingClassifier with 44 features (ACTIVE)
   regime.py     → Market regime detector (trending_up/trending_down/ranging via EMA cross + BB position + multi-window momentum)
 
 strategy/       → Trading logic
@@ -61,7 +61,7 @@ storage/
   db.py         → SQLite (candles, feature_snapshots, paper_trades, live_trades with outcome/pnl tracking, market_snapshots with spread columns, historical price lookup)
 
 models/         → Trained ML model artifacts
-  best_model.pkl  → Serialized RandomForestClassifier (RF_d3, trained 2026-02-28)
+  best_model.pkl  → Serialized GradientBoostingClassifier (GBT_v3, retrained 2026-03-13 with Chainlink label upgrade)
   scaler.pkl      → StandardScaler fitted on training data
   dataset.npz     → Training dataset (34,100 samples x 44 features)
 
