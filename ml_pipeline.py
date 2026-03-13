@@ -1353,6 +1353,7 @@ if __name__ == "__main__":
     parser.add_argument("--db", type=str, default=str(DB_PATH), help="Path to btc_edge.db")
     parser.add_argument("--binance-only", action="store_true", help="Skip local DB data")
     parser.add_argument("--no-gamma", action="store_true", help="Skip gamma evaluation")
+    parser.add_argument("--gamma-holdout-days", type=int, default=5, help="Days of recent gamma data held out for eval (older upgrades training labels)")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -1388,7 +1389,69 @@ if __name__ == "__main__":
     # Step 5: Load gamma evaluation set
     gamma_eval = None
     if not args.no_gamma:
-        gamma_eval = load_gamma_eval_set(candles, db_path=args.db)
+        gamma_all = load_gamma_eval_set(candles, db_path=args.db)
+
+        if gamma_all is not None:
+            X_gamma, y_gamma, meta_gamma = gamma_all
+
+            # ── Fix: split gamma data into label-upgrade (old) + holdout (recent) ──
+            # Older gamma trades upgrade training labels from Binance → Chainlink.
+            # Recent gamma trades become a clean holdout eval (no feature overlap).
+            now_ts = int(time.time())
+            holdout_cutoff = now_ts - (args.gamma_holdout_days * 86400)
+
+            holdout_mask = np.array([m["window_start"] >= holdout_cutoff for m in meta_gamma])
+            train_mask = ~holdout_mask
+
+            log.info(f"\n  Gamma split: {int(train_mask.sum())} → label upgrade, "
+                     f"{int(holdout_mask.sum())} → holdout eval (last {args.gamma_holdout_days} days)")
+
+            # Holdout portion → clean eval set
+            if holdout_mask.sum() >= 30:
+                holdout_indices = np.where(holdout_mask)[0]
+                gamma_eval = (
+                    X_gamma[holdout_indices],
+                    y_gamma[holdout_indices],
+                    [meta_gamma[i] for i in holdout_indices],
+                )
+            else:
+                log.warning(f"  Only {int(holdout_mask.sum())} holdout samples — using ALL gamma for eval (no label upgrade)")
+                gamma_eval = gamma_all
+
+            # Label upgrade: replace Binance labels with Chainlink for older gamma windows
+            upgrade_map = {}
+            for i in range(len(meta_gamma)):
+                if train_mask[i]:
+                    upgrade_map[meta_gamma[i]["window_start"]] = int(y_gamma[i])
+
+            if upgrade_map:
+                upgraded = 0
+                flipped = 0
+                for i, m in enumerate(meta):
+                    ws = m["window_start"]
+                    if ws in upgrade_map:
+                        new_label = upgrade_map[ws]
+                        if y[i] != new_label:
+                            flipped += 1
+                        y[i] = new_label
+                        upgraded += 1
+                log.info(f"  Label upgrade: {upgraded} training windows stamped with Chainlink labels "
+                         f"({flipped} flipped from Binance disagreement)")
+
+            # Remove holdout windows from training (eliminate feature leakage)
+            if gamma_eval is not gamma_all:
+                holdout_windows = {m["window_start"] for m in gamma_eval[2]}
+            else:
+                holdout_windows = {m["window_start"] for m in meta_gamma}
+            keep = [i for i, m in enumerate(meta) if m["window_start"] not in holdout_windows]
+            removed = len(meta) - len(keep)
+            if removed > 0:
+                X = X[keep]
+                y = y[keep]
+                weights = weights[keep]
+                meta = [meta[i] for i in keep]
+                log.info(f"  Holdout exclusion: removed {removed} gamma eval windows from training set")
+            log.info(f"  Training set after cleanup: {len(y)} samples")
 
     # Step 6: Backup existing model
     backup_path = MODEL_DIR / "best_model_backup.pkl"

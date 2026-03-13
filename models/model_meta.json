@@ -47,15 +47,15 @@
     "close_position_in_range"
   ],
   "n_features": 44,
-  "train_samples": 16432,
-  "test_samples": 4108,
-  "test_accuracy": 0.5267770204479065,
-  "cv_accuracy_mean": 0.5319310546304411,
-  "cv_accuracy_std": 0.005764594558887797,
-  "baseline_accuracy": 0.5002434274586174,
+  "train_samples": 16196,
+  "test_samples": 4049,
+  "test_accuracy": 0.5203754013336627,
+  "cv_accuracy_mean": 0.5323058684054535,
+  "cv_accuracy_std": 0.006108677191695651,
+  "baseline_accuracy": 0.5025932328970116,
   "paradigm": "always_trade",
-  "total_candles": 36972,
-  "gamma_eval_accuracy": 0.5263157894736842,
-  "gamma_eval_samples": 1615,
-  "gamma_eval_pvalue": 0.018282479795361635
+  "total_candles": 36441,
+  "gamma_eval_accuracy": 0.5299684542586751,
+  "gamma_eval_samples": 317,
+  "gamma_eval_pvalue": 0.15601168324983622
 }
