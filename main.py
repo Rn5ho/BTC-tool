@@ -199,6 +199,36 @@ class Orchestrator:
         except (IndexError, ValueError):
             return time.time()
 
+    # ------------------------------------------------------------------
+    # Pause state persistence
+    # ------------------------------------------------------------------
+    _PAUSE_STATE_FILE = "pause_state.json"
+
+    def _save_pause_state(self) -> None:
+        """Persist pause state to file so it survives service restarts."""
+        try:
+            from datetime import datetime, timezone as _tz
+            state = {
+                "paused": self._paused,
+                "paused_at": datetime.now(_tz.utc).isoformat() if self._paused else None,
+            }
+            with open(self._PAUSE_STATE_FILE, "w") as f:
+                json.dump(state, f)
+        except Exception:
+            logger.exception("Failed to save pause state")
+
+    def _load_pause_state(self) -> bool:
+        """Load pause state from file. Returns True if paused."""
+        try:
+            with open(self._PAUSE_STATE_FILE, "r") as f:
+                state = json.load(f)
+            return bool(state.get("paused", False))
+        except FileNotFoundError:
+            return False
+        except Exception:
+            logger.exception("Failed to load pause state")
+            return False
+
     def _build_flipped_signal(
         self, original: dict, market, new_side: str
     ) -> dict | None:
@@ -266,6 +296,11 @@ class Orchestrator:
 
         # Database
         await self.db.initialize()
+
+        # Restore pause state from file (survives service restarts)
+        if self._load_pause_state():
+            self._paused = True
+            logger.warning("PAUSED state restored from file — trading is paused")
 
         # Paper trader (import here to avoid circular / missing file issues)
         from strategy.paper_trader import PaperTrader
@@ -628,6 +663,7 @@ class Orchestrator:
         if self._paused:
             return "\u23f8 Already paused. Use /resume to restart trading."
         self._paused = True
+        self._save_pause_state()
         if self.live_trader:
             self.live_trader.pause()
         logger.info("Trading PAUSED via Telegram command")
@@ -644,6 +680,7 @@ class Orchestrator:
         if not self._paused:
             return "\u25b6 Already running. Trading is active."
         self._paused = False
+        self._save_pause_state()
         if self.live_trader:
             self.live_trader.resume()
         logger.info("Trading RESUMED via Telegram command")

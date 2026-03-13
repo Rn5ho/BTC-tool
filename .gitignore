@@ -51,3 +51,6 @@ historical_data/
 # ML model artifacts (large binaries)
 models/*.pkl
 models/*.npz
+
+# Runtime state files
+pause_state.json
