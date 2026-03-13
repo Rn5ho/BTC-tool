@@ -599,9 +599,360 @@ def build_dataset(candles: list[Candle]):
 
 
 # ---------------------------------------------------------------------------
+# STEP 3b: Build local dataset from our own DB
+# ---------------------------------------------------------------------------
+def build_local_dataset(db_path: str = None) -> tuple[np.ndarray, np.ndarray, list[dict]] | None:
+    """Build a dataset from our own collected feature_snapshots + candles.
+
+    Labels: Binance candle close-to-close (same as Binance historical pipeline).
+    Features: Same 44 features computed from candle history, matching extract_features().
+    Bonus: Polymarket spread/book features from market_snapshots (where available).
+
+    Returns (X, y, meta) or None if not enough data.
+    """
+    _db = db_path or str(DB_PATH)
+    if not Path(_db).exists():
+        log.warning(f"DB not found at {_db} — skipping local dataset")
+        return None
+
+    log.info("\n" + "=" * 60)
+    log.info("Building dataset from local DB (feature_snapshots + candles)")
+    log.info("=" * 60)
+
+    conn = sqlite3.connect(_db)
+    cur = conn.cursor()
+
+    # Load all candles
+    cur.execute(
+        "SELECT timestamp, open, high, low, close, volume, taker_buy_volume, trades "
+        "FROM candles ORDER BY timestamp ASC"
+    )
+    candle_rows = cur.fetchall()
+    if len(candle_rows) < 100:
+        log.warning(f"Only {len(candle_rows)} candles in DB — not enough for local dataset")
+        conn.close()
+        return None
+
+    local_candles = [
+        Candle(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7])
+        for r in candle_rows
+    ]
+    candle_by_ts = {c.timestamp: c for c in local_candles}
+    timestamps = sorted(candle_by_ts.keys())
+    log.info(f"  Loaded {len(local_candles)} candles from DB")
+
+    # Load market_snapshots for Polymarket features (spread, book state)
+    # Group by 5-min window for joining
+    cur.execute(
+        "SELECT timestamp, slug, up_best_bid, up_best_ask, up_spread, "
+        "       down_best_bid, down_best_ask, down_spread "
+        "FROM market_snapshots "
+        "WHERE up_spread IS NOT NULL "
+        "ORDER BY timestamp ASC"
+    )
+    snap_rows = cur.fetchall()
+    log.info(f"  Loaded {len(snap_rows)} market snapshots with spread data")
+
+    # Index snapshots by 5-min window start
+    snap_by_window: dict[int, list[dict]] = {}
+    for r in snap_rows:
+        ts_sec = r[0] // 1000 if r[0] > 1_000_000_000_000 else r[0]
+        window_start = ts_sec - (ts_sec % 300)
+        if window_start not in snap_by_window:
+            snap_by_window[window_start] = []
+        snap_by_window[window_start].append({
+            "up_spread": r[4],
+            "down_spread": r[7],
+            "up_best_bid": r[2],
+            "up_best_ask": r[3],
+            "down_best_bid": r[5],
+            "down_best_ask": r[6],
+        })
+
+    conn.close()
+
+    # Build dataset using same windowing logic as build_dataset()
+    first_ts = timestamps[0] // 1000
+    last_ts = timestamps[-1] // 1000
+    first_window = first_ts - (first_ts % 300) + 300
+    last_window = last_ts - (last_ts % 300)
+
+    features_list = []
+    labels = []
+    meta_list = []
+    skipped = {"no_history": 0, "no_end": 0, "tie": 0}
+
+    window_ts = first_window
+    while window_ts <= last_window - 300:
+        start_ms = window_ts * 1000
+        end_ms = (window_ts + 300) * 1000
+
+        hist_times = [t for t in timestamps if t < start_ms]
+        if len(hist_times) < 30:
+            skipped["no_history"] += 1
+            window_ts += 300
+            continue
+
+        hist_candles = [candle_by_ts[t] for t in hist_times[-60:]]
+        start_price = candle_by_ts[hist_times[-1]].close
+
+        end_candidates = [t for t in timestamps if end_ms - 60000 <= t <= end_ms + 60000]
+        if not end_candidates:
+            skipped["no_end"] += 1
+            window_ts += 300
+            continue
+        best_end = min(end_candidates, key=lambda t: abs(t - end_ms))
+        end_price = candle_by_ts[best_end].close
+
+        if start_price == end_price:
+            skipped["tie"] += 1
+            window_ts += 300
+            continue
+
+        label = 1 if end_price > start_price else 0
+
+        feat = extract_features(hist_candles, window_ts)
+        if feat is None:
+            window_ts += 300
+            continue
+
+        # Append Polymarket features if available for this window
+        poly_feats = _get_poly_features(snap_by_window.get(window_ts))
+
+        features_list.append(feat)
+        labels.append(label)
+        meta_list.append({
+            "window_start": window_ts,
+            "start_price": start_price,
+            "end_price": end_price,
+            "source": "local",
+            "poly_spread_up": poly_feats.get("up_spread"),
+            "poly_spread_down": poly_feats.get("down_spread"),
+        })
+
+        window_ts += 300
+
+    if len(features_list) < 100:
+        log.warning(f"Only {len(features_list)} local samples — not enough")
+        return None
+
+    X = np.array(features_list)
+    y = np.array(labels)
+
+    log.info(f"  Local dataset: {X.shape[0]} samples, {X.shape[1]} features")
+    log.info(f"  Labels: UP={np.sum(y)} ({np.mean(y)*100:.1f}%), DOWN={np.sum(y==0)} ({np.mean(y==0)*100:.1f}%)")
+    log.info(f"  Skipped: {skipped}")
+    log.info(f"  Windows with Polymarket data: {sum(1 for m in meta_list if m.get('poly_spread_up') is not None)}")
+
+    return X, y, meta_list
+
+
+def _get_poly_features(snapshots: list[dict] | None) -> dict:
+    """Average Polymarket features across snapshots in a window."""
+    if not snapshots:
+        return {}
+    spreads_up = [s["up_spread"] for s in snapshots if s.get("up_spread") is not None]
+    spreads_down = [s["down_spread"] for s in snapshots if s.get("down_spread") is not None]
+    return {
+        "up_spread": np.mean(spreads_up) if spreads_up else None,
+        "down_spread": np.mean(spreads_down) if spreads_down else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# STEP 3c: Gamma-resolved evaluation set
+# ---------------------------------------------------------------------------
+def load_gamma_eval_set(
+    candles: list[Candle],
+    db_path: str = None,
+) -> tuple[np.ndarray, np.ndarray, list[dict]] | None:
+    """Load gamma-resolved trades as a held-out evaluation set.
+
+    Uses live_trades with gamma_winner_matches IS NOT NULL. Labels come from
+    Chainlink ground truth (gamma_resolution), NOT Binance close-to-close.
+
+    NEVER train on this data — it's the gold-standard test set.
+
+    Returns (X, y, meta) or None if not enough data.
+    """
+    _db = db_path or str(DB_PATH)
+    if not Path(_db).exists():
+        log.warning(f"DB not found at {_db}")
+        return None
+
+    log.info("\n" + "=" * 60)
+    log.info("Loading gamma-resolved evaluation set (Chainlink ground truth)")
+    log.info("=" * 60)
+
+    conn = sqlite3.connect(_db)
+    cur = conn.cursor()
+
+    # Load gamma-resolved trades
+    cur.execute("""
+        SELECT timestamp, side, entry_price, gamma_resolution, gamma_winner_matches,
+               outcome, pnl, market_slug
+        FROM live_trades
+        WHERE gamma_winner_matches IS NOT NULL
+          AND gamma_resolution IS NOT NULL
+        ORDER BY timestamp ASC
+    """)
+    trades = cur.fetchall()
+    conn.close()
+
+    if len(trades) < 50:
+        log.warning(f"Only {len(trades)} gamma-resolved trades — not enough for eval")
+        return None
+
+    log.info(f"  Found {len(trades)} gamma-resolved trades")
+
+    # Build feature vectors from candle history at each trade timestamp
+    candle_by_ts = {c.timestamp: c for c in candles}
+    timestamps = sorted(candle_by_ts.keys())
+
+    features_list = []
+    labels = []
+    meta_list = []
+    skipped = 0
+
+    for trade in trades:
+        trade_ts = trade[0]  # timestamp (could be ms or s)
+        trade_side = trade[1]
+        gamma_resolution = trade[3]  # "UP" or "DOWN"
+
+        # Normalize timestamp to seconds
+        ts_sec = trade_ts // 1000 if trade_ts > 1_000_000_000_000 else trade_ts
+        # Find 5-min window start
+        window_start = ts_sec - (ts_sec % 300)
+        start_ms = window_start * 1000
+
+        # Get candle history before this window
+        hist_times = [t for t in timestamps if t < start_ms]
+        if len(hist_times) < 30:
+            skipped += 1
+            continue
+
+        hist_candles = [candle_by_ts[t] for t in hist_times[-60:]]
+
+        feat = extract_features(hist_candles, window_start)
+        if feat is None:
+            skipped += 1
+            continue
+
+        # Label from Chainlink ground truth: did the market go UP?
+        # gamma_resolution is "UP" or "DOWN" — what Chainlink said the market resolved to.
+        label = 1 if gamma_resolution == "UP" else 0
+
+        features_list.append(feat)
+        labels.append(label)
+        meta_list.append({
+            "window_start": window_start,
+            "trade_side": trade_side,
+            "gamma_resolution": gamma_resolution,
+            "entry_price": trade[2],
+            "outcome": trade[5],
+            "pnl": trade[6],
+            "source": "gamma_eval",
+        })
+
+    if len(features_list) < 50:
+        log.warning(f"Only {len(features_list)} usable gamma-resolved samples (skipped {skipped})")
+        return None
+
+    X = np.array(features_list)
+    y = np.array(labels)
+
+    log.info(f"  Eval set: {X.shape[0]} samples (skipped {skipped})")
+    log.info(f"  Labels: UP={np.sum(y)} ({np.mean(y)*100:.1f}%), DOWN={np.sum(y==0)} ({np.mean(y==0)*100:.1f}%)")
+
+    return X, y, meta_list
+
+
+# ---------------------------------------------------------------------------
+# STEP 3d: Combine datasets
+# ---------------------------------------------------------------------------
+def combine_datasets(
+    binance_data: tuple[np.ndarray, np.ndarray, list[dict]],
+    local_data: tuple[np.ndarray, np.ndarray, list[dict]] | None,
+    recency_weight_days: int = 14,
+    recency_multiplier: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    """Combine Binance and local datasets with recency-based sample weighting.
+
+    Recent data (last `recency_weight_days` days) gets `recency_multiplier`x weight.
+    Local data is always weighted at recency_multiplier (it's recent by definition).
+
+    Returns (X, y, sample_weights, meta).
+    """
+    log.info("\n" + "=" * 60)
+    log.info("Combining datasets with sample weighting")
+    log.info("=" * 60)
+
+    X_parts = [binance_data[0]]
+    y_parts = [binance_data[1]]
+    meta_parts = [binance_data[2]]
+
+    if local_data is not None:
+        X_parts.append(local_data[0])
+        y_parts.append(local_data[1])
+        meta_parts.append(local_data[2])
+        log.info(f"  Binance: {binance_data[0].shape[0]} samples")
+        log.info(f"  Local:   {local_data[0].shape[0]} samples")
+    else:
+        log.info(f"  Binance only: {binance_data[0].shape[0]} samples")
+
+    X = np.vstack(X_parts)
+    y = np.concatenate(y_parts)
+    meta = []
+    for part in meta_parts:
+        meta.extend(part)
+
+    # Deduplicate by window_start — download_binance_klines() already loads DB
+    # candles, so local dataset overlaps. Prefer local source when duplicate
+    # (it has Polymarket features and is from current regime).
+    seen_windows: dict[int, int] = {}  # window_start -> index (prefer local)
+    for i, m in enumerate(meta):
+        ws = m["window_start"]
+        if ws not in seen_windows:
+            seen_windows[ws] = i
+        elif m.get("source") == "local":
+            seen_windows[ws] = i  # local wins over binance
+    keep_indices = sorted(seen_windows.values())
+    dupes = len(meta) - len(keep_indices)
+    X = X[keep_indices]
+    y = y[keep_indices]
+    meta = [meta[i] for i in keep_indices]
+    if dupes:
+        log.info(f"  Deduplicated: removed {dupes} overlapping windows (kept local)")
+
+    # Sort by window_start time (chronological order for TimeSeriesSplit)
+    indices = np.argsort([m["window_start"] for m in meta])
+    X = X[indices]
+    y = y[indices]
+    meta = [meta[i] for i in indices]
+
+    # Compute sample weights: recent data gets higher weight
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - (recency_weight_days * 86400)
+
+    weights = np.ones(len(y))
+    recent_count = 0
+    for i, m in enumerate(meta):
+        if m["window_start"] >= cutoff_ts or m.get("source") == "local":
+            weights[i] = recency_multiplier
+            recent_count += 1
+
+    log.info(f"  Combined: {X.shape[0]} samples ({X.shape[1]} features)")
+    log.info(f"  Recent (weight={recency_multiplier}x): {recent_count}")
+    log.info(f"  Older  (weight=1.0x): {len(y) - recent_count}")
+    log.info(f"  Labels: UP={np.sum(y)} ({np.mean(y)*100:.1f}%), DOWN={np.sum(y==0)} ({np.mean(y==0)*100:.1f}%)")
+
+    return X, y, weights, meta
+
+
+# ---------------------------------------------------------------------------
 # STEP 4: Train and evaluate
 # ---------------------------------------------------------------------------
-def train_and_evaluate(X, y, meta):
+def train_and_evaluate(X, y, meta, sample_weights=None, gamma_eval=None):
     from sklearn.preprocessing import StandardScaler
     from sklearn.linear_model import LogisticRegression
     from sklearn.ensemble import (
@@ -661,11 +1012,13 @@ def train_and_evaluate(X, y, meta):
 
         for name, model_fn in model_configs.items():
             model = model_fn()
-            model.fit(X_tr_s, y_tr)
+            w_tr = sample_weights[train_idx] if sample_weights is not None else None
+            model.fit(X_tr_s, y_tr, sample_weight=w_tr)
             acc = accuracy_score(y_te, model.predict(X_te_s))
             cv_results[name].append(acc)
 
-        log.info(f"  Fold {fold+1}/5 done (train={len(train_idx)}, test={len(test_idx)})")
+        fold_accs = " | ".join(f"{name}={cv_results[name][-1]*100:.1f}%" for name in list(model_configs.keys())[:4])
+        log.info(f"  Fold {fold+1}/5 (train={len(train_idx)}, test={len(test_idx)}): {fold_accs}")
 
     log.info(f"\n  {'Model':<15s} {'Mean':>7s} {'Std':>6s} {'Min':>6s} {'Max':>6s}  Folds")
     log.info(f"  {'-'*15} {'-'*7} {'-'*6} {'-'*6} {'-'*6}  {'-'*30}")
@@ -673,6 +1026,15 @@ def train_and_evaluate(X, y, meta):
         log.info(f"  {name:<15s} {np.mean(accs)*100:>6.1f}% {np.std(accs)*100:>5.1f}% "
                  f"{np.min(accs)*100:>5.1f}% {np.max(accs)*100:>5.1f}%  "
                  f"{[f'{a*100:.1f}' for a in accs]}")
+
+    # Reject models where any fold < 49%
+    rejected = set()
+    for name, accs in cv_results.items():
+        if min(accs) < 0.49:
+            rejected.add(name)
+            log.warning(f"  REJECTED {name}: min fold accuracy {min(accs)*100:.1f}% < 49%")
+    if rejected:
+        log.info(f"  Rejected {len(rejected)} models with fold < 49%")
 
     # ================================================================
     # Final train/test (80/20)
@@ -700,7 +1062,8 @@ def train_and_evaluate(X, y, meta):
     for name, model_fn in model_configs.items():
         log.info(f"  Training {name}...")
         model = model_fn()
-        model.fit(X_train_s, y_train)
+        w_train = sample_weights[:split] if sample_weights is not None else None
+        model.fit(X_train_s, y_train, sample_weight=w_train)
         trained_models[name] = model
 
     # Evaluate
@@ -728,7 +1091,7 @@ def train_and_evaluate(X, y, meta):
 
         # Select best by CV mean (more robust than single test split)
         cv_mean = np.mean(cv_results[name])
-        if cv_mean > best_cv_mean:
+        if cv_mean > best_cv_mean and name not in rejected:
             best_cv_mean = cv_mean
             best_name = name
 
@@ -934,6 +1297,47 @@ def train_and_evaluate(X, y, meta):
     )
     log.info(f"  Saved dataset to {MODEL_DIR}/dataset.npz")
 
+    # ================================================================
+    # Gamma-resolved evaluation (Chainlink ground truth)
+    # ================================================================
+    if gamma_eval is not None:
+        X_gamma, y_gamma, meta_gamma = gamma_eval
+        log.info(f"\n{'='*60}")
+        log.info(f"GAMMA EVALUATION ({best_name} — Chainlink ground truth)")
+        log.info(f"{'='*60}")
+
+        X_gamma_s = scaler.transform(X_gamma)
+        preds = best_model.predict(X_gamma_s)
+        probs = best_model.predict_proba(X_gamma_s)[:, 1]
+
+        gamma_acc = accuracy_score(y_gamma, preds)
+
+        n_correct = int(gamma_acc * len(y_gamma))
+        p_val = stats.binomtest(n_correct, len(y_gamma), 0.5, alternative='greater').pvalue
+
+        log.info(f"  Samples: {len(y_gamma)}")
+        log.info(f"  Accuracy: {gamma_acc*100:.1f}% (p={p_val:.4f})")
+        log.info(f"  Correct: {n_correct}/{len(y_gamma)}")
+
+        # Per entry-price bucket
+        for lo, hi, label in [(0.25, 0.40, "0.25-0.40"), (0.40, 0.50, "0.40-0.50"), (0.50, 0.65, "0.50-0.65")]:
+            mask = np.array([lo <= m.get("entry_price", 0) < hi for m in meta_gamma])
+            if np.sum(mask) > 5:
+                bucket_acc = accuracy_score(y_gamma[mask], preds[mask])
+                log.info(f"  Entry {label}: {bucket_acc*100:.1f}% ({np.sum(mask)} trades)")
+
+        if gamma_acc < 0.50:
+            log.warning(f"  WARNING: Model accuracy {gamma_acc*100:.1f}% < 50% on gamma eval — DO NOT DEPLOY")
+        else:
+            log.info(f"  PASS: Model accuracy {gamma_acc*100:.1f}% >= 50% on gamma eval")
+
+        model_meta["gamma_eval_accuracy"] = gamma_acc
+        model_meta["gamma_eval_samples"] = len(y_gamma)
+        model_meta["gamma_eval_pvalue"] = p_val
+        # Re-save meta with gamma results
+        with open(MODEL_DIR / "model_meta.json", "w") as f:
+            json.dump(model_meta, f, indent=2)
+
     log.info(f"\n{'='*60}")
     log.info("DONE")
     log.info(f"{'='*60}")
@@ -942,21 +1346,57 @@ def train_and_evaluate(X, y, meta):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse as _ap
+
+    parser = _ap.ArgumentParser(description="BTC 5-Min ML Pipeline")
+    parser.add_argument("--months", type=int, default=2, help="Months of Binance history (default 2)")
+    parser.add_argument("--db", type=str, default=str(DB_PATH), help="Path to btc_edge.db")
+    parser.add_argument("--binance-only", action="store_true", help="Skip local DB data")
+    parser.add_argument("--no-gamma", action="store_true", help="Skip gamma evaluation")
+    args = parser.parse_args()
+
     log.info("=" * 60)
-    log.info("BTC 5-Min ML Pipeline (Always Trade)")
+    log.info("BTC 5-Min ML Pipeline (Hybrid Training)")
     log.info(f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     log.info("=" * 60)
 
-    candles = download_binance_klines(months=3)
+    # Step 1: Download Binance klines
+    candles = download_binance_klines(months=args.months)
 
     if len(candles) < 1000:
         log.error(f"Only {len(candles)} candles — not enough data")
         sys.exit(1)
 
-    X, y, meta = build_dataset(candles)
+    # Step 2: Build Binance dataset
+    X_binance, y_binance, meta_binance = build_dataset(candles)
 
-    if len(y) < 500:
-        log.error(f"Only {len(y)} samples — not enough")
+    if len(y_binance) < 500:
+        log.error(f"Only {len(y_binance)} Binance samples — not enough")
         sys.exit(1)
 
-    train_and_evaluate(X, y, meta)
+    # Step 3: Build local dataset (our own collected data)
+    local_data = None
+    if not args.binance_only:
+        local_data = build_local_dataset(db_path=args.db)
+
+    # Step 4: Combine with sample weighting
+    X, y, weights, meta = combine_datasets(
+        (X_binance, y_binance, meta_binance),
+        local_data,
+    )
+
+    # Step 5: Load gamma evaluation set
+    gamma_eval = None
+    if not args.no_gamma:
+        gamma_eval = load_gamma_eval_set(candles, db_path=args.db)
+
+    # Step 6: Backup existing model
+    backup_path = MODEL_DIR / "best_model_backup.pkl"
+    model_path = MODEL_DIR / "best_model.pkl"
+    if model_path.exists():
+        import shutil
+        shutil.copy2(str(model_path), str(backup_path))
+        log.info(f"  Backed up existing model to {backup_path}")
+
+    # Step 7: Train and evaluate
+    train_and_evaluate(X, y, meta, sample_weights=weights, gamma_eval=gamma_eval)
