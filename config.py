@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     early_exit_threshold_mid: float = 0.90     # entry 0.40-0.50: 0.70 tested 2026-03-09, reverted — flat 0.90 outperforms tiered
     early_exit_threshold_high: float = 0.95    # entry >= 0.50 (~55% WR, conservative)
 
+    # Live entry range — only place live trades when entry price is in this range.
+    # Outside this range, trades are paper-only (exploration).
+    # Data: 0.40-0.50 entries are profitable at 47% true WR (+$0.24/trade).
+    live_entry_min: float = 0.40
+    live_entry_max: float = 0.50
+
     # Gamma verification — delay before re-querying Gamma after Chainlink settlement
     gamma_verify_delay_seconds: int = 300  # 5 minutes — markets resolve in 2-6 min
 
