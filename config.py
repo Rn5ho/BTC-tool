@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     max_live_bet_usdc: float = 10.0       # Hard safety cap per live trade
     clob_proxy: str = ""                   # SOCKS5 proxy for CLOB API (e.g. socks5://127.0.0.1:1080)
 
+    # Total USDC deposited into Polymarket (for all-time PnL calculation)
+    total_deposited: float = 152.77  # 4 deposits: $20.02 + $53.80 + $43.18 + $35.77
+
     # Polymarket Builder Mode (legacy — not used by live_trader)
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""

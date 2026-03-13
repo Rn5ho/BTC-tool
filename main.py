@@ -513,25 +513,37 @@ class Orchestrator:
             ls = await self.db.get_live_trading_stats_full()
             balance = await self.live_trader.get_balance()
             session = self.live_trader.get_session_summary()
-            roi = 0.0
-            if self.live_trader.initial_bankroll > 0:
-                roi = (self.live_trader.bankroll - self.live_trader.initial_bankroll) / self.live_trader.initial_bankroll
             ee_str = f" + {ls.get('early_exits', 0)}ee" if ls.get("early_exits") else ""
             mk_str = f" + {ls.get('maker_fills', 0)}mk" if ls.get("maker_fills") else ""
 
-            balance_line = ""
+            # Portfolio: real CLOB balance vs total deposited = ground truth PnL
+            deposited = settings.total_deposited
+            portfolio_lines = ""
             if balance is not None:
-                balance_line = f"USDC: <b>${balance:.2f}</b>\n"
+                real_pnl = balance - deposited
+                portfolio_lines = (
+                    f"Balance: <b>${balance:.2f}</b>\n"
+                    f"Deposited: ${deposited:.2f}\n"
+                    f"All-time PnL: <b>${real_pnl:+.2f}</b> ({real_pnl/deposited:+.1%})\n"
+                )
+            else:
+                portfolio_lines = f"Balance: unavailable\nDeposited: ${deposited:.2f}\n"
+
+            # Effective WR: (W + EE) / (W + L + EE) — treats EE as wins
+            total_settled = ls.get('wins', 0) + ls.get('losses', 0) + ls.get('early_exits', 0)
+            eff_wr = (ls.get('wins', 0) + ls.get('early_exits', 0)) / total_settled if total_settled > 0 else 0.0
 
             parts.append(
-                f"\U0001f4b5 <b>LIVE TRADING</b>\n"
-                f"{balance_line}"
-                f"Bankroll: <b>${self.live_trader.bankroll:,.2f}</b> | ROI: {roi:+.1%}\n"
+                f"\U0001f4b5 <b>PORTFOLIO</b>\n"
+                f"{portfolio_lines}"
+                f"\n<b>Live Trades</b>\n"
                 f"Settled: {ls.get('settled', 0)} | "
                 f"W/L: {ls.get('wins', 0)}/{ls.get('losses', 0)}{ee_str}{mk_str}\n"
-                f"Win rate: <b>{ls.get('win_rate', 0):.1%}</b>\n"
-                f"P&amp;L: <b>${ls.get('total_pnl', 0):+.2f}</b>\n"
-                f"Volume: ${ls.get('total_amount', 0):,.2f}\n"
+                f"Effective WR: <b>{eff_wr:.1%}</b> | "
+                f"Settlement WR: {ls.get('win_rate', 0):.1%}\n"
+                f"DB PnL: ${ls.get('total_pnl', 0):+.2f} "
+                f"(EE: ${ls.get('early_exit_pnl', 0):+.2f})\n"
+                f"Volume: ${ls.get('total_amount', 0):,.2f} | "
                 f"Max bet: ${settings.max_live_bet_usdc:.2f}\n"
                 f"Session: {session.get('successful', 0)} filled / "
                 f"{session.get('total', 0)} total"
