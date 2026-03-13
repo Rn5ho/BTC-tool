@@ -2219,36 +2219,56 @@ class Orchestrator:
         if slug:
             await self.db.backfill_early_exit_settlement(slug, btc_end, btc_went_up)
 
-        # Layer 1: Schedule delayed Gamma verification if we used Chainlink fallback
-        if settled_ids and settlement_source != "Gamma API":
-            asyncio.create_task(
-                self._verify_settlement_gamma(slug, settled_ids),
-                name=f"gamma_verify_{slug}",
-            )
-
-        # Telegram alerts for in-memory tracked positions
+        # Pop in-memory position data before it goes stale
+        live_info = None
         if slug and slug in self._live_trade_tokens:
             live_info = self._live_trade_tokens.pop(slug)
 
-            if not live_info.get("exited"):
+        # Layer 1: Schedule delayed Gamma verification if we used Chainlink fallback
+        if settled_ids and settlement_source != "Gamma API":
+            asyncio.create_task(
+                self._verify_settlement_gamma(slug, settled_ids, live_info=live_info),
+                name=f"gamma_verify_{slug}",
+            )
+
+        # Telegram alerts for live settlement
+        if live_info and not live_info.get("exited") and self.alerter:
+            if settlement_source == "Gamma API":
+                # Gamma was available at settlement — notification is accurate
                 trade_won = (live_info["side"] == "UP" and btc_went_up) or \
                             (live_info["side"] == "DOWN" and not btc_went_up)
-
-                if self.alerter:
-                    outcome = "WIN" if trade_won else "LOSS"
-                    amt = live_info.get("amount", 0)
-                    await self.alerter.send_live_settlement_alert(
-                        slug=slug,
-                        side=live_info["side"],
-                        outcome=outcome,
-                        amount=amt,
-                        entry_price=live_info.get("entry_price", 0),
-                    )
-
-                if self.alerter:
-                    await self.alerter.send_stats_summary(
-                        stats, live_info=await self._build_live_info()
-                    )
+                outcome = "WIN" if trade_won else "LOSS"
+                await self.alerter.send_live_settlement_alert(
+                    slug=slug,
+                    side=live_info["side"],
+                    outcome=outcome,
+                    amount=live_info.get("amount", 0),
+                    entry_price=live_info.get("entry_price", 0),
+                )
+                await self.alerter.send_stats_summary(
+                    stats, live_info=await self._build_live_info()
+                )
+            elif settled_ids:
+                # Chainlink fallback — defer notification until Gamma verifies (~5 min)
+                logger.info(
+                    "Deferring settlement notification for %s until Gamma verification (%ds)",
+                    slug, settings.gamma_verify_delay_seconds,
+                )
+            else:
+                # No settled IDs but live_info exists — send with unverified tag
+                trade_won = (live_info["side"] == "UP" and btc_went_up) or \
+                            (live_info["side"] == "DOWN" and not btc_went_up)
+                outcome = "WIN [unverified]" if trade_won else "LOSS [unverified]"
+                await self.alerter.send_live_settlement_alert(
+                    slug=slug,
+                    side=live_info["side"],
+                    outcome=outcome,
+                    amount=live_info.get("amount", 0),
+                    entry_price=live_info.get("entry_price", 0),
+                )
+                await self.alerter.send_stats_summary(
+                    stats, live_info=await self._build_live_info()
+                )
 
     async def _settle_live_trades_for_window(
         self, slug: str, btc_went_up: bool, settlement_price: float | None = None
@@ -2406,13 +2426,17 @@ class Orchestrator:
         )
 
     async def _verify_settlement_gamma(
-        self, slug: str, settled_trade_ids: list[int]
+        self, slug: str, settled_trade_ids: list[int],
+        live_info: dict | None = None,
     ) -> None:
         """Layer 1: Delayed Gamma verification of Chainlink-settled trades.
 
         Waits gamma_verify_delay_seconds (default 5 min) for Gamma resolution
         to become available, then checks if our Chainlink-based settlement was
         correct. Corrects phantom WINs/missed WINs in DB.
+
+        If live_info is provided, sends the Telegram settlement notification
+        AFTER verification (deferred from _settle_previous_window).
         """
         delay = settings.gamma_verify_delay_seconds
         logger.info(
@@ -2428,10 +2452,32 @@ class Orchestrator:
                 "Gamma verify: no resolution for %s after %ds — Layer 2 will catch it",
                 slug, delay,
             )
+            # Still send deferred notification with Chainlink-based outcome (best we have)
+            if live_info and not live_info.get("exited") and self.alerter:
+                # Read outcome from DB (already settled by Chainlink)
+                for trade_id in settled_trade_ids:
+                    row = await self._db_fetch_trade(trade_id)
+                    if row and row["outcome"] in ("WIN", "LOSS"):
+                        await self.alerter.send_live_settlement_alert(
+                            slug=slug,
+                            side=row["side"],
+                            outcome=f"{row['outcome']} [unverified]",
+                            amount=row["amount_usdc"],
+                            entry_price=row.get("entry_price", 0),
+                        )
+                        break
+                await self.alerter.send_stats_summary(
+                    await self.paper_trader.get_stats() if self.paper_trader else {},
+                    live_info=await self._build_live_info(),
+                )
             return
 
         # Check each settled trade against Gamma truth
         corrections = 0
+        verified_outcome = None  # for deferred notification
+        verified_side = None
+        verified_amount = 0.0
+        verified_entry_price = 0.0
         for trade_id in settled_trade_ids:
             try:
                 row = await self._db_fetch_trade(trade_id)
@@ -2451,6 +2497,12 @@ class Orchestrator:
                 side_would_win = (side == gamma_resolution)
                 expected_outcome = "WIN" if side_would_win else "LOSS"
                 matches = 1 if row["outcome"] == expected_outcome else 0
+
+                # Track for deferred notification
+                verified_outcome = expected_outcome
+                verified_side = side
+                verified_amount = amount
+                verified_entry_price = entry_price
 
                 if matches:
                     # Outcome is correct — just stamp verification
@@ -2487,19 +2539,6 @@ class Orchestrator:
                         row.get("pnl", 0), new_pnl,
                     )
 
-                    # Telegram alert
-                    if self.alerter:
-                        try:
-                            await self.alerter._send(
-                                f"CORRECTION: {slug}\n"
-                                f"{side} {old_outcome} -> {expected_outcome}\n"
-                                f"PnL: ${row.get('pnl', 0):+.2f} -> ${new_pnl:+.2f}\n"
-                                f"(Gamma verified)",
-                                parse_mode=None,
-                            )
-                        except Exception:
-                            pass
-
             except Exception:
                 logger.exception("Gamma verify failed for trade %d", trade_id)
 
@@ -2513,6 +2552,20 @@ class Orchestrator:
             )
         else:
             logger.info("Gamma verify %s: all %d trades confirmed correct", slug, len(settled_trade_ids))
+
+        # Send deferred Telegram notification with Gamma-verified outcome
+        if live_info and not live_info.get("exited") and self.alerter and verified_outcome:
+            await self.alerter.send_live_settlement_alert(
+                slug=slug,
+                side=verified_side or live_info["side"],
+                outcome=verified_outcome,
+                amount=verified_amount or live_info.get("amount", 0),
+                entry_price=verified_entry_price or live_info.get("entry_price", 0),
+            )
+            await self.alerter.send_stats_summary(
+                await self.paper_trader.get_stats() if self.paper_trader else {},
+                live_info=await self._build_live_info(),
+            )
 
     async def _gamma_reconciliation(self) -> None:
         """Layer 2: Hourly reconciliation of trades missing Gamma verification.
