@@ -1,5 +1,5 @@
 {
-  "model_type": "RF_d5",
+  "model_type": "GBT_v3",
   "feature_names": [
     "momentum_1m",
     "momentum_3m",
@@ -47,12 +47,15 @@
     "close_position_in_range"
   ],
   "n_features": 44,
-  "train_samples": 27280,
-  "test_samples": 6820,
-  "test_accuracy": 0.5360703812316715,
-  "cv_accuracy_mean": 0.5258842160830547,
-  "cv_accuracy_std": 0.011702611223714752,
-  "baseline_accuracy": 0.5016129032258064,
+  "train_samples": 16432,
+  "test_samples": 4108,
+  "test_accuracy": 0.5267770204479065,
+  "cv_accuracy_mean": 0.5319310546304411,
+  "cv_accuracy_std": 0.005764594558887797,
+  "baseline_accuracy": 0.5002434274586174,
   "paradigm": "always_trade",
-  "total_candles": 61380
+  "total_candles": 36972,
+  "gamma_eval_accuracy": 0.5263157894736842,
+  "gamma_eval_samples": 1615,
+  "gamma_eval_pvalue": 0.018282479795361635
 }
