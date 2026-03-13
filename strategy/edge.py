@@ -13,6 +13,7 @@ against the fee-adjusted implied probability to ensure the edge is real
 import logging
 from typing import Optional
 
+from config import settings
 from data.models import FeatureVector, PolymarketMarket
 from data.polymarket import compute_fee_factor
 from signals.probability import ProbabilityModel
@@ -180,9 +181,8 @@ class EdgeDetector:
             spread = market.down_spread
 
         # Reject entry prices outside the tradeable range.
-        # Core range 0.40-0.55: live trades — EE sweet spot ($3.73/trade avg).
-        # Exploration range 0.25-0.40: paper-only (too thin, bad R:R).
-        # Exploration range 0.55-0.65: paper-only (thin margins, mean-reversion fails in trends).
+        # Core range: LIVE_ENTRY_MIN to LIVE_ENTRY_MAX (default 0.40-0.50) — EE sweet spot.
+        # Exploration range 0.25-LIVE_ENTRY_MIN and LIVE_ENTRY_MAX-0.65: paper-only.
         # Below 0.25: too contrarian to be useful.
         if entry_price > 0.65 or entry_price < 0.25:
             self.last_skip_reason = (
@@ -194,11 +194,12 @@ class EdgeDetector:
             )
             return None
 
-        exploration = entry_price < 0.40 or entry_price >= 0.55
+        exploration = entry_price < settings.live_entry_min or entry_price >= settings.live_entry_max
         if exploration:
             logger.info(
-                "Exploration signal — entry price %.3f outside 0.40-0.55 live range on %s %s",
-                entry_price, best_side, market.slug,
+                "Exploration signal — entry price %.3f outside %.2f-%.2f live range on %s %s",
+                entry_price, settings.live_entry_min, settings.live_entry_max,
+                best_side, market.slug,
             )
 
         fee_factor = compute_fee_factor(
