@@ -1,0 +1,991 @@
+{
+  "analyzed_at": "2026-03-19T12:40:13.891334+00:00",
+  "accounts_analyzed": 27,
+  "results": [
+    {
+      "name": "HorizonSplendidView",
+      "address": "0x02227b8f...",
+      "reported_profit": 4016108,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 20,
+      "avg_price": 0.4814930896755547,
+      "median_price": 0.45,
+      "min_price": 0.16,
+      "max_price": 0.739691634,
+      "pct_under_20": 0.5,
+      "pct_20_40": 22.0,
+      "pct_40_60": 65.0,
+      "pct_60_80": 12.5,
+      "pct_80_plus": 0.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 36943.69647648,
+      "median_size_usd": 21000.0,
+      "total_volume": 7388739.295296,
+      "assets": {
+        "other": 200
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 0.2672451038469933,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "reachingthesky",
+      "address": "0xefbc5fec...",
+      "reported_profit": 3742635,
+      "trades_fetched": 65,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 8,
+      "avg_price": 0.4177710281777541,
+      "median_price": 0.42,
+      "min_price": 0.19,
+      "max_price": 0.62,
+      "pct_under_20": 4.615384615384616,
+      "pct_20_40": 32.30769230769231,
+      "pct_40_60": 56.92307692307692,
+      "pct_60_80": 6.153846153846154,
+      "pct_80_plus": 0.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 60071.15766307692,
+      "median_size_usd": 23000.0,
+      "total_volume": 3904625.2481,
+      "assets": {
+        "other": 65
+      },
+      "timeframes": {
+        "event": 65
+      },
+      "market_types": {
+        "event": 65
+      },
+      "trades_per_hour": 0.6388590087310732,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "beachboy4",
+      "address": "0xc2e7800b...",
+      "reported_profit": 2951326,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 20,
+      "avg_price": 0.5988196219237117,
+      "median_price": 0.629999999988975,
+      "min_price": 0.028321775077186334,
+      "max_price": 0.779200522125,
+      "pct_under_20": 2.0,
+      "pct_20_40": 2.5,
+      "pct_40_60": 31.0,
+      "pct_60_80": 64.5,
+      "pct_80_plus": 0.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 117933.626612595,
+      "median_size_usd": 49999.999999,
+      "total_volume": 23586725.322519,
+      "assets": {
+        "other": 196,
+        "politics": 4
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 0.18062600457535707,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "majorexploiter",
+      "address": "0x019782ca...",
+      "reported_profit": 2416975,
+      "trades_fetched": 60,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 3,
+      "avg_price": 0.5896906276188852,
+      "median_price": 0.65,
+      "min_price": 0.48,
+      "max_price": 0.69,
+      "pct_under_20": 0.0,
+      "pct_20_40": 0.0,
+      "pct_40_60": 38.333333333333336,
+      "pct_60_80": 61.66666666666667,
+      "pct_80_plus": 0.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 65125.85838166667,
+      "median_size_usd": 32500.0,
+      "total_volume": 3907551.5029,
+      "assets": {
+        "other": 60
+      },
+      "timeframes": {
+        "event": 60
+      },
+      "market_types": {
+        "event": 60
+      },
+      "trades_per_hour": 2.34324148405294,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "CemeterySun",
+      "address": "0x37c1874a...",
+      "reported_profit": 1827134,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 46,
+      "avg_price": 0.4729990423265907,
+      "median_price": 0.5,
+      "min_price": 0.04399147634888196,
+      "max_price": 0.85,
+      "pct_under_20": 5.5,
+      "pct_20_40": 4.0,
+      "pct_40_60": 86.0,
+      "pct_60_80": 4.0,
+      "pct_80_plus": 0.5,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 1531.90615815,
+      "median_size_usd": 249.68999999999997,
+      "total_volume": 306381.23163,
+      "assets": {
+        "other": 199,
+        "AVAX": 1
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 14.964459408903853,
+      "strategy": "EVENT_TRADER + HIGH_FREQUENCY + WHALE"
+    },
+    {
+      "name": "gatorr",
+      "address": "0x93abbc02...",
+      "reported_profit": 1158268,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 115,
+      "avg_price": 0.5004195965307082,
+      "median_price": 0.51,
+      "min_price": 0.003,
+      "max_price": 0.87,
+      "pct_under_20": 3.0,
+      "pct_20_40": 3.5000000000000004,
+      "pct_40_60": 86.5,
+      "pct_60_80": 5.0,
+      "pct_80_plus": 2.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 11795.862909880001,
+      "median_size_usd": 7420.5716,
+      "total_volume": 2359172.581976,
+      "assets": {
+        "other": 181,
+        "sports": 8,
+        "BTC": 6,
+        "fed": 3,
+        "AVAX": 2
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 0.5560730123865263,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "Countryside",
+      "address": "0xbddf61af...",
+      "reported_profit": 1014236,
+      "trades_fetched": 200,
+      "buy_pct": 97.5,
+      "sell_pct": 2.5,
+      "unique_markets": 137,
+      "avg_price": 0.4342720572930942,
+      "median_price": 0.46,
+      "min_price": 0.026,
+      "max_price": 0.83,
+      "pct_under_20": 4.5,
+      "pct_20_40": 28.999999999999996,
+      "pct_40_60": 57.49999999999999,
+      "pct_60_80": 7.5,
+      "pct_80_plus": 1.5,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 17529.593421715,
+      "median_size_usd": 6983.2059,
+      "total_volume": 3505918.684343,
+      "assets": {
+        "other": 198,
+        "sports": 2
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 0.09388797130783597,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "swisstony",
+      "address": "0x204f72f3...",
+      "reported_profit": 777632,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 57,
+      "avg_price": 0.5797902800480147,
+      "median_price": 0.58,
+      "min_price": 0.05,
+      "max_price": 0.989,
+      "pct_under_20": 4.5,
+      "pct_20_40": 8.0,
+      "pct_40_60": 41.0,
+      "pct_60_80": 31.5,
+      "pct_80_plus": 15.0,
+      "pct_90_plus": 12.0,
+      "pct_95_plus": 10.5,
+      "avg_size_usd": 66.884551895,
+      "median_size_usd": 19.84,
+      "total_volume": 13376.910378999999,
+      "assets": {
+        "other": 175,
+        "ADA": 25
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 371.13402061855675,
+      "strategy": "EVENT_TRADER + HIGH_FREQUENCY"
+    },
+    {
+      "name": "JaJackson",
+      "address": "0xf195721a...",
+      "reported_profit": 758226,
+      "trades_fetched": 173,
+      "buy_pct": 93.64161849710982,
+      "sell_pct": 6.358381502890173,
+      "unique_markets": 36,
+      "avg_price": 0.4732229984458699,
+      "median_price": 0.47,
+      "min_price": 0.11945686274509804,
+      "max_price": 0.999,
+      "pct_under_20": 2.8901734104046244,
+      "pct_20_40": 9.248554913294797,
+      "pct_40_60": 80.92485549132948,
+      "pct_60_80": 3.4682080924855487,
+      "pct_80_plus": 3.4682080924855487,
+      "pct_90_plus": 3.4682080924855487,
+      "pct_95_plus": 2.8901734104046244,
+      "avg_size_usd": 19168.368553768785,
+      "median_size_usd": 9911.395,
+      "total_volume": 3316127.759802,
+      "assets": {
+        "other": 162,
+        "AVAX": 6,
+        "sports": 5
+      },
+      "timeframes": {
+        "event": 173
+      },
+      "market_types": {
+        "event": 173
+      },
+      "trades_per_hour": 0.12582908700572232,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "sovereign2013",
+      "address": "0xee613b3f...",
+      "reported_profit": 686243,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 45,
+      "avg_price": 0.5485294604603644,
+      "median_price": 0.53,
+      "min_price": 0.04389136363636364,
+      "max_price": 0.94,
+      "pct_under_20": 4.0,
+      "pct_20_40": 12.0,
+      "pct_40_60": 50.5,
+      "pct_60_80": 22.0,
+      "pct_80_plus": 11.5,
+      "pct_90_plus": 8.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 359.1539367,
+      "median_size_usd": 245.77239999999998,
+      "total_volume": 71830.78734,
+      "assets": {
+        "other": 159,
+        "ADA": 41
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 19.169329073482427,
+      "strategy": "EVENT_TRADER + HIGH_FREQUENCY + MID_SIZE"
+    },
+    {
+      "name": "gmanas",
+      "address": "0xe90bec87...",
+      "reported_profit": 679034,
+      "trades_fetched": 200,
+      "buy_pct": 99.5,
+      "sell_pct": 0.5,
+      "unique_markets": 111,
+      "avg_price": 0.5974613451205043,
+      "median_price": 0.58,
+      "min_price": 0.001,
+      "max_price": 0.999,
+      "pct_under_20": 10.5,
+      "pct_20_40": 11.0,
+      "pct_40_60": 30.5,
+      "pct_60_80": 18.0,
+      "pct_80_plus": 30.0,
+      "pct_90_plus": 20.0,
+      "pct_95_plus": 15.5,
+      "avg_size_usd": 27831.893741350003,
+      "median_size_usd": 4784.90925,
+      "total_volume": 5566378.74827,
+      "assets": {
+        "other": 183,
+        "BTC": 6,
+        "sports": 4,
+        "AVAX": 3,
+        "stocks": 2,
+        "ADA": 2
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 191,
+        "price_target": 6,
+        "updown": 3
+      },
+      "trades_per_hour": 3.2601313108444647,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "WoofMaster",
+      "address": "0x916f7165...",
+      "reported_profit": 571305,
+      "trades_fetched": 164,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 58,
+      "avg_price": 0.4740634711824103,
+      "median_price": 0.475280998,
+      "min_price": 0.25,
+      "max_price": 0.69,
+      "pct_under_20": 0.0,
+      "pct_20_40": 23.78048780487805,
+      "pct_40_60": 64.63414634146342,
+      "pct_60_80": 11.585365853658537,
+      "pct_80_plus": 0.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 6888.788917664634,
+      "median_size_usd": 2220.8991,
+      "total_volume": 1129761.382497,
+      "assets": {
+        "other": 163,
+        "ADA": 1
+      },
+      "timeframes": {
+        "event": 164
+      },
+      "market_types": {
+        "event": 164
+      },
+      "trades_per_hour": 0.017706569749189317,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "kch123",
+      "address": "0x6a72f618...",
+      "reported_profit": 529612,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 50,
+      "avg_price": 0.5888705742698476,
+      "median_price": 0.57,
+      "min_price": 0.013506692865633264,
+      "max_price": 0.9695537585698638,
+      "pct_under_20": 3.5000000000000004,
+      "pct_20_40": 11.0,
+      "pct_40_60": 42.5,
+      "pct_60_80": 21.5,
+      "pct_80_plus": 21.5,
+      "pct_90_plus": 9.0,
+      "pct_95_plus": 1.5,
+      "avg_size_usd": 6047.143205,
+      "median_size_usd": 325.46920000000006,
+      "total_volume": 1209428.641,
+      "assets": {
+        "other": 179,
+        "AVAX": 13,
+        "sports": 8
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "event": 200
+      },
+      "trades_per_hour": 1.9736409289269972,
+      "strategy": "EVENT_TRADER + WHALE"
+    },
+    {
+      "name": "0x8dxd",
+      "address": "0x63ce3421...",
+      "reported_profit": 453207,
+      "trades_fetched": 200,
+      "buy_pct": 91.5,
+      "sell_pct": 8.5,
+      "unique_markets": 12,
+      "avg_price": 0.47910034653220457,
+      "median_price": 0.5,
+      "min_price": 0.009636384615384616,
+      "max_price": 0.82,
+      "pct_under_20": 14.000000000000002,
+      "pct_20_40": 12.0,
+      "pct_40_60": 45.0,
+      "pct_60_80": 26.5,
+      "pct_80_plus": 2.5,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 53.51330995,
+      "median_size_usd": 45.407999999999994,
+      "total_volume": 10702.66199,
+      "assets": {
+        "BTC": 161,
+        "SOL": 14,
+        "ETH": 13,
+        "XRP": 12
+      },
+      "timeframes": {
+        "5m": 160,
+        "event": 40
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 427.0462633451957,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "k9Q2mX4L8A7ZP3R",
+      "address": "0xd0d6053c...",
+      "reported_profit": 450312,
+      "trades_fetched": 200,
+      "buy_pct": 85.0,
+      "sell_pct": 15.0,
+      "unique_markets": 15,
+      "avg_price": 0.39010121092153627,
+      "median_price": 0.43,
+      "min_price": 0.05,
+      "max_price": 0.9,
+      "pct_under_20": 22.0,
+      "pct_20_40": 20.0,
+      "pct_40_60": 44.5,
+      "pct_60_80": 10.0,
+      "pct_80_plus": 3.5000000000000004,
+      "pct_90_plus": 0.5,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 16.728458,
+      "median_size_usd": 14.58,
+      "total_volume": 3345.6916,
+      "assets": {
+        "BTC": 139,
+        "SOL": 27,
+        "ETH": 22,
+        "XRP": 12
+      },
+      "timeframes": {
+        "5m": 188,
+        "event": 12
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 1016.949152542373,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "BoneReader",
+      "address": "0xd84c2b6d...",
+      "reported_profit": 445829,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 95,
+      "avg_price": 0.45865759181647175,
+      "median_price": 0.49,
+      "min_price": 0.001,
+      "max_price": 0.999,
+      "pct_under_20": 24.0,
+      "pct_20_40": 0.0,
+      "pct_40_60": 59.0,
+      "pct_60_80": 0.0,
+      "pct_80_plus": 17.0,
+      "pct_90_plus": 17.0,
+      "pct_95_plus": 17.0,
+      "avg_size_usd": 179.730019985,
+      "median_size_usd": 5.491199999999999,
+      "total_volume": 35946.003997,
+      "assets": {
+        "BTC": 110,
+        "ETH": 41,
+        "SOL": 28,
+        "XRP": 21
+      },
+      "timeframes": {
+        "5m": 192,
+        "event": 8
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 42.164441321152495,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY + MID_SIZE"
+    },
+    {
+      "name": "0xdE17f7...",
+      "address": "0xde17f714...",
+      "reported_profit": 408433,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 36,
+      "avg_price": 0.5411625581840098,
+      "median_price": 0.577,
+      "min_price": 0.007167597765363128,
+      "max_price": 0.989,
+      "pct_under_20": 20.5,
+      "pct_20_40": 5.0,
+      "pct_40_60": 31.0,
+      "pct_60_80": 20.0,
+      "pct_80_plus": 23.5,
+      "pct_90_plus": 15.0,
+      "pct_95_plus": 5.0,
+      "avg_size_usd": 127.387882135,
+      "median_size_usd": 19.7901,
+      "total_volume": 25477.576427,
+      "assets": {
+        "BTC": 200
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "price_target": 101,
+        "event": 82,
+        "updown": 17
+      },
+      "trades_per_hour": 61.05834464043419,
+      "strategy": "CRYPTO_FOCUSED + HIGH_FREQUENCY + MID_SIZE"
+    },
+    {
+      "name": "0x1f0ebc...",
+      "address": "0x1f0ebc54...",
+      "reported_profit": 268945,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 21,
+      "avg_price": 0.4229367466226418,
+      "median_price": 0.46,
+      "min_price": 0.01,
+      "max_price": 0.98,
+      "pct_under_20": 19.5,
+      "pct_20_40": 17.0,
+      "pct_40_60": 47.0,
+      "pct_60_80": 13.0,
+      "pct_80_plus": 3.5000000000000004,
+      "pct_90_plus": 2.5,
+      "pct_95_plus": 0.5,
+      "avg_size_usd": 30.974101824999998,
+      "median_size_usd": 13.249998999999999,
+      "total_volume": 6194.820365,
+      "assets": {
+        "ETH": 93,
+        "BTC": 67,
+        "XRP": 24,
+        "SOL": 16
+      },
+      "timeframes": {
+        "5m": 193,
+        "event": 7
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 1146.496815286624,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "vidarx",
+      "address": "0x2d8b401d...",
+      "reported_profit": 267270,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 5,
+      "avg_price": 0.5381795815518907,
+      "median_price": 0.55,
+      "min_price": 0.11,
+      "max_price": 0.9107625,
+      "pct_under_20": 2.5,
+      "pct_20_40": 7.5,
+      "pct_40_60": 66.0,
+      "pct_60_80": 19.5,
+      "pct_80_plus": 4.5,
+      "pct_90_plus": 1.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 19.010261500000002,
+      "median_size_usd": 21.200000000000003,
+      "total_volume": 3802.0523000000003,
+      "assets": {
+        "BTC": 200
+      },
+      "timeframes": {
+        "5m": 200
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 621.7616580310881,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "stingo43",
+      "address": "0x0006af12...",
+      "reported_profit": 205778,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 98,
+      "avg_price": 0.5951717850349741,
+      "median_price": 0.65,
+      "min_price": 0.01,
+      "max_price": 0.99,
+      "pct_under_20": 8.5,
+      "pct_20_40": 13.0,
+      "pct_40_60": 19.5,
+      "pct_60_80": 42.0,
+      "pct_80_plus": 17.0,
+      "pct_90_plus": 11.0,
+      "pct_95_plus": 8.5,
+      "avg_size_usd": 362.5293943049999,
+      "median_size_usd": 60.3793,
+      "total_volume": 72505.87886099999,
+      "assets": {
+        "BTC": 100,
+        "XRP": 41,
+        "ETH": 36,
+        "SOL": 23
+      },
+      "timeframes": {
+        "5m": 200
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 2.314368370298939,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + MID_SIZE"
+    },
+    {
+      "name": "guh123",
+      "address": "0xa45fe11d...",
+      "reported_profit": 175825,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 6,
+      "avg_price": 0.5116662000000001,
+      "median_price": 0.51,
+      "min_price": 0.14,
+      "max_price": 0.97,
+      "pct_under_20": 3.0,
+      "pct_20_40": 21.0,
+      "pct_40_60": 49.5,
+      "pct_60_80": 20.0,
+      "pct_80_plus": 6.5,
+      "pct_90_plus": 2.0,
+      "pct_95_plus": 2.0,
+      "avg_size_usd": 7.056210999999999,
+      "median_size_usd": 6.6000000000000005,
+      "total_volume": 1411.2422,
+      "assets": {
+        "BTC": 106,
+        "ETH": 94
+      },
+      "timeframes": {
+        "5m": 200
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 1865.2849740932643,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "hgjghjh85",
+      "address": "0x3e9d296b...",
+      "reported_profit": 161184,
+      "trades_fetched": 200,
+      "buy_pct": 82.5,
+      "sell_pct": 17.5,
+      "unique_markets": 53,
+      "avg_price": 0.4234449117217442,
+      "median_price": 0.4727177219764359,
+      "min_price": 0.01,
+      "max_price": 0.8157333390222223,
+      "pct_under_20": 13.5,
+      "pct_20_40": 25.5,
+      "pct_40_60": 49.5,
+      "pct_60_80": 10.5,
+      "pct_80_plus": 1.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 425.202966575,
+      "median_size_usd": 159.588,
+      "total_volume": 85040.593315,
+      "assets": {
+        "BTC": 200
+      },
+      "timeframes": {
+        "5m": 195,
+        "event": 5
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 2.17564725505838,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + MID_SIZE"
+    },
+    {
+      "name": "vague-sourdough",
+      "address": "0x70ec235a...",
+      "reported_profit": 160097,
+      "trades_fetched": 200,
+      "buy_pct": 71.5,
+      "sell_pct": 28.499999999999996,
+      "unique_markets": 22,
+      "avg_price": 0.619675567260855,
+      "median_price": 0.63,
+      "min_price": 0.03,
+      "max_price": 0.97,
+      "pct_under_20": 5.5,
+      "pct_20_40": 13.0,
+      "pct_40_60": 23.5,
+      "pct_60_80": 26.5,
+      "pct_80_plus": 31.5,
+      "pct_90_plus": 16.0,
+      "pct_95_plus": 8.5,
+      "avg_size_usd": 11.70404376,
+      "median_size_usd": 9.3,
+      "total_volume": 2340.808752,
+      "assets": {
+        "BTC": 65,
+        "XRP": 58,
+        "SOL": 50,
+        "ETH": 27
+      },
+      "timeframes": {
+        "5m": 200
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 502.09205020920507,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "BoshBashBish",
+      "address": "0x29bc82f7...",
+      "reported_profit": 107485,
+      "trades_fetched": 200,
+      "buy_pct": 83.0,
+      "sell_pct": 17.0,
+      "unique_markets": 19,
+      "avg_price": 0.40037550258276583,
+      "median_price": 0.39,
+      "min_price": 0.03,
+      "max_price": 0.88,
+      "pct_under_20": 17.0,
+      "pct_20_40": 36.0,
+      "pct_40_60": 28.999999999999996,
+      "pct_60_80": 9.5,
+      "pct_80_plus": 8.5,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 31.2234625,
+      "median_size_usd": 23.6844,
+      "total_volume": 6244.6925,
+      "assets": {
+        "BTC": 153,
+        "ETH": 47
+      },
+      "timeframes": {
+        "5m": 200
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 388.34951456310677,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "kingofcoinflips",
+      "address": "0xe9c63124...",
+      "reported_profit": 100996,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 39,
+      "avg_price": 0.4730133876124889,
+      "median_price": 0.52,
+      "min_price": 0.007240909720077939,
+      "max_price": 0.96,
+      "pct_under_20": 22.5,
+      "pct_20_40": 11.5,
+      "pct_40_60": 26.0,
+      "pct_60_80": 32.0,
+      "pct_80_plus": 8.0,
+      "pct_90_plus": 7.000000000000001,
+      "pct_95_plus": 3.5000000000000004,
+      "avg_size_usd": 117.55280615,
+      "median_size_usd": 14.85,
+      "total_volume": 23510.56123,
+      "assets": {
+        "BTC": 125,
+        "ETH": 66,
+        "SOL": 9
+      },
+      "timeframes": {
+        "event": 200
+      },
+      "market_types": {
+        "price_target": 179,
+        "updown": 21
+      },
+      "trades_per_hour": 5.369768205005817,
+      "strategy": "CRYPTO_FOCUSED + HIGH_FREQUENCY + MID_SIZE"
+    },
+    {
+      "name": "livebreathevolatility",
+      "address": "0x818f214c...",
+      "reported_profit": 99104,
+      "trades_fetched": 200,
+      "buy_pct": 100.0,
+      "sell_pct": 0.0,
+      "unique_markets": 39,
+      "avg_price": 0.5002632549657985,
+      "median_price": 0.52875,
+      "min_price": 0.14,
+      "max_price": 0.8,
+      "pct_under_20": 1.0,
+      "pct_20_40": 19.0,
+      "pct_40_60": 68.5,
+      "pct_60_80": 10.5,
+      "pct_80_plus": 1.0,
+      "pct_90_plus": 0.0,
+      "pct_95_plus": 0.0,
+      "avg_size_usd": 6.861514000000001,
+      "median_size_usd": 5.18,
+      "total_volume": 1372.3028000000002,
+      "assets": {
+        "ETH": 63,
+        "BTC": 56,
+        "XRP": 51,
+        "SOL": 30
+      },
+      "timeframes": {
+        "5m": 200
+      },
+      "market_types": {
+        "updown": 200
+      },
+      "trades_per_hour": 166.89847009735746,
+      "strategy": "CRYPTO_FOCUSED + SHORT_TIMEFRAME + HIGH_FREQUENCY"
+    },
+    {
+      "name": "Sharky6999",
+      "address": "0x751a2b86...",
+      "reported_profit": 92608,
+      "trades_fetched": 200,
+      "buy_pct": 96.0,
+      "sell_pct": 4.0,
+      "unique_markets": 151,
+      "avg_price": 0.8761892721201354,
+      "median_price": 0.9897759343714371,
+      "min_price": 0.01,
+      "max_price": 0.999,
+      "pct_under_20": 9.0,
+      "pct_20_40": 3.5000000000000004,
+      "pct_40_60": 0.0,
+      "pct_60_80": 1.5,
+      "pct_80_plus": 86.0,
+      "pct_90_plus": 84.5,
+      "pct_95_plus": 80.5,
+      "avg_size_usd": 3998.396978,
+      "median_size_usd": 378.61101,
+      "total_volume": 799679.3956,
+      "assets": {
+        "BTC": 68,
+        "XRP": 36,
+        "ETH": 33,
+        "BNB": 17,
+        "SOL": 17,
+        "DOGE": 13,
+        "HYPE": 12,
+        "stocks": 2,
+        "other": 1,
+        "fed": 1
+      },
+      "timeframes": {
+        "5m": 110,
+        "event": 88,
+        "daily": 2
+      },
+      "market_types": {
+        "updown": 129,
+        "event": 57,
+        "price_target": 14
+      },
+      "trades_per_hour": 2.684563758389262,
+      "strategy": "FAVORITE_SCALPER + CRYPTO_FOCUSED + SHORT_TIMEFRAME + WHALE"
+    }
+  ]
+}
