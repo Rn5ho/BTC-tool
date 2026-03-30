@@ -308,6 +308,8 @@ class LiveTrader:
             return 0.0
         if self._sizing_strategy == "adaptive":
             size = self.adaptive_size(confidence)
+        elif self._sizing_strategy == "fixed":
+            size = settings.bet_size_usdc
         else:
             size = 0.02 * self.bankroll  # fallback: flat 2%
         size = max(1.00, size)
