@@ -1511,10 +1511,11 @@ class Orchestrator:
         # 6d3. Trend-conflict filter — don't bet against a strong intra-window
         #     price move.  Uses the post-flip side so regime-flipped trades
         #     (which align with the trend) are not incorrectly blocked.
+        #     Disabled in cheaper mode: side is market-determined, not directional.
         effective_side = signal["side"]
         if flip_signal and settings.regime_flip_live:
             effective_side = flip_signal["side"]
-        if self._window_btc_start and btc_now:
+        if settings.side_selection != "cheaper" and self._window_btc_start and btc_now:
             window_move_pct = (btc_now - self._window_btc_start) / self._window_btc_start * 100
             btc_trending_up = window_move_pct > self._TREND_CONFLICT_PCT
             btc_trending_down = window_move_pct < -self._TREND_CONFLICT_PCT
@@ -1530,8 +1531,9 @@ class Orchestrator:
         # 6d4. Loss streak guard — pause a side after consecutive losses.
         #      Uses post-flip side so the guard protects the actually-traded
         #      direction, not the model's original prediction.
+        #      Disabled in cheaper mode: side alternates naturally with market pricing.
         trade_side = effective_side
-        if trade_side in self._side_paused:
+        if settings.side_selection != "cheaper" and trade_side in self._side_paused:
             if time.time() < self._side_paused[trade_side]:
                 self._window_skip_reason = (
                     f"streak guard ({settings.streak_pause_threshold}x {trade_side} LOSS)"
