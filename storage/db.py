@@ -238,6 +238,9 @@ class Database:
             # Gamma verification (2026-03-10)
             ("live_trades", "gamma_resolution", "TEXT"),
             ("live_trades", "gamma_winner_matches", "INTEGER"),
+            # Cheaper-side experiment (2026-03-30): what would model have picked?
+            ("live_trades", "model_side", "TEXT"),
+            ("live_trades", "model_p_up", "REAL"),
             # skipped_windows enrichment (2026-03-04)
             ("skipped_windows", "model_side", "TEXT"),
             ("skipped_windows", "entry_obi", "REAL"),
@@ -560,6 +563,8 @@ class Database:
         entry_down_spread: Optional[float] = None,
         entry_token_bid_size: Optional[float] = None,
         entry_token_ask_size: Optional[float] = None,
+        model_side: Optional[str] = None,
+        model_p_up: Optional[float] = None,
     ) -> Optional[int]:
         """Insert a live trade record. Returns the row id on success."""
         try:
@@ -579,11 +584,13 @@ class Database:
                      entry_ema_cross, entry_funding_zscore,
                      entry_volume_zscore, entry_atr,
                      entry_up_spread, entry_down_spread,
-                     entry_token_bid_size, entry_token_ask_size)
+                     entry_token_bid_size, entry_token_ask_size,
+                     model_side, model_p_up)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?)
+                        ?, ?, ?, ?,
+                        ?, ?)
                 """,
                 (
                     timestamp,
@@ -622,6 +629,8 @@ class Database:
                     entry_down_spread,
                     entry_token_bid_size,
                     entry_token_ask_size,
+                    model_side,
+                    model_p_up,
                 ),
             )
             await self._db.commit()

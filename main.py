@@ -1764,6 +1764,9 @@ class Orchestrator:
                     entry_down_spread=market.down_spread,
                     entry_token_bid_size=_token_book.bid_size if _token_book else None,
                     entry_token_ask_size=_token_book.ask_size if _token_book else None,
+                    # Model comparison data (what would model have picked?)
+                    model_side="UP" if p_up > 0.5 else "DOWN",
+                    model_p_up=p_up,
                 )
 
                 # Track token for settlement + early exit
