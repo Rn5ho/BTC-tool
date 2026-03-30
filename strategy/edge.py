@@ -204,7 +204,7 @@ class EdgeDetector:
             )
             return None
 
-        exploration = entry_price < settings.live_entry_min or entry_price >= settings.live_entry_max
+        exploration = entry_price < settings.live_entry_min or entry_price > settings.live_entry_max
         if exploration:
             logger.info(
                 "Exploration signal — entry price %.3f outside %.2f-%.2f live range on %s %s",
