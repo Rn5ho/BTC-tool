@@ -33,6 +33,7 @@ class EdgeDetector:
         fee_exponent: int = 2,
         always_trade: bool = False,
         min_confidence: float = 0.015,
+        side_selection: str = "model",
     ) -> None:
         self.model = model
         self.min_edge = min_edge
@@ -41,16 +42,18 @@ class EdgeDetector:
         self.fee_exponent = fee_exponent
         self.always_trade = always_trade
         self.min_confidence = min_confidence
+        self.side_selection = side_selection
         self.last_skip_reason: str | None = None
         logger.info(
             "EdgeDetector initialised with min_edge=%.2f, max_edge=%.2f, fee_rate=%.3f, "
-            "fee_exponent=%d, always_trade=%s, min_confidence=%.3f",
+            "fee_exponent=%d, always_trade=%s, min_confidence=%.3f, side_selection=%s",
             self.min_edge,
             self.max_edge,
             self.fee_rate,
             self.fee_exponent,
             self.always_trade,
             self.min_confidence,
+            self.side_selection,
         )
 
     def _fee_adjusted_prob(self, market_price: float) -> float:
@@ -116,19 +119,26 @@ class EdgeDetector:
         )
 
         if self.always_trade:
-            # Always-trade mode: pick direction based on ML model, not edge.
-            # We always enter a position — the question is which side.
             confidence = abs(p_up - 0.5)
 
-            # Skip when model confidence is below threshold
-            if confidence < self.min_confidence:
-                self.last_skip_reason = (
-                    f"low confidence ({confidence*100:.1f}% < {self.min_confidence*100:.1f}%)"
-                )
-                return None
-
-            best_side = "UP" if p_up > 0.5 else "DOWN"
-            best_edge = up_edge if best_side == "UP" else down_edge
+            if self.side_selection == "cheaper":
+                # Cheaper-side mode: always buy whichever side has the lower
+                # ask price.  Model direction is ignored.  No confidence gate
+                # since we're not using the model for side selection.
+                up_ask = market.up_best_ask if market.up_best_ask else raw_up
+                down_ask = market.down_best_ask if market.down_best_ask else raw_down
+                best_side = "UP" if up_ask <= down_ask else "DOWN"
+                best_edge = up_edge if best_side == "UP" else down_edge
+            else:
+                # Model mode: pick direction based on ML model's P(up).
+                # Skip when model confidence is below threshold.
+                if confidence < self.min_confidence:
+                    self.last_skip_reason = (
+                        f"low confidence ({confidence*100:.1f}% < {self.min_confidence*100:.1f}%)"
+                    )
+                    return None
+                best_side = "UP" if p_up > 0.5 else "DOWN"
+                best_edge = up_edge if best_side == "UP" else down_edge
 
             # In always-trade mode, edge cap is not applied — we trade the
             # model's direction regardless of edge size.  The entry price filter

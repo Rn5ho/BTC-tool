@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # Raised from 0.015 to 0.020: 1.5-2% band averaged -$0.16/trade.
     min_confidence: float = 0.020
 
+    # Side selection strategy:
+    #   "model"   — use ML model's P(up) to pick side (original behavior)
+    #   "cheaper" — always buy the cheaper (lower ask) side, ignore model direction
+    side_selection: str = "model"
+
     # Sizing strategy: "fixed", "kelly", "adaptive"
     # - fixed: flat bet_size_usdc every trade
     # - kelly: half-Kelly based on edge

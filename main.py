@@ -109,6 +109,7 @@ class Orchestrator:
             fee_exponent=settings.polymarket_fee_exponent,
             always_trade=settings.always_trade,
             min_confidence=settings.min_confidence,
+            side_selection=settings.side_selection,
         )
         self.regime_detector = RegimeDetector(
             trend_threshold=settings.regime_trend_threshold,
@@ -1485,10 +1486,12 @@ class Orchestrator:
         # 6d2. Regime flip — when a strong trend is detected, flip the signal
         #   to bet WITH the trend instead of the model's counter-trend prediction.
         #   Applies to paper always; live when regime_flip_live=True.
+        #   Disabled in "cheaper" side_selection mode — always buy the cheaper side.
         #   Must run BEFORE streak guard and trend filter so they check the
         #   post-flip side (the side we'll actually trade).
         flip_signal = None
-        if (self._current_regime
+        if (settings.side_selection != "cheaper"
+                and self._current_regime
                 and self._current_regime.regime != "ranging"
                 and abs(self._current_regime.strength) >= settings.regime_flip_threshold
                 and self._regime_trend_count >= settings.regime_flip_confirm_windows):
@@ -1620,7 +1623,9 @@ class Orchestrator:
         # Use flipped signal during strong trends, otherwise use model's signal
         if self.paper_trader:
             paper_signal = flip_signal if flip_signal else signal
-            if paper_signal.get("exploration"):
+            if settings.side_selection == "cheaper":
+                paper_signal = {**paper_signal, "trade_tag_override": "cheap_side"}
+            elif paper_signal.get("exploration"):
                 paper_signal = {**paper_signal, "size_override": 1.00}
             elif paper_signal.get("regime_flip"):
                 paper_signal = {**paper_signal, "trade_tag_override": "regime_flip"}
@@ -1686,7 +1691,9 @@ class Orchestrator:
 
                 # Persist to DB first (to get row ID for early exit tracking)
                 trade_tag = None
-                if flip_signal and settings.regime_flip_live:
+                if settings.side_selection == "cheaper":
+                    trade_tag = "cheap_side"
+                elif flip_signal and settings.regime_flip_live:
                     trade_tag = "regime_flip"
                 elif live_signal.get("_post_streak"):
                     trade_tag = "post_streak"
