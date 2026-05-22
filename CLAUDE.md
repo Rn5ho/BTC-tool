@@ -1,5 +1,13 @@
 # CLAUDE.md
 
+> **STATUS (2026-05-22): PROJECT SHELVED — proven dead end.** The VPS `btc-edge`
+> service was stopped and disabled. A 3-month analysis (19,960 windows) showed the
+> ML model is 48.75% directional (3.5σ below coin flip), the market is efficiently
+> priced, and apparent shadow "edges" are non-executable price phantoms. Live
+> ground truth: 1,755 real trades, net −$181.58. The shadow dataset structurally
+> cannot validate profitability — it never recorded a real fill. See the Changelog
+> entry below for details. Do not resume without a fundamentally different approach.
+
 ## Project Overview
 
 BTC Polymarket 5-Minute Edge Finder — monitors Binance BTC price data, uses a trained ML model (GradientBoostingClassifier, 53.2% CV / 53.0% clean gamma eval) to predict 5-minute BTC direction, and trades on Polymarket's binary UP/DOWN markets. Deployed on Hetzner VPS in Helsinki (65.21.178.90) running 24/7. Live trading enabled via py-clob-client with adaptive tiered early exit selling.
@@ -331,6 +339,7 @@ Reverse-chronological log of deployed changes. Check timestamps to know what dat
 
 | Date (UTC) | Change | Design Doc |
 |------------|--------|------------|
+| 2026-05-22 | **PROJECT SHELVED — `btc-edge` service stopped & disabled.** 3-month analysis joined `skipped_windows` (model_side) to `shadow_windows` (settlement prices) → 19,960 clean windows (Mar 9–May 22). Findings: (1) ML model 48.75% directional accuracy = 3.5σ below coin flip, WR flat ~47–50% across all confidence buckets incl 9%+ → confidence is noise; decaying 50.8%→48.5%→47.5% Mar/Apr/May. (2) Market efficiently priced — vig-free calibration near-perfect, 92% of windows at 0.50. (3) Shadow EE sim's apparent +$2,285 model / +$489 fade edges are phantoms: model-side WR is flat ~49% whether quoted ask is $0.20 or $0.80, proving `market_snapshots.best_ask` quotes non-executable liquidity. Live ground truth: 1,755 real trades, net −$181.58; cheaper-side 0-for-39 at settlement. Conclusion: the dataset cannot validate profitability (no real fills recorded). Analysis scripts in `scripts/analysis/_*.py`. | — |
 | 2026-03-30 | **Cheaper-side experiment**: New `SIDE_SELECTION=cheaper` config. Always buys whichever side has lower ask price, ML model ignored for direction. Regime flip, streak guard, trend conflict disabled in this mode. Fixed $5 sizing. EE threshold optimized to 0.93 (from 0.96) based on 500-window shadow sweep — 0.93 hits +$0.176/trade vs +$0.089 at 0.96. All trades tagged `cheap_side` with `model_side`/`model_p_up` stored for comparison. $50 deposited for live test. | — |
 | 2026-03-13 ~17:00 | **Deferred settlement notifications**: WIN/LOSS Telegram notifications now wait for Gamma verification (~5 min) instead of sending immediately based on Chainlink price comparison. Previously, ~7-18% of notifications were wrong (Chainlink/Polymarket disagreement). Now: (a) if Gamma resolves within 5s, send immediately; (b) if Chainlink fallback used, defer until Gamma verifies; (c) if Gamma still unavailable after 5 min, send with `[unverified]` tag. Eliminates phantom WIN notifications. | — |
 | 2026-03-13 ~14:45 | **ML pipeline data integrity fix**: (1) Gamma eval holdout — recent 5 days of gamma trades excluded from training, eliminating 100% feature leakage. Clean eval: 53.0% on 317 samples. (2) Chainlink label upgrade — older gamma trades replace Binance labels in training. 175/955 (18.3%) had wrong labels, now corrected. New `--gamma-holdout-days` CLI arg. Retrained GBT_v3 deployed. | — |
